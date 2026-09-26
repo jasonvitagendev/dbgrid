@@ -376,4 +376,17 @@ function M.sql_literal(v)
   return "'" .. tostring(v):gsub("'", "''") .. "'"
 end
 
+---Make keymap hint plugins pick up buffer-local keymaps set after the buffer
+---was entered. which-key caches a buffer's keymaps on BufEnter and only
+---rescans on BufNew/BufReadPost/LspAttach, so without this `<localleader>`
+---shows no popup in a notebook until the buffer is reloaded.
+---@param buf integer
+function M.refresh_keymap_hints(buf)
+  if package.loaded["which-key"] then
+    pcall(function()
+      require("which-key.buf").clear({ buf = buf })
+    end)
+  end
+end
+
 return M
