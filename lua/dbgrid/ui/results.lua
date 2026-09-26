@@ -1506,6 +1506,17 @@ function M.attach(s)
       end
     end,
   })
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "BufEnter" }, {
+    group = group,
+    callback = function(ev)
+      local win = vim.api.nvim_get_current_win()
+      if win == s.results_win and ev.buf ~= buf and vim.api.nvim_buf_is_loaded(buf) then
+        vim.schedule(function()
+          layout.reclaim_results(s, ev.buf)
+        end)
+      end
+    end,
+  })
   util.refresh_keymap_hints(buf)
 end
 

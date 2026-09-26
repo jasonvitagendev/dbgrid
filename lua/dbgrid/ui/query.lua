@@ -834,8 +834,13 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       local w = vim.api.nvim_get_current_win()
-      -- floats are picker previews and the like, not a query pane
-      if vim.api.nvim_win_get_buf(w) == buf and vim.api.nvim_win_get_config(w).relative == "" then
+      -- floats are picker previews and the like, not a query pane; the
+      -- results window only shows it until reclaim_results puts the results back
+      if
+        vim.api.nvim_win_get_buf(w) == buf
+        and vim.api.nvim_win_get_config(w).relative == ""
+        and w ~= s.results_win
+      then
         s.query_win = w
         s.tab = vim.api.nvim_get_current_tabpage()
         if vim.wo[w].conceallevel < 1 then
