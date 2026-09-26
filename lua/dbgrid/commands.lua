@@ -127,8 +127,69 @@ M.subcommands = {
     end
     if args[1] == "tables" then
       return require("dbgrid.ui.query").browse_tables(s)
+    elseif args[1] == "view" then
+      local results = require("dbgrid.ui.results")
+      results.toggle_schema(s)
+      if s.view.mode == "schema" then
+        require("dbgrid.ui.layout").focus_results(s)
+      end
+      return
     end
     require("dbgrid.ui.query").refresh_schema(s)
+  end,
+  results = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.layout").focus_results(s)
+    end
+  end,
+  format = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    if args[1] == "all" then
+      local n = require("dbgrid.format").buffer(s, { notify = true })
+      return util.notify("formatted " .. n .. " cell(s)")
+    end
+    require("dbgrid.ui.query").format_cell(s)
+  end,
+  param = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    if not args[1] then
+      return require("dbgrid.ui.query").edit_params(s)
+    end
+    local name = args[1]:gsub("^:", "")
+    local value = table.concat(vim.list_slice(args, 2), " ")
+    if value == "" then
+      local v = s.nb.meta.params and s.nb.meta.params[name]
+      return util.notify(":" .. name .. " = " .. (v and tostring(v) or "(not set)"))
+    end
+    require("dbgrid.notebook").set_param(s.nb, name, value)
+    util.notify(":" .. name .. " = " .. value)
+  end,
+  params = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.query").edit_params(s)
+    end
+  end,
+  agent = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local ai = require("dbgrid.ai")
+    if not args[1] then
+      return ai.pick_agent(s)
+    end
+    if args[1] == "default" then
+      return ai.set_agent(s, nil)
+    end
+    ai.set_agent(s, args[1])
   end,
   describe = function(args)
     local s = current_or_warn()
@@ -248,11 +309,25 @@ function M.complete(arglead, cmdline)
   elseif sub == "explain" then
     candidates = { "analyze" }
   elseif sub == "schema" then
-    candidates = { "refresh", "tables" }
+    candidates = { "refresh", "tables", "view" }
   elseif sub == "tag" then
     candidates = { "add", "remove" }
   elseif sub == "export" then
     candidates = { "csv", "json" }
+  elseif sub == "format" then
+    candidates = { "all" }
+  elseif sub == "agent" then
+    for _, a in ipairs(require("dbgrid.ai").agents()) do
+      candidates[#candidates + 1] = a.name
+    end
+    candidates[#candidates + 1] = "default"
+  elseif sub == "param" and n == 2 then
+    local s = require("dbgrid.state").current()
+    if s then
+      for _, p in ipairs(require("dbgrid.expand").notebook_params(s)) do
+        candidates[#candidates + 1] = p.name
+      end
+    end
   end
   return vim.tbl_filter(function(x)
     return x:find(arglead, 1, true) == 1

@@ -36,6 +36,14 @@ local groups = {
   DbgridWinbarOk = { link = "DiagnosticOk" },
   DbgridWinbarError = { link = "DiagnosticError" },
   DbgridWinbarWarn = { link = "DiagnosticWarn" },
+  DbgridWinbarAgent = { link = "Special" },
+  DbgridSchemaTable = { link = "Title" },
+  DbgridSchemaColumn = { link = "Identifier" },
+  DbgridSchemaType = { link = "Type" },
+  DbgridSchemaIndex = { link = "Special" },
+  DbgridSchemaDim = { link = "Comment" },
+  DbgridFindingWarn = { link = "DiagnosticWarn" },
+  DbgridFindingInfo = { link = "DiagnosticInfo" },
 }
 
 function M.setup()
