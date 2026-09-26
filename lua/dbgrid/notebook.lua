@@ -108,11 +108,15 @@ function M.from_path(path)
   if not path:match("%.sql$") then
     return nil
   end
+  -- buffer names are symlink-resolved (macOS /var -> /private/var), config paths may not be
+  local function real(p)
+    return vim.uv.fs_realpath(p) or p
+  end
   local dir = vim.fs.dirname(path)
   local name = vim.fn.fnamemodify(path, ":t:r")
   local st = config.get().storage
-  local data_projects = vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects/"
-  local in_data = dir:sub(1, #data_projects) == data_projects
+  local data_projects = real(vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects") .. "/"
+  local in_data = real(dir):sub(1, #data_projects) == data_projects
   local in_project = vim.fs.basename(dir) == st.project_dir
   if not (in_data or in_project) then
     return nil
