@@ -1,9 +1,10 @@
 -- SQLite adapter, built on the `sqlite3` command line shell.
 --
--- The shell runs in list mode with ASCII unit/record separators, so values
--- with newlines or commas never need un-escaping, and every statement is
--- fenced with `.print` markers carrying a per-run nonce (the same scheme as
--- the Postgres adapter).
+-- The shell runs in quote mode with ASCII unit/record separators: every value
+-- is printed as an SQL literal ('text', 42, NULL, X'00ff'), so BLOBs (binary
+-- UUIDs and the like) come out as hex instead of raw bytes that could contain
+-- the separators, and every statement is fenced with `.print` markers carrying
+-- a per-run nonce (the same scheme as the Postgres adapter).
 local util = require("dbgrid.util")
 
 local M = {
@@ -17,7 +18,6 @@ local M = {
 
 M.FS = "\31"
 M.RS = "\30"
-M.NULL = "\1NULL\1"
 
 ---Database file of a connection. Accepts `sqlite:path`, `sqlite:///abs/path`,
 ---`sqlite://rel/path`, a bare path ending in .sqlite3/.sqlite/.db, `~/...`
@@ -57,13 +57,11 @@ local function argv(conn, opts)
   vim.list_extend(args, {
     "-batch",
     "-header",
-    "-list",
+    "-quote",
     "-separator",
     M.FS,
     "-newline",
     M.RS,
-    "-nullvalue",
-    M.NULL,
     M.path(conn) or ":memory:",
   })
   return args
@@ -107,6 +105,120 @@ local function build_script(statements, nonce, opts)
   return table.concat(lines, "\n") .. "\n", ranges
 end
 
+---Evaluate the escaping functions newer shells wrap around strings with
+---control characters: replace(..., '\n', char(10)), char(n, ...) and
+---unistr('\u000a').
+---@param name string
+---@param args any[]
+---@return any
+local function call(name, args)
+  name = name:lower()
+  if name == "char" then
+    local parts = {}
+    for _, a in ipairs(args) do
+      parts[#parts + 1] = vim.fn.nr2char(tonumber(a) or 0)
+    end
+    return table.concat(parts)
+  elseif name == "replace" and #args == 3 and type(args[1]) == "string" and type(args[2]) == "string" then
+    return (args[1]:gsub(vim.pesc(args[2]), (tostring(args[3]):gsub("%%", "%%%%"))))
+  elseif name == "unistr" and type(args[1]) == "string" then
+    return (
+      args[1]
+        :gsub("\\\\", "\0")
+        :gsub("\\u(%x%x%x%x)", function(h)
+          return vim.fn.nr2char(tonumber(h, 16))
+        end)
+        :gsub("\\%+(%x%x%x%x%x%x)", function(h)
+          return vim.fn.nr2char(tonumber(h, 16))
+        end)
+        :gsub("\\U(%x%x%x%x%x%x%x%x)", function(h)
+          return vim.fn.nr2char(tonumber(h, 16))
+        end)
+        :gsub("%z", "\\")
+    )
+  end
+  return name .. "(" .. table.concat(vim.tbl_map(tostring, args), ", ") .. ")"
+end
+
+---Read one SQL literal as printed by quote mode, starting at `pos`.
+---Text is unquoted, BLOBs stay as their X'..' literal, NULL becomes vim.NIL
+---and numbers are returned as printed.
+---@param s string
+---@param pos integer
+---@param stop string pattern of the characters that end a bare token
+---@return any value, integer next
+local function read_value(s, pos, stop)
+  local c = s:sub(pos, pos)
+  if c == "'" then
+    local parts, i = {}, pos + 1
+    while true do
+      local q = s:find("'", i, true)
+      if not q then
+        parts[#parts + 1] = s:sub(i)
+        return table.concat(parts), #s + 1
+      end
+      parts[#parts + 1] = s:sub(i, q - 1)
+      if s:sub(q + 1, q + 1) == "'" then
+        parts[#parts + 1] = "'"
+        i = q + 2
+      else
+        return table.concat(parts), q + 1
+      end
+    end
+  end
+  local blob = s:match("^[xX]'%x*'", pos)
+  if blob then
+    return blob, pos + #blob
+  end
+  local fn = s:match("^([%a_][%w_]*)%(", pos)
+  if fn then
+    local args, i = {}, pos + #fn + 1
+    while i <= #s and s:sub(i, i) ~= ")" do
+      i = s:find("[^%s,]", i) or #s + 1
+      if s:sub(i, i) == ")" then
+        break
+      end
+      local v
+      v, i = read_value(s, i, "[,)]")
+      args[#args + 1] = v
+    end
+    return call(fn, args), i + 1
+  end
+  local e = s:find(stop, pos) or #s + 1
+  local token = vim.trim(s:sub(pos, e - 1))
+  if token == "NULL" then
+    return vim.NIL, e
+  end
+  return token, e
+end
+
+---Split quote-mode output into records of values.
+---@param block string
+---@return any[][]
+local function parse_records(block)
+  local records, rec, pos = {}, {}, 1
+  local stop = "[" .. M.FS .. M.RS .. "]"
+  while pos <= #block do
+    local c = block:sub(pos, pos)
+    if c == M.RS then
+      records[#records + 1] = rec
+      rec, pos = {}, pos + 1
+    elseif c == M.FS then
+      pos = pos + 1
+    elseif #rec == 0 and c:match("%s") then
+      pos = pos + 1
+    else
+      local v
+      v, pos = read_value(block, pos, stop)
+      rec[#rec + 1] = v
+    end
+  end
+  if #rec > 0 then
+    records[#records + 1] = rec
+  end
+  return records
+end
+
 ---Parse one output block (everything a single statement printed).
 ---@param block string
 ---@return dbgrid.ResultSet[] sets, integer? changes, number server_ms
@@ -120,28 +232,13 @@ local function parse_block(block)
     changes = tonumber(n)
     return ""
   end)
-  if block == "" then
-    return sets, changes, server_ms
-  end
-  local records = vim.split(block, M.RS, { plain = true })
-  if records[#records] == "" or records[#records] == "\n" then
-    records[#records] = nil
-  end
-  local function parse_values(rec)
-    local vals = vim.split(rec, M.FS, { plain = true })
-    for k, v in ipairs(vals) do
-      if v == M.NULL then
-        vals[k] = vim.NIL
-      end
-    end
-    return vals
-  end
+  local records = parse_records(block)
   if #records == 0 then
     return sets, changes, server_ms
   end
-  local set = { columns = parse_values(records[1]), rows = {} }
+  local set = { columns = records[1], rows = {} }
   for i = 2, #records do
-    set.rows[#set.rows + 1] = parse_values(records[i])
+    set.rows[#set.rows + 1] = records[i]
   end
   set.row_count = #set.rows
   for _, row in ipairs(set.rows) do
@@ -874,6 +971,7 @@ M.functions = {
 
 -- exposed for tests
 M._parse_block = parse_block
+M._parse_records = parse_records
 M._split_blocks = split_blocks
 M._parse_stderr = parse_stderr
 M._build_script = build_script

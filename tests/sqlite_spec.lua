@@ -3,18 +3,18 @@ local sq = require("dbgrid.adapters.sqlite")
 
 H.describe("sqlite.parse", function()
   local FS, RS = sq.FS, sq.RS
-  H.it("parses list-mode blocks with timing and change counts", function()
-    local block = "id"
+  H.it("parses quote-mode blocks with timing and change counts", function()
+    local block = "'id'"
       .. FS
-      .. "note"
+      .. "'note'"
       .. RS
       .. "1"
       .. FS
-      .. "a\nb"
+      .. "'a\nb'"
       .. RS
       .. "2"
       .. FS
-      .. sq.NULL
+      .. "NULL"
       .. RS
       .. "Run Time: real 0.002 user 0.000100 sys 0.000000\nchanges: 0   total_changes: 3\n"
     local sets, changes, ms = sq._parse_block(block)
@@ -27,6 +27,31 @@ H.describe("sqlite.parse", function()
       sq._parse_block("Run Time: real 0.000 user 0.000000 sys 0.000000\nchanges: 5   total_changes: 8\n")
     H.eq(sets2, {})
     H.eq(changes2, 5)
+  end)
+  H.it("keeps blobs as hex and separators inside text intact", function()
+    local records = sq._parse_records(
+      "X'019fe0b0'"
+        .. FS
+        .. "'it''s "
+        .. RS
+        .. FS
+        .. " ''NULL'''"
+        .. FS
+        .. "''"
+        .. FS
+        .. "-1.5e+20"
+        .. RS
+        .. [[replace(replace('a\nb\r','\r',char(13)),'\n',char(10))]]
+        .. FS
+        .. [[unistr('x\u000ay\\z')]]
+        .. FS
+        .. "NULL"
+        .. RS
+    )
+    H.eq(records, {
+      { "X'019fe0b0'", "it's " .. RS .. FS .. " 'NULL'", "", "-1.5e+20" },
+      { "a\nb\r", "x\ny\\z", vim.NIL },
+    })
   end)
   H.it("maps errors back to the statement, line and column", function()
     local statements = { { sql = "select 1", line = 1 }, { sql = "select id,\n  nope\nfrom users", line = 5 } }
@@ -109,6 +134,12 @@ H.describe("sqlite integration", function()
       { sql = "insert into dbgrid_t values (1),(2)", kind = "insert", class = "write", line = 3 },
       { sql = "select count(*) from dbgrid_t", kind = "select", class = "read", line = 4 },
       { sql = "select id from users where id < 0", kind = "select", class = "read", line = 5 },
+      {
+        sql = "select x'1e1f00ff' as b, 'a' || char(30, 31) || 'b' as t, 42 as n",
+        kind = "select",
+        class = "read",
+        line = 6,
+      },
     }, {}, function(r)
       result = r
     end)
@@ -126,6 +157,7 @@ H.describe("sqlite integration", function()
     H.eq(result.statements[4].sets[1].rows, { { "2" } })
     H.eq(result.statements[5].sets, {})
     H.eq(result.statements[5].tags, {})
+    H.eq(result.statements[6].sets[1].rows, { { "X'1e1f00ff'", "a\30\31b", "42" } })
     H.truthy(result.elapsed_ms > 0)
   end)
 
