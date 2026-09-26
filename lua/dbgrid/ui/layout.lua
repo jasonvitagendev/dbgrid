@@ -49,7 +49,16 @@ end
 function M.adopt(buf, nb)
   local s = state.attach(buf, nb)
   s.last_used = util.now()
-  require("dbgrid.ui.query").attach(s)
+  local query = require("dbgrid.ui.query")
+  query.attach(s)
+  -- already on screen (restored session, :e): BufWinEnter fired before we
+  -- were listening, so open the results pane here
+  local win = vim.fn.bufwinid(buf)
+  if win ~= -1 and vim.api.nvim_win_get_config(win).relative == "" then
+    s.query_win = win
+    s.tab = vim.api.nvim_win_get_tabpage(win)
+    query.on_cursor(s, true)
+  end
   return s
 end
 

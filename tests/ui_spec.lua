@@ -265,6 +265,53 @@ H.describe("notebook ui", function()
     end)
   end
 
+  H.it("hides the results pane while another file is shown and restores it", function()
+    vim.api.nvim_set_current_win(s.query_win)
+    local other = vim.fn.tempname() .. ".txt"
+    vim.cmd("edit " .. vim.fn.fnameescape(other))
+    H.truthy(
+      H.wait(1000, function()
+        return s.results_win == nil
+      end),
+      "results pane still open"
+    )
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 1)
+    vim.cmd("buffer " .. s.buf)
+    H.truthy(s.results_win and vim.api.nvim_win_is_valid(s.results_win))
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 2)
+    H.eq(vim.api.nvim_get_current_win(), s.query_win)
+  end)
+
+  H.it("keeps the results pane while the notebook is still visible in a split", function()
+    vim.api.nvim_set_current_win(s.query_win)
+    vim.cmd("split")
+    vim.cmd("enew")
+    vim.wait(50)
+    H.truthy(s.results_win and vim.api.nvim_win_is_valid(s.results_win))
+    vim.cmd("close")
+    vim.api.nvim_set_current_win(s.query_win)
+  end)
+
+  H.it("opens the results pane for a notebook opened by hand", function()
+    -- `nvim -l` skips plugin/, which holds the BufReadPost hook under test
+    vim.cmd("runtime plugin/dbgrid.lua")
+    local nb2 = notebook.create("ui adopt", { connection = "test" })
+    vim.cmd("tabnew")
+    vim.cmd("edit " .. vim.fn.fnameescape(nb2.path))
+    local s2
+    H.truthy(
+      H.wait(1000, function()
+        s2 = require("dbgrid.state").get(vim.api.nvim_get_current_buf())
+        return s2 ~= nil and s2.results_win ~= nil
+      end),
+      "notebook not attached"
+    )
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 2)
+    H.eq(vim.api.nvim_get_current_win(), s2.query_win)
+    layout.close(s2)
+    vim.api.nvim_set_current_win(s.query_win)
+  end)
+
   H.it("closes the layout", function()
     local tabs = #vim.api.nvim_list_tabpages()
     layout.close(s)

@@ -740,7 +740,8 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       local w = vim.api.nvim_get_current_win()
-      if vim.api.nvim_win_get_buf(w) == buf then
+      -- floats are picker previews and the like, not a query pane
+      if vim.api.nvim_win_get_buf(w) == buf and vim.api.nvim_win_get_config(w).relative == "" then
         s.query_win = w
         s.tab = vim.api.nvim_get_current_tabpage()
         if vim.wo[w].conceallevel < 1 then
@@ -748,8 +749,29 @@ function M.attach(s)
         end
         vim.wo[w].concealcursor = "nc"
         M.refresh_winbar(s)
-        M.render(s)
+        -- back from another file: bring back the pane BufWinLeave took away
+        M.on_cursor(s, true)
       end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      -- the buffer is still in the window here; check once it's been swapped out
+      vim.schedule(function()
+        if not s.results_win or not vim.api.nvim_win_is_valid(s.results_win) then
+          return
+        end
+        local tab = vim.api.nvim_win_get_tabpage(s.results_win)
+        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+          if vim.api.nvim_win_get_buf(w) == buf then
+            return -- still shown in another window of the tab
+          end
+        end
+        -- fails (and the pane stays) when it's the last window left
+        pcall(vim.api.nvim_win_close, s.results_win, true)
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("VimResized", {
