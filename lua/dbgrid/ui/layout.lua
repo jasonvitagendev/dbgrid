@@ -128,7 +128,7 @@ function M.focus(s)
   M.ensure_results(s)
   s.last_used = util.now()
   -- back to the grid of the cell under the cursor; plan/record views are transient
-  s.view = { truncate = s.view and s.view.truncate }
+  s.view = { truncate = s.view and s.view.truncate, mode = s.view and s.view.mode == "schema" and "schema" or nil }
   require("dbgrid.ui.query").on_cursor(s, true)
 end
 
@@ -233,6 +233,8 @@ function M.winbar_query(buf)
   parts[#parts + 1] = "%#DbgridWinbarTitle# " .. esc(s.nb.meta.title) .. " "
   local n = #require("dbgrid.cells").parse(buf)
   parts[#parts + 1] = "%#DbgridWinbarDim#" .. n .. (n == 1 and " cell" or " cells")
+  local agent = require("dbgrid.ai").agent_name(s)
+  parts[#parts + 1] = " %#DbgridWinbarDim#│%#DbgridWinbarAgent# " .. esc(icons.agent) .. " " .. esc(agent) .. " "
   return table.concat(parts)
 end
 

@@ -22,6 +22,8 @@ local M = {}
 ---@field title string
 ---@field tags string[]
 ---@field connection string?
+---@field agent string?            coding agent used for prompts (overrides ai.agent)
+---@field params table<string,string>  parameter values entered for this notebook
 ---@field created_at integer
 ---@field updated_at integer
 ---@field cells table<string, dbgrid.CellMeta>
@@ -59,6 +61,13 @@ local function load_meta(nb)
   meta.title = meta.title or nb.name
   meta.tags = meta.tags or {}
   meta.cells = meta.cells or {}
+  meta.params = meta.params or {}
+  if meta.params == vim.NIL then
+    meta.params = {}
+  end
+  if meta.agent == vim.NIL then
+    meta.agent = nil
+  end
   meta.created_at = meta.created_at or util.epoch()
   meta.updated_at = meta.updated_at or meta.created_at
   if meta.connection == vim.NIL then
@@ -161,6 +170,7 @@ function M.create(title, opts)
     created_at = util.epoch(),
     updated_at = util.epoch(),
     cells = {},
+    params = {},
   }
   local id = util.short_id(4)
   util.write_file(nb.path, require("dbgrid.cells").header_line(id) .. "\n\n")
@@ -299,6 +309,8 @@ local function slim(result)
     sql_hash = result.sql_hash,
     truncated = result.truncated,
     cancelled = result.cancelled,
+    params = result.params,
+    refs = result.refs,
     statements = {},
   }
   for i, st in ipairs(result.statements or {}) do
@@ -414,6 +426,24 @@ end
 ---@param connection string?
 function M.set_connection(nb, connection)
   nb.meta.connection = connection
+  M.save_meta(nb)
+end
+
+---Remember a parameter value (nil forgets it).
+---@param nb dbgrid.Notebook
+---@param name string
+---@param value string?
+function M.set_param(nb, name, value)
+  nb.meta.params = nb.meta.params or {}
+  nb.meta.params[name] = value
+  M.save_meta(nb)
+end
+
+---Coding agent for this notebook (nil = the configured default).
+---@param nb dbgrid.Notebook
+---@param agent string?
+function M.set_agent(nb, agent)
+  nb.meta.agent = agent
   M.save_meta(nb)
 end
 

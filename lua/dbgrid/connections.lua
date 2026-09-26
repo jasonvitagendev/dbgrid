@@ -75,6 +75,15 @@ function M.discovered(root)
       end
     end
   end
+  -- Rails: config/database.yml
+  if not cfg.rails or cfg.rails.enabled ~= false then
+    for _, c in ipairs(require("dbgrid.rails").connections(root, cfg.rails and cfg.rails.environments)) do
+      if not seen[c.url] then
+        seen[c.url] = true
+        out[#out + 1] = c
+      end
+    end
+  end
   return out
 end
 
@@ -190,30 +199,33 @@ function M.add_interactive(cb)
     if not name or name == "" then
       return cb and cb(nil)
     end
-    vim.ui.input({ prompt = "URL (postgres://user:pass@host:5432/db or $DATABASE_URL): " }, function(url)
-      if not url or url == "" then
-        return cb and cb(nil)
-      end
-      local conn = { name = name, url = url }
-      local a, err = adapters.for_connection({ name = name, url = util.expand_env(url) })
-      if not a then
-        util.error(err or "unsupported url")
-        return cb and cb(nil)
-      end
-      vim.ui.select({ "this project only", "everywhere", "read-only, this project only", "read-only, everywhere" }, {
-        prompt = "Save connection",
-      }, function(choice, idx)
-        if not choice then
+    vim.ui.input(
+      { prompt = "URL (postgres://user:pass@host:5432/db, sqlite:path/to.db or $DATABASE_URL): " },
+      function(url)
+        if not url or url == "" then
           return cb and cb(nil)
         end
-        conn.readonly = idx >= 3 or nil
-        M.save(conn, (idx == 1 or idx == 3) and "project" or "global")
-        util.notify("saved connection " .. name)
-        if cb then
-          cb(M.get(name))
+        local conn = { name = name, url = url }
+        local a, err = adapters.for_connection({ name = name, url = util.expand_env(url) })
+        if not a then
+          util.error(err or "unsupported url")
+          return cb and cb(nil)
         end
-      end)
-    end)
+        vim.ui.select({ "this project only", "everywhere", "read-only, this project only", "read-only, everywhere" }, {
+          prompt = "Save connection",
+        }, function(choice, idx)
+          if not choice then
+            return cb and cb(nil)
+          end
+          conn.readonly = idx >= 3 or nil
+          M.save(conn, (idx == 1 or idx == 3) and "project" or "global")
+          util.notify("saved connection " .. name)
+          if cb then
+            cb(M.get(name))
+          end
+        end)
+      end
+    )
   end)
 end
 
