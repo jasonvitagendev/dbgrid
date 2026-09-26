@@ -834,7 +834,7 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       local w = vim.api.nvim_get_current_win()
-      if vim.api.nvim_win_get_buf(w) == buf and w ~= s.results_win then
+      if vim.api.nvim_win_get_buf(w) == buf then
         s.query_win = w
         s.tab = vim.api.nvim_get_current_tabpage()
         if vim.wo[w].conceallevel < 1 then

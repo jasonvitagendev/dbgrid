@@ -407,49 +407,6 @@ H.describe("notebook ui", function()
     H.eq(vim.wo[s.results_win].foldmethod, "manual")
   end)
 
-  H.it("brings the results pane back after it was closed or taken over", function()
-    vim.api.nvim_set_current_win(s.query_win)
-    -- closed
-    vim.api.nvim_win_close(s.results_win, true)
-    H.eq(s.results_win, nil)
-    layout.focus_results(s)
-    H.truthy(layout.results_visible(s))
-    H.eq(vim.api.nvim_get_current_win(), s.results_win)
-    vim.api.nvim_set_current_win(s.query_win)
-    -- another file opened in it: the file keeps its window, results get a new one
-    local other = vim.api.nvim_create_buf(true, false)
-    vim.api.nvim_buf_set_name(other, tmp .. "/other.txt")
-    local old_win = s.results_win
-    vim.api.nvim_win_set_buf(old_win, other)
-    layout.focus_results(s)
-    H.truthy(layout.results_visible(s))
-    H.truthy(s.results_win ~= old_win)
-    H.eq(vim.api.nvim_win_get_buf(old_win), other)
-    vim.api.nvim_win_close(old_win, true)
-    vim.api.nvim_set_current_win(s.query_win)
-    -- :bdelete put the query buffer in the results window: take it back
-    local rw = s.results_win
-    vim.api.nvim_win_set_buf(rw, s.buf)
-    layout.focus_results(s)
-    H.eq(s.results_win, rw)
-    H.truthy(layout.results_visible(s))
-    H.matches(table.concat(results_lines(s), "\n"), "not been run")
-    vim.api.nvim_set_current_win(s.query_win)
-    -- the results buffer itself was deleted
-    local rb = s.results_buf
-    vim.api.nvim_buf_delete(rb, { force = true, unload = true })
-    layout.focus_results(s)
-    H.truthy(layout.results_visible(s))
-    H.truthy(s.results_buf ~= rb)
-    H.eq(vim.wo[s.results_win].winfixwidth, true)
-    vim.api.nvim_set_current_win(s.query_win)
-    -- squeezed by a zoom
-    vim.api.nvim_win_set_width(s.results_win, 1)
-    layout.focus_results(s)
-    H.truthy(vim.api.nvim_win_get_width(s.results_win) >= 20)
-    vim.api.nvim_set_current_win(s.query_win)
-  end)
-
   H.it("cancels a running query, client side and server side", function()
     set_cells(s, { "-- %% [cx1] slow", "select pg_sleep(20)" })
     local done

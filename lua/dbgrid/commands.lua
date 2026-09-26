@@ -137,12 +137,6 @@ M.subcommands = {
     end
     require("dbgrid.ui.query").refresh_schema(s)
   end,
-  results = function()
-    local s = current_or_warn()
-    if s then
-      require("dbgrid.ui.layout").focus_results(s)
-    end
-  end,
   format = function(args)
     local s = current_or_warn()
     if not s then
