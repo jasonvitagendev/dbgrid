@@ -247,7 +247,7 @@ Query pane:
 | `\s` / `\S` | refresh the schema cache / pick a table (inserts the name) |
 | `\b` | browse the schema document in the results pane |
 | `K` | describe the table or column under the cursor |
-| `\<Tab>` | focus the results pane (recreating it when it was closed or taken over) |
+| `\<Tab>` | focus the results pane |
 | `\z` | zoom the current pane |
 | `\q` | close the notebook |
 | `ic` / `ac` | text objects: cell body / whole cell (`dic`, `yac`, …) |
@@ -294,7 +294,6 @@ do everywhere.
 | `ask <prompt>` | add a prompt to the current cell and generate |
 | `schema refresh` / `schema tables` / `schema view` | refresh the cache / pick a table / toggle the schema document |
 | `describe <table>` | describe a table |
-| `results` | show and focus the results pane (recreates it when it went missing) |
 | `rename <title>` / `delete` / `close` | notebook management |
 | `export csv|json [path]` | current result to the clipboard or a file |
 | `cancel` | stop what is running |

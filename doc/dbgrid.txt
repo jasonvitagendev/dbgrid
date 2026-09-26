@@ -14,8 +14,7 @@ CONTENTS                                                     *dbgrid-contents*
   9. Plans and EXPLAIN ANALYZE ........... |dbgrid-explain|
  10. Prompt to SQL ....................... |dbgrid-ai|
  11. Schema and completion ............... |dbgrid-schema|
- 12. Results pane ........................ |dbgrid-results|
- 13. Adapters (PostgreSQL, SQLite) ....... |dbgrid-adapters|
+ 12. Adapters (PostgreSQL, SQLite) ....... |dbgrid-adapters|
 
 ==============================================================================
 1. INTRODUCTION                                                 *dbgrid-intro*
@@ -110,7 +109,6 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid schema tables          pick a table (inserts its name)
 :Dbgrid schema view            toggle the schema document
 :Dbgrid describe {table}       describe a table
-:Dbgrid results                show and focus the results pane (recreates it)
 :Dbgrid rename {title}         rename the notebook
 :Dbgrid delete                 delete the notebook
 :Dbgrid close                  close the notebook layout
@@ -268,16 +266,7 @@ after `alias.`, tables, schemas, keywords and functions of the connection's
 dialect, cell names and parameters after `{{`, parameters after `:`.
 
 ==============================================================================
-12. RESULTS PANE                                              *dbgrid-results*
-
-The results pane is recreated whenever it is needed: after it was closed,
-after another buffer took over its window (`:bdelete`, a picker opening a
-file there — the file keeps that window and the results get a new one),
-after the results buffer was deleted, after a zoom squeezed it. `\<Tab>` in
-the query pane and `:Dbgrid results` bring it back and focus it.
-
-==============================================================================
-13. ADAPTERS                                                 *dbgrid-adapters*
+12. ADAPTERS                                                 *dbgrid-adapters*
 
 PostgreSQL (`psql`) and SQLite (`sqlite3`) are built in.
 `require("dbgrid").register_adapter(adapter)` adds another database. See
