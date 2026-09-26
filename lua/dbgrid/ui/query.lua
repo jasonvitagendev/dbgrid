@@ -411,6 +411,77 @@ function M.refresh_schema(s)
   end)
 end
 
+---Edit the notebook's parameter values.
+---@param s dbgrid.State
+function M.edit_params(s)
+  local expand = require("dbgrid.expand")
+  local list = expand.notebook_params(s)
+  local items = {}
+  for _, p in ipairs(list) do
+    items[#items + 1] = {
+      text = string.format(
+        ":%s = %s%s   (%s)",
+        p.name,
+        p.value or "?",
+        p.source == "cell" and " [-- @param]" or "",
+        #p.cells > 0 and table.concat(p.cells, ", ") or "unused"
+      ),
+      data = p,
+      preview = { p.value or "no value yet" },
+    }
+  end
+  items[#items + 1] = { text = "+ set another parameter", data = "new", preview = { "" } }
+  local function set_value(name, default)
+    vim.ui.input(
+      { prompt = "Value for :" .. name .. " (a SQL literal, e.g. 'text', 42): ", default = default or "" },
+      function(v)
+        if v == nil then
+          return
+        end
+        v = util.trim(v)
+        notebook.set_param(s.nb, name, v ~= "" and v or nil)
+        util.notify(v ~= "" and (":" .. name .. " = " .. v) or ("forgot :" .. name))
+      end
+    )
+  end
+  require("dbgrid.ui.picker").pick(items, {
+    prompt = "Parameters",
+    preview = false,
+    on_select = function(item)
+      if not item then
+        return
+      end
+      if item.data == "new" then
+        vim.ui.input({ prompt = "Parameter name: " }, function(name)
+          if name and name:match("^[%w_]+$") then
+            set_value(name)
+          end
+        end)
+        return
+      end
+      if item.data.source == "cell" then
+        util.notify(":" .. item.data.name .. " is set by a -- @param line; that value wins over the one entered here")
+      end
+      set_value(item.data.name, item.data.value)
+    end,
+  })
+end
+
+---Format the SQL of the current cell.
+---@param s dbgrid.State
+function M.format_cell(s)
+  local cell = M.current_cell(s)
+  if not cell then
+    return
+  end
+  local changed, err = require("dbgrid.format").cell(s, cell, { notify = true })
+  if changed then
+    util.notify("formatted " .. cells.ref_name(cell))
+  elseif not err then
+    util.notify("already formatted")
+  end
+end
+
 ---@param s dbgrid.State
 function M.browse_tables(s)
   require("dbgrid.runner").with_connection(s, nil, function(conn)
@@ -660,6 +731,24 @@ function M.attach(s)
   map(buf, "n", k.tables, function()
     M.browse_tables(s)
   end, "browse tables")
+  map(buf, "n", k.schema_view, function()
+    local results = require("dbgrid.ui.results")
+    if s.view.mode == "schema" then
+      results.toggle_schema(s)
+    else
+      results.toggle_schema(s)
+      layout.focus_results(s)
+    end
+  end, "browse the schema (foldable, searchable)")
+  map(buf, "n", k.format, function()
+    M.format_cell(s)
+  end, "format the cell's SQL")
+  map(buf, "n", k.params, function()
+    M.edit_params(s)
+  end, "edit parameters")
+  map(buf, "n", k.agent, function()
+    require("dbgrid.ai").pick_agent(s)
+  end, "pick the coding agent")
   map(buf, "n", k.describe, function()
     M.describe_under_cursor(s)
   end, "describe table/column under cursor")
@@ -713,6 +802,11 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       cells.ensure_ids(buf)
+      if config.get().format.on_save then
+        local view = vim.fn.winsaveview()
+        require("dbgrid.format").buffer(s, { notify = false })
+        pcall(vim.fn.winrestview, view)
+      end
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {
@@ -740,7 +834,7 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       local w = vim.api.nvim_get_current_win()
-      if vim.api.nvim_win_get_buf(w) == buf then
+      if vim.api.nvim_win_get_buf(w) == buf and w ~= s.results_win then
         s.query_win = w
         s.tab = vim.api.nvim_get_current_tabpage()
         if vim.wo[w].conceallevel < 1 then

@@ -7,7 +7,7 @@
 local M = {}
 
 ---@class dbgrid.Token
----@field type "word"|"number"|"string"|"ident"|"op"|"punct"|"param"
+---@field type "word"|"number"|"string"|"ident"|"op"|"punct"|"param"|"comment"
 ---@field value string   raw text (words are lower-cased in `lower`)
 ---@field lower string
 ---@field s integer      1-based byte start
@@ -34,10 +34,13 @@ local function is_ident_char(c)
   return c:match("[%w_$]") ~= nil
 end
 
----Tokenize SQL. Comments and whitespace are skipped.
+---Tokenize SQL. Comments and whitespace are skipped unless `opts.comments`
+---asks for comment tokens (used by the formatter to keep them).
 ---@param text string
+---@param opts? { comments?: boolean }
 ---@return dbgrid.Token[]
-function M.tokenize(text)
+function M.tokenize(text, opts)
+  local with_comments = opts and opts.comments
   local tokens = {}
   local i, n = 1, #text
   local line, line_start = 1, 1
@@ -77,6 +80,9 @@ function M.tokenize(text)
       i = i + 1
     elseif two == "--" then
       local e = text:find("\n", i, true) or (n + 1)
+      if with_comments then
+        push("comment", i, e - 1)
+      end
       i = e -- newline handled on next iteration
     elseif two == "/*" then
       local d = 1
@@ -92,6 +98,9 @@ function M.tokenize(text)
         else
           j = j + 1
         end
+      end
+      if with_comments then
+        push("comment", i, j - 1)
       end
       advance_lines(i, j - 1)
       i = j
@@ -178,6 +187,17 @@ function M.tokenize(text)
       local e = i
       while e < n and text:sub(e + 1, e + 1):match("[%w%.]") do
         e = e + 1
+      end
+      -- signed exponent: 1e-5, 2.5E+3
+      if
+        text:sub(e, e):match("[eE]")
+        and text:sub(e + 1, e + 1):match("[%+%-]")
+        and text:sub(e + 2, e + 2):match("%d")
+      then
+        e = e + 1
+        while e < n and text:sub(e + 1, e + 1):match("%d") do
+          e = e + 1
+        end
       end
       push("number", i, e)
       i = e + 1
@@ -618,6 +638,158 @@ end
 ---@param s string
 function M.strip_semicolon(s)
   return (s:gsub("%s*;%s*$", ""))
+end
+
+---Normalised text: comments dropped, words lower-cased, tokens separated by
+---one space. Whitespace, comments and keyword case do not change it, so it is
+---what cells are hashed on (formatting a cell does not mark it as edited).
+---@param text string
+---@return string
+function M.normalize(text)
+  local parts = {}
+  for _, t in ipairs(M.tokenize(text)) do
+    parts[#parts + 1] = t.type == "word" and t.lower or t.value
+  end
+  return table.concat(parts, " ")
+end
+
+---The text on one line with comments removed, keeping the original spacing
+---between tokens where it had none (so `1e-5`, `a.b` or `x::int` survive).
+---Used when a cell is inlined into another one as a subquery.
+---@param text string
+---@return string
+function M.inline(text)
+  local tokens = M.tokenize(text)
+  if #tokens == 0 then
+    return ""
+  end
+  local out = {}
+  for i, t in ipairs(tokens) do
+    if i > 1 then
+      local gap = text:sub(tokens[i - 1].e + 1, t.s - 1)
+      if gap:find("\n", 1, true) or gap:find("--", 1, true) or gap:find("/*", 1, true) then
+        gap = " "
+      end
+      out[#out + 1] = gap
+    end
+    out[#out + 1] = t.value
+  end
+  return table.concat(out)
+end
+
+---@class dbgrid.Placeholder
+---@field name string
+---@field s integer   1-based byte start in the text
+---@field e integer   1-based byte end (inclusive)
+---@field style ":"|"{{"
+
+---`:name` (psql / sqlite style) and `{{name}}` placeholders, outside strings,
+---quoted identifiers and comments. `::` casts and `$1` parameters are not
+---placeholders. Returned in text order.
+---@param text string
+---@return dbgrid.Placeholder[]
+function M.placeholders(text)
+  local tokens = M.tokenize(text)
+  local out = {}
+  local i = 1
+  while i <= #tokens do
+    local t = tokens[i]
+    local nxt = tokens[i + 1]
+    if
+      t.type == "op"
+      and t.value:sub(-1) == ":"
+      and t.value:sub(-2) ~= "::"
+      and nxt
+      and nxt.type == "word"
+      and nxt.s == t.e + 1
+    then
+      -- ":name" (the colon may be glued to a preceding operator, as in "id=:id")
+      out[#out + 1] = { name = nxt.value, s = t.e, e = nxt.e, style = ":" }
+      i = i + 2
+    elseif t.type == "op" and t.value == "{" and nxt and nxt.value == "{" then
+      -- "{{name}}": the name may be a slug with hyphens, which the tokenizer
+      -- splits into words and minus signs
+      local parts, j = {}, i + 2
+      while tokens[j] and #parts < 12 do
+        local tk = tokens[j]
+        if tk.value == "}" then
+          break
+        end
+        if tk.type == "word" or tk.type == "number" or (tk.type == "op" and tk.value:match("^%-+$")) then
+          parts[#parts + 1] = tk.value
+          j = j + 1
+        else
+          parts = nil
+          break
+        end
+      end
+      if
+        parts
+        and #parts > 0
+        and tokens[j]
+        and tokens[j].value == "}"
+        and tokens[j + 1]
+        and tokens[j + 1].value == "}"
+      then
+        out[#out + 1] = { name = table.concat(parts), s = t.s, e = tokens[j + 1].e, style = "{{" }
+        i = j + 2
+      else
+        i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+  return out
+end
+
+---Replace placeholders. `fn` returns the replacement text for a placeholder,
+---or nil to leave it untouched.
+---@param text string
+---@param refs dbgrid.Placeholder[]   from M.placeholders (in text order)
+---@param fn fun(ref: dbgrid.Placeholder): string?
+---@return string
+function M.substitute(text, refs, fn)
+  local out, pos = {}, 1
+  for _, r in ipairs(refs) do
+    local v = fn(r)
+    if v ~= nil and r.s >= pos then
+      out[#out + 1] = text:sub(pos, r.s - 1)
+      out[#out + 1] = v
+      pos = r.e + 1
+    end
+  end
+  out[#out + 1] = text:sub(pos)
+  return table.concat(out)
+end
+
+---Column names (from `columns`) mentioned in the WHERE clause of a statement.
+---@param text string
+---@param columns string[]
+---@return string[]
+function M.where_columns(text, columns)
+  local tokens = M.tokenize(text)
+  local set = {}
+  for _, c in ipairs(columns) do
+    set[c:lower()] = c
+  end
+  local found = {}
+  local in_where = false
+  local STOP =
+    { group = true, order = true, limit = true, offset = true, fetch = true, returning = true, window = true }
+  for _, t in ipairs(tokens) do
+    if t.depth == 0 and t.type == "word" then
+      if t.lower == "where" then
+        in_where = true
+      elseif STOP[t.lower] then
+        in_where = false
+      end
+    end
+    if in_where and t.type == "word" and set[t.lower] and not vim.tbl_contains(found, set[t.lower]) then
+      found[#found + 1] = set[t.lower]
+    end
+  end
+  return found
 end
 
 return M

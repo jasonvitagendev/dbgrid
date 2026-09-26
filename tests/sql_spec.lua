@@ -120,3 +120,42 @@ H.describe("sql.referenced_tables", function()
     H.eq(sql.referenced_tables('select * from "Weird Table" w'), { { name = '"Weird Table"', alias = "w" } })
   end)
 end)
+
+H.describe("sql.placeholders", function()
+  H.it("finds :name and {{name}} outside strings, comments and casts", function()
+    local text =
+      "select x::int from t where id=:id and a = ':nope' -- :c\n and b = {{ since }} and c = {{overdue-invoices}} and $1 = 1"
+    local names = vim.tbl_map(function(r)
+      return r.style .. r.name
+    end, sql.placeholders(text))
+    H.eq(names, { ":id", "{{since", "{{overdue-invoices" })
+    local out = sql.substitute(text, sql.placeholders(text), function(r)
+      return "<" .. r.name .. ">"
+    end)
+    H.matches(out, "id=<id>")
+    H.matches(out, "b = <since>")
+    H.matches(out, "c = <overdue%-invoices>")
+    H.matches(out, "':nope'")
+    H.matches(out, "x::int")
+  end)
+  H.it("normalises and inlines text", function()
+    H.eq(sql.normalize("SELECT  a ,\n b FROM t -- x"), sql.normalize("select a, b\nfrom t"))
+    H.truthy(sql.normalize("select 'A'") ~= sql.normalize("select 'a'"))
+    H.eq(
+      sql.inline("select a.b, -- c\n  1e-5, x::int\nfrom t /* z */ where a = 1"),
+      "select a.b, 1e-5, x::int from t where a = 1"
+    )
+    H.eq(#sql.tokenize("select 1 -- c\n/* b */", { comments = true }), 4)
+    H.eq(sql.tokenize("select 1e-5, 2.5E+3, 3-1")[2].value, "1e-5")
+    H.eq(#sql.tokenize("select 3-1"), 4)
+  end)
+  H.it("lists the columns a WHERE clause uses", function()
+    H.eq(
+      sql.where_columns(
+        "select * from t where balance > 5 and email like 'x' order by id",
+        { "id", "email", "balance" }
+      ),
+      { "balance", "email" }
+    )
+  end)
+end)
