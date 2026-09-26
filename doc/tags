@@ -1,0 +1,13 @@
+:Dbgrid	dbgrid.txt	/*:Dbgrid*
+dbgrid	dbgrid.txt	/*dbgrid*
+dbgrid-adapters	dbgrid.txt	/*dbgrid-adapters*
+dbgrid-ai	dbgrid.txt	/*dbgrid-ai*
+dbgrid-commands	dbgrid.txt	/*dbgrid-commands*
+dbgrid-completion	dbgrid.txt	/*dbgrid-completion*
+dbgrid-contents	dbgrid.txt	/*dbgrid-contents*
+dbgrid-format	dbgrid.txt	/*dbgrid-format*
+dbgrid-intro	dbgrid.txt	/*dbgrid-intro*
+dbgrid-keymaps	dbgrid.txt	/*dbgrid-keymaps*
+dbgrid-run	dbgrid.txt	/*dbgrid-run*
+dbgrid-setup	dbgrid.txt	/*dbgrid-setup*
+dbgrid.txt	dbgrid.txt	/*dbgrid.txt*

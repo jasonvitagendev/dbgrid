@@ -1043,6 +1043,7 @@ function M.attach(s)
       end
     end,
   })
+  util.refresh_keymap_hints(buf)
 end
 
 return M

@@ -774,6 +774,7 @@ function M.attach(s)
       state_mod.detach(buf)
     end,
   })
+  util.refresh_keymap_hints(buf)
   M.render(s)
 end
 
