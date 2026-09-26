@@ -92,9 +92,9 @@ local function normalise(raw)
       data.tables[#data.tables + 1] = t
       local full = (t.schema .. "." .. t.name):lower()
       data.by_name[full] = t
-      -- bare names resolve to public first, then the first schema seen
+      -- bare names resolve to the default schema first, then the first schema seen
       local bare = t.name:lower()
-      if not data.by_name[bare] or t.schema == "public" then
+      if not data.by_name[bare] or M.is_default_schema(t.schema) then
         data.by_name[bare] = t
       end
     end
@@ -205,10 +205,16 @@ function M.find_column(tbl, col)
   end
 end
 
----Display name: `name` for public, `schema.name` otherwise.
+---Schemas whose tables are referenced without a prefix.
+---@param name string
+function M.is_default_schema(name)
+  return name == "public" or name == "main"
+end
+
+---Display name: `name` in the default schema, `schema.name` otherwise.
 ---@param tbl dbgrid.SchemaTable
 function M.display_name(tbl)
-  if tbl.schema == "public" then
+  if M.is_default_schema(tbl.schema) then
     return tbl.name
   end
   return tbl.schema .. "." .. tbl.name

@@ -114,3 +114,37 @@ H.describe("util", function()
     H.eq(util.expand_env("x=${HOME}/y", {}), "x=" .. os.getenv("HOME") .. "/y")
   end)
 end)
+
+H.describe("cells.params / depends / find", function()
+  H.it("reads parameter and dependency directives", function()
+    local b = buf_with({
+      "-- %% [p1] Overdue Invoices",
+      "-- @param days = 30",
+      "-- @param uid",
+      "-- @depends q2, totals",
+      "select :days, :uid",
+      "-- %% [p2] totals",
+      "select 1",
+    })
+    local c = cells.parse(b)
+    H.eq(cells.params(c[1]), { { name = "days", value = "30" }, { name = "uid", value = "" } })
+    H.eq(cells.depends(c[1]), { "q2", "totals" })
+    H.eq(cells.ref_name(c[1]), "overdue-invoices")
+    H.eq(cells.ref_name(c[2]), "totals")
+    H.eq(cells.find(c, "p2").id, "p2")
+    H.eq(cells.find(c, "q1").id, "p1")
+    H.eq(cells.find(c, "Totals").id, "p2")
+    H.eq(cells.find(c, "overdue-invoices").id, "p1")
+    H.eq(cells.find(c, "nope"), nil)
+  end)
+  H.it("hashes independently of formatting but not of directives", function()
+    local a = buf_with({ "-- %% [h1]", "select  id,email FROM users -- c", "where x = 1" })
+    local b = buf_with({ "-- %% [h1]", "SELECT id, email", "from users", "WHERE x = 1" })
+    local c = buf_with({ "-- %% [h1]", "-- @nolimit", "select id, email from users where x = 1" })
+    local d = buf_with({ "-- %% [h1]", "select id, email from users where x = 'X'" })
+    local ha, hb = cells.hash(cells.parse(a)[1]), cells.hash(cells.parse(b)[1])
+    H.eq(ha, hb)
+    H.truthy(cells.hash(cells.parse(c)[1]) ~= ha)
+    H.truthy(cells.hash(cells.parse(d)[1]) ~= ha)
+  end)
+end)

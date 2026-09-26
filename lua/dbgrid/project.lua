@@ -53,6 +53,19 @@ function M.data_dir()
   return config.get().storage.data_dir
 end
 
+local framework_cache = {}
+
+---Framework the project is built with, when it matters to dbgrid ("rails"), else nil.
+---@param root? string
+---@return string?
+function M.framework(root)
+  root = root or M.root()
+  if framework_cache[root] == nil then
+    framework_cache[root] = require("dbgrid.rails").is_rails(root) and "rails" or false
+  end
+  return framework_cache[root] or nil
+end
+
 ---Human readable name of the project.
 ---@param root? string
 function M.name(root)
