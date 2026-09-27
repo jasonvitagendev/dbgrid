@@ -69,17 +69,32 @@ function M.status_chunks(s, cell)
   local function add(text, hl)
     chunks[#chunks + 1] = { text, hl }
   end
-  if running then
+  local live = s.live and s.live[cell.id]
+  if running and not (live and running.kind == "run") then
     local frame = SPINNER[(s.spinner_frame or 0) % #SPINNER + 1]
     local secs = util.now() - (running.started or util.now())
-    add(
-      string.format(" %s %s %.1fs ", frame, running.kind == "explain" and "planning" or "running", secs),
-      "DbgridStatusRunning"
-    )
+    local what = ({ explain = "planning", analyze = "asking the agent", run = "running" })[running.kind] or running.kind
+    add(string.format(" %s %s %.1fs ", frame, what, secs), "DbgridStatusRunning")
     return chunks
+  end
+  if live then
+    add(
+      string.format(
+        " %s live every %s · %d ticks%s ",
+        icons.live,
+        util.fmt_ms(live.interval),
+        live.ticks or 0,
+        (live.changed_count or 0) > 0 and (" · " .. icons.changed .. " " .. live.changed_count) or ""
+      ),
+      "DbgridLive"
+    )
   end
   if rt.status == "generating" then
     add(" " .. icons.generated .. " generating… ", "DbgridStatusRunning")
+    return chunks
+  end
+  if rt.status == "analyzing" and not running then
+    add(" " .. icons.generated .. " analyzing… ", "DbgridStatusRunning")
     return chunks
   end
   if rt.status == "generated" then
@@ -104,6 +119,9 @@ function M.status_chunks(s, cell)
     end
     if meta.warnings and #meta.warnings > 0 then
       add(icons.warn .. " seq scan ", "DbgridStatusWarn")
+    end
+    if meta.dry_run then
+      add("dry run ", "DbgridStatusWarn")
     end
     if stale then
       add(icons.stale .. " edited ", "DbgridStatusStale")
@@ -251,6 +269,12 @@ function M.on_change(s)
     vim.b[s.buf].dbgrid_cells_cache = nil
   end
   M.render(s)
+  for id in pairs(s.live or {}) do
+    local c = cells.by_id(s.buf, id)
+    if c then
+      require("dbgrid.runner").on_cell_edited(s, c)
+    end
+  end
   local cell = M.current_cell(s)
   if cell and cell.id then
     local meta = s.nb.meta.cells[cell.id]
@@ -719,6 +743,27 @@ function M.attach(s)
       require("dbgrid.ai").generate(s, cell)
     end
   end, "generate SQL from the cell prompt")
+  map(buf, "n", k.analyze, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.analyze_cell(s, cell)
+    end
+  end, "analyze the plan with the agent")
+  map(buf, "n", k.explain_error, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.explain_error(s, cell)
+    end
+  end, "explain the last error with the agent")
+  map(buf, "n", k.try_index, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.try_index(s, cell)
+    end
+  end, "try the suggested index (hypopg)")
+  map(buf, "n", k.history, function()
+    require("dbgrid.commands").subcommands.history({})
+  end, "query history")
   map(buf, "n", k.tags, function()
     M.edit_tags(s)
   end, "edit notebook tags")
@@ -884,6 +929,7 @@ function M.attach(s)
     group = group,
     buffer = buf,
     callback = function()
+      require("dbgrid.runner").stop_all_live(s, "closed")
       if s.spinner_timer then
         s.spinner_timer:stop()
         s.spinner_timer:close()
@@ -891,6 +937,9 @@ function M.attach(s)
       end
       if s.results_win and vim.api.nvim_win_is_valid(s.results_win) then
         pcall(vim.api.nvim_win_close, s.results_win, true)
+      end
+      if s.analysis_win and vim.api.nvim_win_is_valid(s.analysis_win) then
+        pcall(vim.api.nvim_win_close, s.analysis_win, true)
       end
       state_mod.detach(buf)
     end,

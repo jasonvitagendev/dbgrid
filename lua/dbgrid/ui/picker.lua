@@ -143,15 +143,24 @@ end
 
 ---Pick a connection (or add one).
 ---@param cb fun(conn?: dbgrid.Connection)
-function M.connection(cb)
+---@param opts? { prompt?: string, exclude?: string }
+function M.connection(cb, opts)
+  opts = opts or {}
   local connections = require("dbgrid.connections")
   local items = {}
   for _, c in ipairs(connections.all()) do
-    items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url) } }
+    if c.name ~= opts.exclude then
+      items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url or "") } }
+    end
   end
   items[#items + 1] = { text = "+ add connection", data = "new", preview = { "Save a new connection url." } }
+  items[#items + 1] = {
+    text = "+ add AWS RDS / Aurora connection",
+    data = "aws",
+    preview = { "Profile, cluster, bastion, secret." },
+  }
   M.pick(items, {
-    prompt = "Connections",
+    prompt = opts.prompt or "Connections",
     preview = false,
     on_select = function(item)
       if not item then
@@ -159,6 +168,9 @@ function M.connection(cb)
       end
       if item.data == "new" then
         return connections.add_interactive(cb)
+      end
+      if item.data == "aws" then
+        return require("dbgrid.aws").add_interactive(cb)
       end
       cb(item.data)
     end,

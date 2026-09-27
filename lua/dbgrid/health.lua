@@ -39,19 +39,26 @@ function M.check()
       "no connections: add one in setup({ connections = ... }), in .env (DATABASE_URL), in config/database.yml or with :Dbgrid connections"
     )
   end
+  local any_aws = false
   for _, c in ipairs(conns) do
     local a, err = adapters.for_connection(c)
+    if c.aws then
+      any_aws = true
+    end
     if not a then
       health.error(c.name .. ": " .. tostring(err))
     elseif vim.fn.executable(a.executable) ~= 1 then
       health.warn(c.name .. ": needs '" .. a.executable .. "' on PATH")
+    elseif c.aws and c.aws_role ~= "writer" then
+      health.info(c.name .. ": reader entry of " .. tostring(c.parent))
     else
+      -- through connections.test so tunnels, aws blocks and password_cmd are resolved
       local ok, msg
-      local started = pcall(a.test, c, function(o, m)
+      local started = pcall(require("dbgrid.connections").test, c, function(o, m)
         ok, msg = o, m
       end)
       if started then
-        vim.wait(8000, function()
+        vim.wait(c.aws and 60000 or 8000, function()
           return ok ~= nil
         end, 50)
       end
@@ -60,6 +67,21 @@ function M.check()
       else
         health.warn(c.name .. ": " .. tostring(msg or "no answer"))
       end
+    end
+  end
+  if any_aws then
+    local ok_aws, aws = pcall(require, "dbgrid.aws")
+    if ok_aws and aws.health then
+      health.start("dbgrid: aws")
+      aws.health({ ok = health.ok, warn = health.warn, error = health.error, info = health.info })
+    end
+  end
+  local ok_tunnel, tunnel = pcall(require, "dbgrid.tunnel")
+  if ok_tunnel and tunnel.list then
+    for _, t in ipairs(tunnel.list()) do
+      (t.ok and health.ok or health.warn)(
+        string.format("tunnel %s: localhost:%d%s", t.key, t.port or 0, t.ok and "" or " (dead)")
+      )
     end
   end
   local project = require("dbgrid.project")

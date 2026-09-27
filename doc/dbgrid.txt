@@ -13,8 +13,13 @@ CONTENTS                                                     *dbgrid-contents*
   8. Formatting .......................... |dbgrid-formatting|
   9. Plans and EXPLAIN ANALYZE ........... |dbgrid-explain|
  10. Prompt to SQL ....................... |dbgrid-ai|
- 11. Schema and completion ............... |dbgrid-schema|
- 12. Adapters (PostgreSQL, SQLite) ....... |dbgrid-adapters|
+ 11. Plan analysis with the agent ........ |dbgrid-analyze|
+ 12. Templates ........................... |dbgrid-templates|
+ 13. Live cells .......................... |dbgrid-live|
+ 14. Diffs, history, export .............. |dbgrid-diff|
+ 15. AWS RDS and tunnels ................. |dbgrid-aws|
+ 16. Schema and completion ............... |dbgrid-schema|
+ 17. Adapters (PostgreSQL, SQLite) ....... |dbgrid-adapters|
 
 ==============================================================================
 1. INTRODUCTION                                                 *dbgrid-intro*
@@ -84,6 +89,9 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 `-- @notx`           do not wrap a multi-statement cell in a transaction.
 `-- @conn name`      run this cell on another connection.
 `-- @agent name`     send this cell's prompt to another agent.
+`-- @dryrun`         run a write with RETURNING * and roll it back.
+`-- @every 5s`       re-run the cell on that interval (|dbgrid-live|).
+`-- @param n = 3`    default for the `:n` parameter (|dbgrid-params|).
 `{{name}}`           inline the named cell as a subquery (|dbgrid-params|).
 `:name`              a parameter.
 
@@ -112,9 +120,26 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid rename {title}         rename the notebook
 :Dbgrid delete                 delete the notebook
 :Dbgrid close                  close the notebook layout
-:Dbgrid export csv|json [path] current result to the register or a file
-:Dbgrid cancel                 stop the running query or generation
+:Dbgrid export csv|json|md [path]
+                               current result (md: the notebook) to the
+                               register or a file
+:Dbgrid cancel                 stop the running query, generation or live loop
 :Dbgrid health                 same as `:checkhealth dbgrid`
+:Dbgrid new --template {name} [title]
+                               create a notebook from a template
+:Dbgrid templates              pick a template (`templates list` prints them)
+:Dbgrid analyze                agent analysis of the cell's plan
+:Dbgrid explain-error          agent explanation of the cell's last error
+:Dbgrid try-index [sql]        hypothetical index (hypopg), cost before/after
+:Dbgrid params [name value]    re-prompt / set parameters; `params clear`
+:Dbgrid live [interval|stop]   start or stop the live loop of the cell
+:Dbgrid diff [connection]      diff against the previous run, or against the
+                               same cell run on another connection
+:Dbgrid schema diff [a] [b]    compare two schemas
+:Dbgrid settings diff [a] [b]  compare pg_settings of two connections
+:Dbgrid history                pick a statement from the project history
+:Dbgrid aws {sub} [connection] add | login | refresh | tunnels | status |
+                               events | bluegreen (|dbgrid-aws|)
 
 ==============================================================================
 5. KEYMAPS                                                    *dbgrid-keymaps*
@@ -130,7 +155,9 @@ Query pane ~
   \d          delete cell            \y          yank cell
   \m          rename cell            \=          format the cell
   \p          edit parameters        \g          generate SQL from prompt
-  \a          pick the agent         \t          edit tags
+  \a          pick the agent         \A          analyze plan (agent)
+  \!          explain error (agent)  \i          try suggested index
+  \H          query history          \t          edit tags
   \c          pick connection        \s  \S      refresh schema / pick table
   \b          schema document        K           describe identifier
   \<Tab>      focus results          \z          zoom pane
@@ -141,7 +168,9 @@ Results pane ~
   <CR> K      inspect value          \v          record view
   \p          plan view              \b          schema document
   \w          toggle truncation      \s          sort by column
-  \f          filter rows            \yc \yr \ya \yi   yank value / row JSON / CSV / row INSERT
+  \f          filter rows            \d          diff vs previous run
+  \h          sparkline (live cells)
+  \yc \yr \ya \yi \yp   yank value / row JSON / CSV / row INSERT / plan
   <Tab> <S-Tab>     next / previous column (row in record view)
   ]c  [c      next / previous cell   \<Tab>      focus query pane
   \z          zoom pane              q           close notebook
@@ -163,7 +192,21 @@ LIMIT           read-only statements without a top-level LIMIT/FETCH get
                 `LIMIT {query.limit}`; the footer reports when it was hit.
 Writes          INSERT/UPDATE/DELETE/MERGE/DDL/DO/CALL ask for confirmation
                 (`query.confirm_writes`); UPDATE/DELETE without WHERE get a
-                louder prompt. `readonly` connections reject writes.
+                louder prompt. The prompt counts the rows an UPDATE/DELETE
+                touches (`query.preview_writes`). `readonly` connections
+                reject writes.
+Dry run         `-- @dryrun` or `query.dry_run`: the write runs with
+                RETURNING * inside a transaction that is rolled back, also
+                on read-only connections.
+DDL warnings    CREATE/DROP INDEX without CONCURRENTLY on a big table,
+                ALTER TABLE (type changes, SET NOT NULL, constraints without
+                NOT VALID, volatile defaults), TRUNCATE, VACUUM FULL,
+                CLUSTER, REINDEX and a missing `lock_timeout_ms` are listed
+                in the confirmation (`query.ddl_warnings`).
+Session         `query.session = true` (or `session = true` per connection)
+                keeps one psql alive across runs: temp tables and SET carry
+                over and the connection handshake is paid once. Cancelling
+                ends the session; the next run starts a new one.
 Index check     `index_check.mode`: "warn" (default), "confirm" or "off".
                 Statements are EXPLAINed first; a Seq Scan on a table with at
                 least `index_check.min_rows` rows, or an Index Scan with a
@@ -245,7 +288,100 @@ The agent is chosen per cell (`-- @agent kimi`), per notebook (`\a`,
 about Rails naming conventions.
 
 ==============================================================================
-11. SCHEMA AND COMPLETION                                      *dbgrid-schema*
+11. PLAN ANALYSIS WITH THE AGENT                              *dbgrid-analyze*
+
+`\A` (`:Dbgrid analyze`) runs EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT
+JSON) on the cell inside a rolled back transaction (`ai.analyze.mode =
+"estimate"` skips ANALYZE; writes ask first), gathers the tables' columns,
+indexes and pg_stat_user_tables counters, applies the `analyze_rules`
+(estimate off by `estimate_ratio`, sorts/hashes spilling to disk, the node
+with the highest exclusive time, filters discarding most rows) and asks the
+agent for: what is slow, why, the fix as SQL, what to verify. The answer
+opens in a markdown window: `i` inserts its sql blocks as cells below the
+analyzed cell, `y` yanks, `q` closes. It is kept with the result and shown in
+the plan view (`\p`), which also renders actual times and buffers.
+
+`\!` explains the cell's last error the same way. `\i` needs the hypopg
+extension: the suggested index is created hypothetically in the same
+session, the statement is re-explained and the cost before and after shown.
+
+`ai.redact_literals` replaces literals before anything leaves the machine;
+`ai = false` on a connection disables the agent for it; `ai.investigate`
+gives the agent a read-only `dbgrid-query` shell helper on the connection.
+
+==============================================================================
+12. TEMPLATES                                               *dbgrid-templates*
+
+`:Dbgrid new --template diagnostics` and `:Dbgrid new --template blue-green`
+copy a bundled notebook into the project. Diagnostics: active queries,
+blocking tree, idle in transaction, long transactions, top statements
+(pg_stat_statements), seq scans, dead tuples, unused and redundant indexes,
+cache hit ratio, sizes, connections, wraparound, temp files, replica lag,
+replication, settings, extensions, locks on a table, cancel a backend.
+Blue-green: slot lag, sender and subscription state, writes in flight, rows
+written, application sessions, long transactions, tables without replica
+identity, row counts and sequences on both sides, green accepts writes, make
+blue read-only. Cells with `-- @conn blue|green` are bound to the
+connections you pick. `templates.dir` adds your own (header lines
+`-- template-name:`, `-- template-tags:`, `-- template-description:`,
+`-- template-connections:`).
+
+==============================================================================
+13. LIVE CELLS                                                  *dbgrid-live*
+
+`-- @every 5s` (`500ms`, `2m`) makes a read-only cell live: running it once
+keeps it re-running until `\x`, an edit, an error or closing the notebook.
+Ticks are skipped while one is in flight; changed values are highlighted
+(|hl-DbgridChanged|); `\h` draws a sparkline of the numeric column under the
+cursor over the last `live.history` ticks; `live.max_cells` caps the loops
+per notebook. Live results are written to the cache when the loop stops.
+
+==============================================================================
+14. DIFFS, HISTORY, EXPORT                                       *dbgrid-diff*
+
+`\d` diffs the current result against the previous run of the cell, matched
+by the table's primary key (or an `id` column, or whole rows).
+`:Dbgrid diff {connection}` runs the cell on another connection and diffs.
+`:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` open a scratch
+buffer (`]c` / `[c` jump between tables, `q` closes).
+
+Every statement is appended to `<store>/history.jsonl` (`history.enabled`,
+`history.max_entries`); `\H` / `:Dbgrid history` inserts an entry as a new
+cell, <C-y> yanks it. `:Dbgrid export md [path]` writes the notebook as
+markdown with SQL, results and analyses.
+
+==============================================================================
+15. AWS RDS AND TUNNELS                                           *dbgrid-aws*
+
+>lua
+  { name = "prod", aws = { profile = "prod", region = "ap-southeast-1",
+      cluster = "app-prod", bastion = "i-0123456789abcdef0",
+      secret = "prod/db",
+      login_cmd = { "company-aws-login", "--profile", "{profile}" } } }
+<
+The entry appears as `prod/writer` and `prod/reader` (readers are
+read-only; plain RDS gets one reader per replica). On the first run the
+endpoints are resolved with the aws CLI and cached (`aws.endpoint_ttl_seconds`),
+an SSM port forward to the bastion is started and kept for the session,
+the password comes from Secrets Manager (or `auth = "iam"`) and goes to psql
+through the environment. The URL keeps the real host with `hostaddr=127.0.0.1`
+so `ssl = "verify-full"` with `sslrootcert` and ~/.pgpass work. Expired
+credentials run `aws.login_cmd` (`{profile}` substituted) in a terminal
+split and retry. Without `bastion` the connection is direct; `aws.document`
+and `aws.parameters` cover custom SSM documents.
+
+`:Dbgrid aws add` builds an entry interactively; `aws login`, `aws refresh`,
+`aws tunnels`, `aws status` (status, version, maintenance, five CloudWatch
+metrics), `aws events` (last day), `aws bluegreen` (deployments and
+switchover status). `:checkhealth dbgrid` covers the CLI, the Session
+Manager plugin, credentials and tunnels.
+
+Generic tunnels: `tunnel = { kind = "ssh", host = "bastion" }` (remote
+defaults to the URL's host:port) or `tunnel = { kind = "cmd", cmd = { ...,
+"{port}" } }`; `local_port` fixes the local port.
+
+==============================================================================
+16. SCHEMA AND COMPLETION                                      *dbgrid-schema*
 
 The schema (tables, columns, keys, indexes, enums) is fetched once per
 connection, cached on disk and refreshed after `schema.ttl_seconds` or `\s`.
@@ -266,12 +402,12 @@ after `alias.`, tables, schemas, keywords and functions of the connection's
 dialect, cell names and parameters after `{{`, parameters after `:`.
 
 ==============================================================================
-12. ADAPTERS                                                 *dbgrid-adapters*
+17. ADAPTERS                                                 *dbgrid-adapters*
 
 PostgreSQL (`psql`) and SQLite (`sqlite3`) are built in.
 `require("dbgrid").register_adapter(adapter)` adds another database. See
 `lua/dbgrid/adapters/postgres.lua` and `sqlite.lua` for the interface
-(`run`, `explain`, `explain_text`, `schema`, `test`, `cancel(job, conn)`,
-`keywords`, `functions`, `dialect`, `analyze`).
+(`run`, `explain`, `explain_text`, `explain_json`, `schema`, `test`,
+`cancel(job, conn)`, `keywords`, `functions`, `dialect`, `analyze`).
 
 vim:tw=78:ts=8:ft=help:norl:

@@ -1,5 +1,10 @@
 -- Connection registry: setup() connections, saved connections (data dir),
 -- and DATABASE_URL-style variables found in the project's .env files.
+--
+-- A declared connection is what the user wrote (a url, or an `aws` / `tunnel`
+-- block). `resolve()` turns it into an effective connection the adapter can
+-- use: endpoints looked up, tunnel started, credentials fetched, password_cmd
+-- run. Everything that spawns a client goes through resolve().
 local util = require("dbgrid.util")
 local config = require("dbgrid.config")
 local project = require("dbgrid.project")
@@ -87,6 +92,32 @@ function M.discovered(root)
   return out
 end
 
+---Expand a declared connection into picker entries: an `aws` block becomes a
+---writer and one or more readers; everything else is itself.
+---@param c dbgrid.Connection
+---@return dbgrid.Connection[]
+local endpoint_memo = {} ---@type table<string, { at: number, info: table? }>
+
+local function expand(c)
+  if c.aws then
+    local ok, aws = pcall(require, "dbgrid.aws")
+    if ok then
+      -- all() runs on every winbar redraw: read the endpoint cache at most every few seconds
+      local key = table.concat({ c.aws.profile or "", c.aws.region or "", c.aws.cluster or c.aws.instance or "" }, "|")
+      local memo = endpoint_memo[key]
+      if not memo or util.now() - memo.at > 5 then
+        memo = { at = util.now(), info = aws.cached_endpoints and aws.cached_endpoints(c.aws) or nil }
+        endpoint_memo[key] = memo
+      end
+      local list = aws.expand(c, memo.info)
+      if list and #list > 0 then
+        return list
+      end
+    end
+  end
+  return { c }
+end
+
 ---Every connection available to the project, in priority order.
 ---@param root? string
 ---@return dbgrid.Connection[]
@@ -95,12 +126,18 @@ function M.all(root)
   local out = {}
   local names = {}
   local function add(c, source)
-    if c.name and c.url and not names[c.name] then
+    if c.name and (c.url or c.aws) and not names[c.name] then
       local copy = vim.deepcopy(c)
-      copy.url = util.expand_env(copy.url)
+      if copy.url then
+        copy.url = util.expand_env(copy.url)
+      end
       copy.source = copy.source or source
-      names[c.name] = true
-      out[#out + 1] = copy
+      for _, e in ipairs(expand(copy)) do
+        if not names[e.name] then
+          names[e.name] = true
+          out[#out + 1] = e
+        end
+      end
     end
   end
   for _, c in ipairs(config.get().connections or {}) do
@@ -128,6 +165,12 @@ function M.get(name)
       return c
     end
   end
+  -- "prod" for an aws connection means its writer
+  for _, c in ipairs(M.all()) do
+    if c.parent == name and c.aws_role == "writer" then
+      return c
+    end
+  end
 end
 
 ---The connection new notebooks should use, if it can be decided without asking.
@@ -147,21 +190,38 @@ function M.default()
   return nil
 end
 
+local SAVED_FIELDS = {
+  "name",
+  "url",
+  "readonly",
+  "index_check",
+  "statement_timeout_ms",
+  "lock_timeout_ms",
+  "password_cmd",
+  "adapter",
+  "aws",
+  "tunnel",
+  "ssl",
+  "sslrootcert",
+  "ai",
+  "env",
+}
+
 ---Persist a connection (global, or bound to the current project).
 ---@param conn dbgrid.Connection
 ---@param scope "global"|"project"
 function M.save(conn, scope)
   local list = saved()
-  local copy = {
-    name = conn.name,
-    url = conn.url,
-    readonly = conn.readonly or nil,
-    index_check = conn.index_check,
-    statement_timeout_ms = conn.statement_timeout_ms,
-    password_cmd = conn.password_cmd,
-    adapter = conn.adapter,
-    project = scope == "project" and project.root() or nil,
-  }
+  local copy = {}
+  for _, k in ipairs(SAVED_FIELDS) do
+    if conn[k] ~= nil and conn[k] ~= false then
+      copy[k] = vim.deepcopy(conn[k])
+    end
+  end
+  if conn.ai == false then
+    copy.ai = false
+  end
+  copy.project = scope == "project" and project.root() or nil
   for i, c in ipairs(list) do
     if c.name == conn.name and (c.project or "") == (copy.project or "") then
       list[i] = copy
@@ -199,34 +259,271 @@ function M.add_interactive(cb)
     if not name or name == "" then
       return cb and cb(nil)
     end
-    vim.ui.input(
-      { prompt = "URL (postgres://user:pass@host:5432/db, sqlite:path/to.db or $DATABASE_URL): " },
-      function(url)
-        if not url or url == "" then
-          return cb and cb(nil)
-        end
-        local conn = { name = name, url = url }
-        local a, err = adapters.for_connection({ name = name, url = util.expand_env(url) })
-        if not a then
-          util.error(err or "unsupported url")
-          return cb and cb(nil)
-        end
-        vim.ui.select({ "this project only", "everywhere", "read-only, this project only", "read-only, everywhere" }, {
-          prompt = "Save connection",
-        }, function(choice, idx)
-          if not choice then
-            return cb and cb(nil)
-          end
-          conn.readonly = idx >= 3 or nil
-          M.save(conn, (idx == 1 or idx == 3) and "project" or "global")
-          util.notify("saved connection " .. name)
-          if cb then
-            cb(M.get(name))
-          end
-        end)
+    local url_prompt = "URL (postgres://user:pass@host:5432/db, sqlite:path/to.db or $DATABASE_URL): "
+    vim.ui.input({ prompt = url_prompt }, function(url)
+      if not url or url == "" then
+        return cb and cb(nil)
       end
-    )
+      local conn = { name = name, url = url }
+      local a, err = adapters.for_connection({ name = name, url = util.expand_env(url) })
+      if not a then
+        util.error(err or "unsupported url")
+        return cb and cb(nil)
+      end
+      local function finish()
+        vim.ui.select(
+          { "this project only", "everywhere", "read-only, this project only", "read-only, everywhere" },
+          { prompt = "Save connection" },
+          function(choice, idx)
+            if not choice then
+              return cb and cb(nil)
+            end
+            conn.readonly = idx >= 3 or nil
+            M.save(conn, (idx == 1 or idx == 3) and "project" or "global")
+            util.notify("saved connection " .. name)
+            if cb then
+              cb(M.get(name))
+            end
+          end
+        )
+      end
+      -- a password typed into the url is offered a home in ~/.pgpass instead
+      local user, pass, host, port, db = M.parse_url(util.expand_env(url))
+      if pass and pass ~= "" and user and db then
+        vim.ui.select({ "move it to ~/.pgpass", "keep it in the url" }, {
+          prompt = "The url contains a password.",
+        }, function(_, idx)
+          if idx == 1 then
+            M.save_pgpass(host or "*", port or "*", db, user, pass)
+            conn.url = url:gsub("(://[^:/@]+):[^@]*@", "%1@", 1)
+            util.notify("password written to ~/.pgpass")
+          end
+          finish()
+        end)
+      else
+        finish()
+      end
+    end)
   end)
+end
+
+---Split a postgres url into its parts (all optional).
+---@param url string
+---@return string? user, string? password, string? host, string? port, string? db, string? query
+function M.parse_url(url)
+  if type(url) ~= "string" then
+    return nil
+  end
+  local rest = url:match("^[%w+]+://(.*)$")
+  if not rest then
+    return nil
+  end
+  local query
+  rest, query = rest:match("^([^?]*)%??(.*)$")
+  local auth, hostpart = rest:match("^(.-)@(.*)$")
+  if not auth then
+    auth, hostpart = nil, rest
+  end
+  local user, password
+  if auth then
+    user, password = auth:match("^([^:]*):?(.*)$")
+    if password == "" then
+      password = nil
+    end
+    user = user ~= "" and vim.uri_decode(user) or nil
+    if password then
+      password = vim.uri_decode(password)
+    end
+  end
+  local hostport, db = hostpart:match("^([^/]*)/?(.*)$")
+  local host, port = hostport:match("^%[?([^%]:]*)%]?:?(%d*)$")
+  if host == "" then
+    host = nil
+  end
+  if port == "" then
+    port = nil
+  end
+  if db == "" then
+    db = nil
+  end
+  return user, password, host, port, db, query ~= "" and query or nil
+end
+
+---Append a line to ~/.pgpass (mode 600).
+function M.save_pgpass(host, port, db, user, password)
+  local path = os.getenv("PGPASSFILE") or (vim.env.HOME .. "/.pgpass")
+  local function esc(s)
+    return (tostring(s):gsub("[\\:]", "\\%0"))
+  end
+  local line = table.concat({ esc(host), esc(port), esc(db), esc(user), esc(password) }, ":")
+  local existing = util.read_file(path) or ""
+  if existing ~= "" and not existing:match("\n$") then
+    existing = existing .. "\n"
+  end
+  util.write_file(path, existing .. line .. "\n")
+  pcall(vim.uv.fs_chmod, path, 384) -- 0600
+end
+
+---Rewrite a url so the client connects to a local tunnel port while keeping
+---the real host name for TLS verification and ~/.pgpass lookups.
+---@param url string
+---@param local_port integer
+---@param opts? { ssl?: string, sslrootcert?: string }
+---@return string
+function M.tunnelled_url(url, local_port, opts)
+  opts = opts or {}
+  local base, query = url:match("^([^?]*)%??(.*)$")
+  local params = {}
+  if query and query ~= "" then
+    for kv in query:gmatch("[^&]+") do
+      local k, v = kv:match("^([^=]*)=?(.*)$")
+      params[k] = v
+    end
+  end
+  params.hostaddr = "127.0.0.1"
+  params.port = tostring(local_port)
+  if not params.sslmode then
+    params.sslmode = opts.ssl or config.get().aws.ssl or "require"
+  end
+  if opts.sslrootcert and not params.sslrootcert then
+    params.sslrootcert = opts.sslrootcert
+  end
+  local keys = vim.tbl_keys(params)
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = k .. "=" .. params[k]
+  end
+  return base .. "?" .. table.concat(parts, "&")
+end
+
+local resolved = {} ---@type table<string, dbgrid.Connection>
+local inflight = {} ---@type table<string, fun(conn?: dbgrid.Connection, err?: string)[]>
+
+---Forget the effective form of a connection (after a failure, or when its
+---declaration changed).
+---@param name? string  nil = everything
+function M.forget(name)
+  endpoint_memo = {}
+  if name then
+    resolved[name] = nil
+  else
+    resolved = {}
+  end
+end
+
+---@param conn dbgrid.Connection
+---@param cb fun(conn?: dbgrid.Connection, err?: string)
+local function run_password_cmd(conn, cb)
+  if not conn.password_cmd or conn.password_cmd == "" or (conn.env and conn.env.PGPASSWORD) then
+    return cb(conn)
+  end
+  local ok, job = pcall(vim.system, { "sh", "-c", conn.password_cmd }, { text = true, timeout = 30000 }, function(out)
+    vim.schedule(function()
+      if out.code ~= 0 then
+        return cb(nil, "password_cmd failed for " .. conn.name .. ": " .. util.trim(out.stderr or ""))
+      end
+      conn.env = conn.env or {}
+      conn.env.PGPASSWORD = util.trim(out.stdout or "")
+      cb(conn)
+    end)
+  end)
+  if not ok then
+    cb(nil, "password_cmd could not start: " .. tostring(job))
+  end
+end
+
+---Build the tunnel spec of a generic `tunnel` block.
+---@param conn dbgrid.Connection
+---@return table spec
+local function tunnel_spec(conn)
+  local t = vim.deepcopy(conn.tunnel)
+  t.kind = t.kind or (t.cmd and "cmd") or (t.host and "ssh") or "cmd"
+  if t.kind == "ssh" and not t.remote then
+    local _, _, host, port = M.parse_url(conn.url or "")
+    t.remote = (host or "localhost") .. ":" .. (port or "5432")
+  end
+  t.key = t.key or (t.kind .. "|" .. conn.name .. "|" .. (t.remote or table.concat(t.cmd or {}, " ")))
+  return t
+end
+
+---Turn a declared connection into an effective one: aws / tunnel / password_cmd.
+---The result is cached per name; a cached tunnel is probed before reuse.
+---@param conn dbgrid.Connection
+---@param cb fun(conn?: dbgrid.Connection, err?: string)
+function M.resolve(conn, cb)
+  if conn._resolved then
+    return cb(conn)
+  end
+  local key = conn.name
+  local cached = resolved[key]
+  local function finish(eff, err)
+    if eff then
+      eff._resolved = true
+      eff.declared_url = eff.declared_url or conn.url
+      resolved[key] = eff
+    else
+      resolved[key] = nil
+    end
+    local cbs = inflight[key] or {}
+    inflight[key] = nil
+    for _, f in ipairs(cbs) do
+      pcall(f, eff, err)
+    end
+  end
+  local function start()
+    local eff = vim.deepcopy(conn)
+    eff.env = vim.deepcopy(conn.env or {})
+    if conn.aws then
+      require("dbgrid.aws").resolve(eff, function(res, err)
+        if not res then
+          return finish(nil, err)
+        end
+        eff.url = res.url
+        for k, v in pairs(res.env or {}) do
+          eff.env[k] = v
+        end
+        eff.local_port = res.local_port
+        eff.tunnel_key = res.tunnel_key
+        eff.aws_role = res.role or eff.aws_role
+        run_password_cmd(eff, finish)
+      end)
+    elseif conn.tunnel then
+      local spec = tunnel_spec(conn)
+      require("dbgrid.tunnel").ensure(spec, function(port, err)
+        if not port then
+          return finish(nil, err)
+        end
+        eff.url = M.tunnelled_url(eff.url, port, { ssl = conn.ssl, sslrootcert = conn.sslrootcert })
+        eff.local_port = port
+        eff.tunnel_key = spec.key
+        run_password_cmd(eff, finish)
+      end)
+    else
+      run_password_cmd(eff, finish)
+    end
+  end
+  if inflight[key] then
+    inflight[key][#inflight[key] + 1] = cb
+    return
+  end
+  if cached then
+    if cached.local_port then
+      -- a tunnel may have died (SSM idle timeout): probe before reuse
+      require("dbgrid.tunnel").probe(cached.local_port, config.get().aws.probe_ms or 500, function(ok)
+        if ok then
+          return cb(cached)
+        end
+        resolved[key] = nil
+        inflight[key] = { cb }
+        start()
+      end)
+      return
+    end
+    return cb(cached)
+  end
+  inflight[key] = { cb }
+  start()
 end
 
 ---Test a connection.
@@ -237,7 +534,12 @@ function M.test(conn, cb)
   if not a then
     return cb(false, err or "no adapter")
   end
-  a.test(conn, cb)
+  M.resolve(conn, function(eff, rerr)
+    if not eff then
+      return cb(false, rerr or "could not resolve the connection")
+    end
+    a.test(eff, cb)
+  end)
 end
 
 ---One line describing a connection for pickers.
@@ -247,7 +549,20 @@ function M.describe(conn)
   if conn.readonly then
     parts[#parts + 1] = "[ro]"
   end
-  parts[#parts + 1] = util.redact_url(conn.url or "")
+  if conn.aws then
+    local a = conn.aws
+    parts[#parts + 1] = string.format(
+      "aws %s %s%s",
+      a.profile or "default",
+      a.cluster or a.instance or "?",
+      a.bastion and (" via " .. a.bastion) or ""
+    )
+  else
+    parts[#parts + 1] = util.redact_url(conn.url or "")
+    if conn.tunnel then
+      parts[#parts + 1] = "(" .. (conn.tunnel.kind or "tunnel") .. ")"
+    end
+  end
   if conn.source then
     parts[#parts + 1] = "(" .. conn.source .. ")"
   end

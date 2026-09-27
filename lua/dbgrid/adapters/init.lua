@@ -77,9 +77,15 @@ function M.for_connection(conn)
     local a = M.get(conn.adapter)
     return a, a == nil and ("unknown adapter '" .. conn.adapter .. "'") or nil
   end
+  if conn.aws and not conn.url then
+    return M.get("postgres")
+  end
   local scheme = M.scheme(conn.url or "")
   if not scheme then
     return nil, "connection url has no scheme: " .. tostring(conn.url)
+  end
+  if scheme == "aws" then
+    return M.get("postgres")
   end
   for _, name in ipairs(M.BUILTIN) do
     local a = M.get(name)

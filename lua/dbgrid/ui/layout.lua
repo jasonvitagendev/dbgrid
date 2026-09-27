@@ -262,6 +262,13 @@ function M.winbar_query(buf)
   parts[#parts + 1] = "%#DbgridWinbarDim#" .. n .. (n == 1 and " cell" or " cells")
   local agent = require("dbgrid.ai").agent_name(s)
   parts[#parts + 1] = " %#DbgridWinbarDim#│%#DbgridWinbarAgent# " .. esc(icons.agent) .. " " .. esc(agent) .. " "
+  local live = 0
+  for _ in pairs(s.live or {}) do
+    live = live + 1
+  end
+  if live > 0 then
+    parts[#parts + 1] = " %#DbgridWinbarLive#" .. esc(icons.live) .. " " .. live .. " live"
+  end
   return table.concat(parts)
 end
 

@@ -233,9 +233,15 @@ local function render_set(s, entry, ctx)
   lines[#lines + 1] = rule_line
   line_hl[#lines] = { { 0, #rule_line, "DbgridRule" } }
   -- rows
+  local live = s.live and s.view.cell_id and s.live[s.view.cell_id]
+  local changed = live and live.changed or nil
   for i, frow in ipairs(formatted) do
     local raw = rows[i]
+    local row_changed = changed and changed[raw] or nil
     local line, starts, ends, hls = build(frow, function(j)
+      if row_changed and (row_changed[j] or row_changed[0]) then
+        return "DbgridChanged"
+      end
       local v = raw[j]
       if v == vim.NIL or v == nil then
         return "DbgridNull"
@@ -340,6 +346,19 @@ local function render_footer(s, result, ctx)
   if result.connection then
     parts[#parts + 1] = "via " .. result.connection
   end
+  if result.dry_run then
+    parts[#parts + 1] = "dry run, rolled back"
+  end
+  local live = s.live and s.view.cell_id and s.live[s.view.cell_id]
+  if live then
+    parts[#parts + 1] = string.format(
+      "%s live every %s · tick %d%s",
+      icons.live,
+      util.fmt_ms(live.interval),
+      live.ticks or 0,
+      (live.changed_count or 0) > 0 and (" · " .. live.changed_count .. " changed") or ""
+    )
+  end
   if #lines > 0 and lines[#lines] ~= "" then
     add("")
   end
@@ -422,6 +441,7 @@ local function render_placeholder(s, cell, ctx)
     { key(k.tables) .. "  " .. key(k.describe), "browse tables · describe the identifier under the cursor" },
     { key(k.schema_view) .. "  " .. key(k.params), "schema document (foldable) · parameters" },
     { key(k.format) .. "  " .. key(k.agent), "format the cell · pick the coding agent" },
+    { key(k.analyze) .. "  " .. key(k.explain_error), "analyze the plan · explain the error (agent)" },
     { key(k.focus_results), "jump to this pane" },
   }
   for _, r in ipairs(rows) do
@@ -504,6 +524,16 @@ local function render_plan(s, cell, result, ctx)
   local icons = config.get().icons
   local rt = cell and s.runtime[cell.id] or {}
   local explain = require("dbgrid.explain")
+  if result and result.analysis and result.analysis.text then
+    add(
+      string.format(" %s analysis (%s, %s)", icons.generated, result.analysis.kind or "", util.ago(result.analysis.at)),
+      "DbgridSetTitle"
+    )
+    for _, l in ipairs(util.lines(result.analysis.text)) do
+      add(l)
+    end
+    add("")
+  end
   if rt.plan_text then
     local title = " " .. (rt.plan_kind or "EXPLAIN")
     if rt.plan_params and next(rt.plan_params) then
@@ -921,10 +951,232 @@ function M.refresh_winbar(s)
   end
 end
 
+---@param s dbgrid.State
+---@param ctx table
+local function render_diff(s, ctx)
+  local lines, line_hl = ctx.lines, ctx.line_hl
+  local d = s.view.diff
+  if not d then
+    lines[#lines + 1] = " no diff: run the cell twice, or :Dbgrid diff <connection>"
+    line_hl[#lines] = { { 0, #lines[#lines], "DbgridStatusDim" } }
+    return
+  end
+  lines[#lines + 1] = string.format(" %s → %s", d.a_name, d.b_name)
+  line_hl[#lines] = { { 0, #lines[#lines], "DbgridSetTitle" } }
+  for _, l in ipairs(d.lines) do
+    lines[#lines + 1] = l
+  end
+  for _, h in ipairs(d.hl or {}) do
+    local lnum = h[1] + 1
+    line_hl[lnum] = line_hl[lnum] or {}
+    line_hl[lnum][#line_hl[lnum] + 1] = { h[2], h[3], h[4] }
+  end
+end
+
+---Diff two results of a cell and show it.
+---@param s dbgrid.State
+---@param cell_id string
+---@param before table
+---@param after table
+---@param opts { a_name: string, b_name: string }
+function M.show_diff(s, cell_id, before, after, opts)
+  local diff = require("dbgrid.diff")
+  local sets_a, sets_b = all_sets(before), all_sets(after)
+  local a, b = sets_a[1], sets_b[1]
+  if not a or not b then
+    return util.warn("nothing to diff (no rows)")
+  end
+  local key
+  local sql = a.stmt.sql or ""
+  local refs = require("dbgrid.sql").referenced_tables(sql)
+  local conn = s.nb.meta.connection and require("dbgrid.connections").get(s.nb.meta.connection)
+  local sch = conn and require("dbgrid.schema").loaded(conn)
+  local tbl = sch and refs[1] and require("dbgrid.schema").find_table(sch, refs[1].name)
+  if diff.pick_key then
+    key = diff.pick_key(a.set.columns, tbl)
+  end
+  local d = diff.rows({ columns = a.set.columns, rows = a.set.rows }, { columns = b.set.columns, rows = b.set.rows }, {
+    key = key,
+  })
+  local lines, hl = diff.render(d, b.set.columns, {})
+  s.view.cell_id = cell_id
+  s.view.mode = "diff"
+  s.view.diff = { lines = lines, hl = hl, a_name = opts.a_name, b_name = opts.b_name, result = d }
+  M.render(s, true)
+  util.notify(
+    string.format(
+      "diff: %d added, %d removed, %d changed, %d same",
+      #d.added,
+      #d.removed,
+      #d.changed,
+      d.same or 0
+    )
+  )
+end
+
+---Diff the current result against the previous run of the same cell.
+---@param s dbgrid.State
+function M.diff_previous(s)
+  if s.view.mode == "diff" then
+    s.view.mode = "grid"
+    return M.render(s, true)
+  end
+  local id = s.view.cell_id
+  local result = current_result(s)
+  local previous = id and s.previous and s.previous[id]
+  if not result or not previous then
+    return util.notify("no previous run to diff against (run the cell again, or :Dbgrid diff <connection>)")
+  end
+  M.show_diff(s, id, previous, result, {
+    a_name = "previous run (" .. os.date("%H:%M:%S", previous.ran_at or 0) .. ")",
+    b_name = "this run (" .. os.date("%H:%M:%S", result.ran_at or 0) .. ")",
+  })
+end
+
+---Text sparkline of the column under the cursor across the live ticks of the cell.
+---@param s dbgrid.State
+function M.sparkline(s)
+  local c = M.cell_at_cursor(s)
+  local live = s.live and s.view.cell_id and s.live[s.view.cell_id]
+  if not c then
+    return util.notify("put the cursor on a value first")
+  end
+  if not live or #live.history == 0 then
+    return util.notify("no live history for this cell (start it with -- @every)")
+  end
+  -- position of the row inside its set
+  local pos
+  for i, row in ipairs(c.entry.set.rows) do
+    if row == c.row then
+      pos = i
+      break
+    end
+  end
+  local values = {}
+  for _, tick in ipairs(live.history) do
+    local row = tick.rows[pos or 1]
+    local v = row and row[c.col]
+    values[#values + 1] = (v ~= nil and v ~= vim.NIL) and tonumber(v) or nil
+  end
+  local nums = vim.tbl_filter(function(v)
+    return v ~= nil
+  end, values)
+  if #nums == 0 then
+    return util.notify("column " .. c.column .. " is not numeric")
+  end
+  local lo, hi = math.huge, -math.huge
+  for _, v in ipairs(nums) do
+    lo, hi = math.min(lo, v), math.max(hi, v)
+  end
+  local bars = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
+  local out = {}
+  for _, v in ipairs(values) do
+    if v == nil then
+      out[#out + 1] = " "
+    elseif hi == lo then
+      out[#out + 1] = bars[4]
+    else
+      out[#out + 1] = bars[math.max(1, math.min(8, math.floor((v - lo) / (hi - lo) * 7 + 1.5)))]
+    end
+  end
+  local lines = {
+    table.concat(out),
+    string.format(
+      "%s · %d ticks · min %s · max %s · last %s",
+      c.column,
+      #values,
+      tostring(lo),
+      tostring(hi),
+      tostring(nums[#nums])
+    ),
+  }
+  vim.lsp.util.open_floating_preview(lines, "", { border = "rounded", title = " live " .. c.column .. " " })
+end
+
+---Show arbitrary rows (aws status, events, ...) in the results pane, or in a
+---scratch buffer when no notebook is open.
+---@param s dbgrid.State?
+---@param set { columns: string[], rows: any[][] }
+---@param opts? { title?: string }
+function M.show_rows(s, set, opts)
+  opts = opts or {}
+  local result = {
+    ok = true,
+    ran_at = require("dbgrid.util").epoch(),
+    elapsed_ms = 0,
+    statements = {
+      {
+        sql = opts.title or "",
+        kind = "select",
+        class = "read",
+        sets = { { columns = set.columns, rows = set.rows, row_count = #set.rows } },
+        tags = {},
+      },
+    },
+    notices = opts.title and { opts.title } or {},
+  }
+  if s and vim.api.nvim_buf_is_valid(s.buf) then
+    local id = "__" .. (opts.title or "rows"):gsub("[^%w]+", "_")
+    notebook.set_result_memory(s.nb, { id = id }, result)
+    require("dbgrid.ui.layout").ensure_results(s)
+    s.view = { truncate = s.view.truncate, cell_id = id, mode = "grid" }
+    M.render(s, true)
+    return
+  end
+  local lines = {}
+  local widths = {}
+  for j, c in ipairs(set.columns) do
+    widths[j] = util.width(c)
+    for _, row in ipairs(set.rows) do
+      widths[j] = math.max(widths[j], util.width(raw_text(row[j])))
+    end
+  end
+  local function fmt(vals)
+    local parts = {}
+    for j = 1, #set.columns do
+      parts[j] = util.pad(raw_text(vals[j]), widths[j])
+    end
+    return " " .. table.concat(parts, " │ ")
+  end
+  lines[#lines + 1] = fmt(set.columns)
+  lines[#lines + 1] = string.rep("─", #lines[1] + 2)
+  for _, row in ipairs(set.rows) do
+    lines[#lines + 1] = fmt(row)
+  end
+  require("dbgrid.compare").open_scratch(opts.title or "rows", lines)
+end
+
+---Yank the JSON plan of the statement under the cursor (for plan visualizers).
+---@param s dbgrid.State
+function M.yank_plan(s)
+  local result = current_result(s)
+  if not result then
+    return util.notify("no result")
+  end
+  local c = M.cell_at_cursor(s)
+  local st = c and c.entry.stmt or (result.statements or {})[1]
+  local plan = st and st.plan
+  if not plan then
+    for _, other in ipairs(result.statements or {}) do
+      if other.plan then
+        plan = other.plan
+        break
+      end
+    end
+  end
+  if not plan then
+    return util.notify("no plan attached to this result (index check off?)")
+  end
+  local text = vim.json.encode(plan)
+  vim.fn.setreg('"', text)
+  pcall(vim.fn.setreg, "+", text)
+  util.notify("yanked the plan JSON (paste it into explain.dalibo.com or explain.depesz.com)")
+end
+
 ---Show a cell's result in the results pane.
 ---@param s dbgrid.State
 ---@param cell_id string
----@param opts? { view?: "grid"|"record"|"plan" }
+---@param opts? { view?: "grid"|"record"|"plan"|"diff"|"schema" }
 function M.show(s, cell_id, opts)
   opts = opts or {}
   require("dbgrid.ui.layout").ensure_results(s)
@@ -966,6 +1218,8 @@ function M.render(s, reset_cursor)
     end
   elseif mode == "plan" then
     render_plan(s, cell, result, ctx)
+  elseif mode == "diff" then
+    render_diff(s, ctx)
   elseif not result then
     render_placeholder(s, cell, ctx)
   elseif mode == "record" then
@@ -1155,6 +1409,10 @@ function M.winbar(s)
     end
   else
     parts[#parts + 1] = "%#DbgridWinbarDim# " .. esc(icons.idle) .. " not run "
+  end
+  local live = s.live and s.live[cell.id]
+  if live then
+    parts[#parts + 1] = "%#DbgridWinbarLive#" .. esc(icons.live) .. " live "
   end
   parts[#parts + 1] = "%#DbgridWinbarDim#│ " .. (s.view.mode or "grid")
   if s.view.sort and s.view.sort.col then
@@ -1457,6 +1715,15 @@ function M.attach(s)
   map(buf, k.filter, function()
     M.filter(s)
   end, "filter rows")
+  map(buf, k.diff, function()
+    M.diff_previous(s)
+  end, "diff against the previous run")
+  map(buf, k.history, function()
+    M.sparkline(s)
+  end, "sparkline of the column across live ticks")
+  map(buf, k.yank_plan, function()
+    M.yank_plan(s)
+  end, "yank the plan JSON")
   map(buf, k.yank_cell, function()
     M.yank_cell(s)
   end, "yank value")

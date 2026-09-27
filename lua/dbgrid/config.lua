@@ -11,6 +11,17 @@ local M = {}
 ---@field password_cmd? string    shell command printing the password (1Password, pass, ...)
 ---@field adapter? string         force an adapter instead of deriving it from the url scheme ("postgres", "sqlite")
 ---@field env? table<string,string> extra environment for the client process
+---@field lock_timeout_ms? integer server-side lock_timeout (recommended for DDL on a busy database)
+---@field aws? table              AWS RDS / Aurora block: profile, region, cluster|instance, bastion, secret, auth, ...
+---@field aws_role? string        "writer" | "reader" | "reader-N", set on the expanded picker entries
+---@field tunnel? table           generic port forward: { kind = "ssh"|"cmd"|"ssm", ... } (see README)
+---@field ssl? string             sslmode for tunnelled connections ("require" | "verify-full")
+---@field sslrootcert? string     CA bundle for sslmode=verify-full
+---@field ai? boolean             false: never send this connection's SQL, plans or schema to an agent
+---@field session? boolean        keep one psql alive across runs (overrides query.session)
+---@field parent? string          name of the declared connection an expanded entry came from
+---@field _resolved? boolean      set on the effective copy produced by connections.resolve
+---@field declared_url? string    the url as declared, kept on the effective copy
 
 ---@class dbgrid.Config
 M.defaults = {
@@ -46,10 +57,19 @@ M.defaults = {
     limit = 500,
     -- Ask before running INSERT/UPDATE/DELETE/DDL.
     confirm_writes = true,
+    -- Count the rows an UPDATE / DELETE would touch and show it in the confirmation.
+    preview_writes = true,
+    -- Run writes inside a transaction that is rolled back, showing RETURNING * (also `-- @dryrun` per cell).
+    dry_run = false,
+    -- Warn about DDL that takes heavy locks (CREATE INDEX without CONCURRENTLY, ALTER TABLE, ...).
+    ddl_warnings = true,
     -- Wrap multi-statement cells in a single transaction.
     transaction_per_cell = true,
     -- Kill the client after this long (nil = wait forever).
     timeout_ms = nil,
+    -- Keep one psql per connection alive across runs (temp tables and SET carry over,
+    -- the connection handshake is paid once). Also per connection: `session = true`.
+    session = false,
     -- When a cancel (SIGINT) has not stopped the query after `cancel_grace_ms`,
     -- ask the server to cancel it (pg_cancel_backend) through a second
     -- connection; for sessions behind proxies that swallow cancel requests.
@@ -84,6 +104,55 @@ M.defaults = {
   rails = {
     enabled = true,
     environments = { "development", "test" },
+  },
+
+  -- `-- @every 5s` cells.
+  live = {
+    -- Smallest interval accepted.
+    min_interval_ms = 1000,
+    -- Ticks kept in memory per live cell (for the change highlight and the sparkline).
+    history = 60,
+    -- Live cells per notebook.
+    max_cells = 4,
+  },
+
+  -- Rules applied to EXPLAIN ANALYZE plans (analyze command, plan view).
+  analyze_rules = {
+    -- Planner estimate off by more than this factor.
+    estimate_ratio = 10,
+    -- Flag sorts and hashes that spill to disk.
+    spill = true,
+    -- Mark the node with the highest exclusive time.
+    hot_node = true,
+    -- Ignore nodes smaller than this many rows.
+    min_rows = 1000,
+  },
+
+  -- Bundled notebooks (`:Dbgrid new --template <name>`).
+  templates = {
+    -- Extra directory with your own *.sql templates.
+    dir = nil,
+  },
+
+  -- Every statement run is appended to <store>/history.jsonl.
+  history = {
+    enabled = true,
+    max_entries = 2000,
+  },
+
+  -- AWS RDS / Aurora connections (connections with an `aws` block).
+  aws = {
+    cli = "aws",
+    -- Endpoint cache lifetime.
+    endpoint_ttl_seconds = 86400,
+    -- How long to wait for the local port after spawning a tunnel.
+    tunnel_ready_ms = 15000,
+    -- Timeout of the pre-run tunnel probe.
+    probe_ms = 500,
+    -- Command that refreshes credentials; "{profile}" is substituted. A company CLI goes here.
+    login_cmd = { "aws", "sso", "login", "--profile", "{profile}" },
+    -- Default sslmode through the tunnel ("require" | "verify-full", the latter needs sslrootcert).
+    ssl = "require",
   },
 
   index_check = {
@@ -137,6 +206,12 @@ M.defaults = {
     instructions = "",
     -- Target dialect reported to the agent.
     dialect = "PostgreSQL 18",
+    -- `:Dbgrid analyze`: "analyze" runs EXPLAIN ANALYZE (rolled back); "estimate" only EXPLAIN.
+    analyze = { mode = "analyze", include_stats = true },
+    -- Replace string and numeric literals in SQL and plans before they leave the machine.
+    redact_literals = false,
+    -- Give the agent a `dbgrid-query` helper bound to the connection (read-only) so it can run its own queries.
+    investigate = false,
   },
 
   schema = {
@@ -180,6 +255,10 @@ M.defaults = {
       format = "<localleader>=",
       params = "<localleader>p",
       agent = "<localleader>a",
+      analyze = "<localleader>A",
+      explain_error = "<localleader>!",
+      try_index = "<localleader>i",
+      history = "<localleader>H",
       focus_results = "<localleader><Tab>",
       zoom = "<localleader>z",
       close = "<localleader>q",
@@ -194,10 +273,13 @@ M.defaults = {
       toggle_truncate = "<localleader>w",
       sort = "<localleader>s",
       filter = "<localleader>f",
+      diff = "<localleader>d",
+      history = "<localleader>h",
       yank_cell = "<localleader>yc",
       yank_row_json = "<localleader>yr",
       yank_csv = "<localleader>ya",
       yank_insert = "<localleader>yi",
+      yank_plan = "<localleader>yp",
       next_col = "<Tab>",
       prev_col = "<S-Tab>",
       next_cell = "]c",
@@ -223,6 +305,8 @@ M.defaults = {
     param = ":",
     table = "▤",
     index = "⌗",
+    live = "◉",
+    changed = "Δ",
   },
 }
 

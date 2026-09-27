@@ -70,6 +70,28 @@ the cache, so moving between cells never re-runs anything.
 - **Rails aware.** A Rails project needs no configuration: the databases in
   `config/database.yml` (development, test, multi-database setups) appear as
   connections, and the agent is told about Rails conventions.
+- **Plan analysis.** `\A` runs `EXPLAIN ANALYZE` (rolled back), applies a few
+  rules (estimates off, sorts spilling to disk, the hot node) and asks the
+  agent what is slow, why, and for the fix as SQL you can insert as a cell.
+  `\!` explains the last error the same way. `\i` tries the suggested index
+  hypothetically with hypopg and shows the cost before and after.
+- **AWS RDS and Aurora.** A connection can be a profile plus a cluster: the
+  plugin resolves the writer and reader endpoints, opens an SSM port forward
+  through a bastion, fetches the password from Secrets Manager (or an IAM
+  token) and hands psql a localhost URL. Expired credentials run your login
+  command. Generic ssh / command tunnels work for everything else.
+- **Diagnostics notebooks.** `:Dbgrid new --template diagnostics` gives you
+  cells for active queries, blocking, top statements, bloat, unused indexes,
+  replica lag and more; `blue-green` watches an RDS blue/green deployment.
+- **Live cells and diffs.** `-- @every 5s` re-runs a cell and highlights what
+  changed; `\d` diffs two runs of a cell (or the same cell on two connections);
+  `:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` compare servers.
+- **Safety for writes.** The confirmation says how many rows an UPDATE or
+  DELETE touches, `-- @dryrun` runs a write with RETURNING * inside a rolled
+  back transaction, and DDL that takes heavy locks is called out.
+- **Parameters, history, export.** `:name` placeholders with `-- @param`,
+  every statement logged to a per-project history, notebooks exported as
+  markdown with their results.
 - **Extensible.** Everything database-specific sits behind a small adapter
   interface; PostgreSQL and SQLite ship, others plug in.
 
@@ -80,7 +102,9 @@ the cache, so moving between cells never re-runs anything.
   `bin` on `PATH`), `sqlite3` for SQLite
 - Optional: [snacks.nvim](https://github.com/folke/snacks.nvim) for pickers
   with previews (falls back to `vim.ui.select`), the `claude` / `kimi` /
-  `codex` CLI for prompt-to-SQL, a SQL formatter (see Formatting).
+  `codex` CLI for prompt-to-SQL and plan analysis, a SQL formatter (see
+  Formatting), the `aws` CLI v2 plus the Session Manager plugin for RDS
+  connections, the `hypopg` extension on the server for `\i`.
 
 ## Install
 
@@ -160,12 +184,85 @@ Options per connection:
 | `readonly = true` | psql runs with `default_transaction_read_only=on` (sqlite3 with `-readonly`); writes fail on the server |
 | `index_check = "confirm"` | override the global mode for this connection |
 | `statement_timeout_ms` | server-side statement timeout (PostgreSQL) |
+| `lock_timeout_ms` | server-side `lock_timeout`; recommended on any connection you run DDL on |
 | `password_cmd` | shell command whose output becomes `PGPASSWORD` (1Password, `pass`, …) |
 | `env` | extra environment for the client process |
 | `adapter` | force `"postgres"` or `"sqlite"` instead of deriving it from the url |
+| `aws` | RDS / Aurora block, see below |
+| `tunnel` | `{ kind = "ssh" | "cmd" | "ssm", ... }`, see below |
+| `ssl`, `sslrootcert` | `sslmode` used through a tunnel (`"require"`, or `"verify-full"` with the CA bundle) |
+| `ai = false` | never send this connection's SQL, plans or schema to an agent |
+| `session = true` | keep one psql alive across runs (see Running queries) |
 
 `~/.pgpass` and `~/.pg_service.conf` work as usual because the real `psql`
-does the connecting.
+does the connecting. When you paste a URL with a password into `+ add
+connection`, the plugin offers to move the password to `~/.pgpass` instead of
+keeping it in its own JSON.
+
+Every run goes through a resolve step: the declared connection becomes an
+effective one (endpoints looked up, tunnel started or re-probed, credentials
+fetched, `password_cmd` run asynchronously). The result is cached per name for
+the session; `:Dbgrid aws refresh` or a failed run drops it.
+
+### AWS RDS and Aurora
+
+```lua
+{
+  name = "prod",
+  aws = {
+    profile = "prod",
+    region  = "ap-southeast-1",
+    cluster = "app-prod",             -- Aurora cluster id
+    -- instance = "app-prod",         -- plain RDS instance id instead of cluster
+    bastion = "i-0123456789abcdef0",  -- SSM target that can reach the database port
+    secret  = "prod/db",              -- Secrets Manager id or ARN; optional when RDS manages the master password
+    login_cmd = { "company-aws-login", "--profile", "{profile}" },  -- default: aws sso login
+    -- auth = "iam", user = "app",    -- IAM database authentication instead of a secret
+    -- database = "app",              -- only when the secret does not carry dbname
+  },
+  index_check = "confirm",
+}
+```
+
+One entry becomes two in the picker, `prod/writer` and `prod/reader` (one per
+replica on plain RDS: `prod/reader`, `prod/reader-2`, …). Readers are
+read-only. `-- @conn prod/reader` works per cell, and `prod` alone means the
+writer.
+
+On the first run the plugin calls `describe-db-clusters` (or
+`describe-db-instances`) and caches the endpoints for a day, starts
+`aws ssm start-session` with the `AWS-StartPortForwardingSessionToRemoteHost`
+document to a local port, reads the secret and passes the password to psql
+through the environment only. The URL psql gets keeps the real host name with
+`hostaddr=127.0.0.1&port=<local>`, so `sslmode=verify-full` and `~/.pgpass`
+keep working. Before every run the local port is probed; a dead tunnel (SSM
+idle timeout is 20 minutes by default) is restarted. Tunnels die with Neovim.
+
+Expired credentials are recognised from the CLI's stderr; the plugin runs
+`aws.login_cmd` (global, `{profile}` substituted; a company CLI goes here or
+per connection in `aws.login_cmd`) in a terminal split, waits for it, and
+retries. Without `bastion` the plugin connects directly. `aws.document` and
+`aws.parameters` cover custom SSM documents.
+
+Commands: `:Dbgrid aws add` (interactive: profile, region, cluster, bastion,
+secret), `aws login`, `aws refresh` (drop the endpoint cache), `aws tunnels`
+(list / kill), `aws status` (instance status, engine version, pending
+maintenance, five CloudWatch metrics over the last five minutes), `aws events`
+(last day of RDS events), `aws bluegreen` (blue/green deployments and their
+switchover status). `:checkhealth dbgrid` reports the CLI, the Session
+Manager plugin, the caller identity per profile and every tunnel.
+
+### Tunnels
+
+```lua
+{ name = "staging", url = "postgres://app@db.internal:5432/app",
+  tunnel = { kind = "ssh", host = "bastion.example.com" } }             -- ssh -N -L <local>:db.internal:5432 bastion
+{ name = "odd", url = "postgres://app@localhost/app",
+  tunnel = { kind = "cmd", cmd = { "my-tunnel", "--local-port", "{port}" } } }
+```
+
+`remote` defaults to the URL's host and port; `local_port` fixes the local port
+(otherwise a stable one derived from the connection name, or a free one).
 
 ## Notebooks
 
@@ -214,9 +311,47 @@ select count(*) from events;
 - `-- @depends a, b` runs cells `a` and `b` first when their result is stale.
 - `-- @nolimit` skips the automatic `LIMIT`; `-- @notx` skips the transaction
   wrapper for multi-statement cells; `-- @conn name` runs the cell on another
-  connection; `-- @agent name` sends the cell's prompt to another agent.
+  connection; `-- @agent name` sends the cell's prompt to another agent;
+  `-- @dryrun` runs a write inside a rolled back transaction; `-- @every 5s`
+  makes the cell live; `-- @param name = value` declares a parameter.
 - `{{name}}` inside the SQL inlines the named cell as a subquery; `:name` (or
-  `{{name}}` when no cell is called that) is a parameter.
+  `{{name}}` when no cell is called that) is a parameter (see Parameters).
+
+### Templates
+
+`:Dbgrid new --template diagnostics` copies a bundled notebook into the
+project store; `:Dbgrid templates` picks one. Two ship:
+
+- **diagnostics**: active queries, blocking tree, idle-in-transaction, long
+  transactions, top statements by time / calls / buffers
+  (`pg_stat_statements`), sequential scans by table, dead tuples and vacuum,
+  unused and redundant indexes, cache hit ratio, table sizes, connections,
+  wraparound age, temp files and deadlocks, replica lag (plain and Aurora),
+  replication on the primary, the settings that matter, extensions, locks on a
+  table, cancel a backend. Cells that need an extension say so in a comment.
+- **blue-green**: for an RDS blue/green deployment (logical replication from
+  blue to green). You are asked which connections are blue and green; the
+  cells cover slot lag, sender and subscription state, writes in flight, rows
+  written since the last tick, application sessions, long transactions,
+  tables without replica identity, row counts and sequence values on both
+  sides, whether green accepts writes, and a write cell that makes blue
+  read-only before switchover. `:Dbgrid schema diff blue green` covers the
+  DDL gap, since logical replication carries none.
+
+Your own templates go in `templates.dir`; a template is a notebook file with
+a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
+`-- template-connections:` header.
+
+### Live cells
+
+`-- @every 5s` (also `500ms`, `2m`) marks a read-only cell as live. Running it
+once keeps it re-running on that interval until `\x`, an edit of the cell, an
+error, or closing the notebook. A tick is skipped while the previous one is
+still running. Values that changed since the previous tick are highlighted,
+the header shows the tick count, and `\h` in the results pane draws a text
+sparkline of the numeric column under the cursor over the last `live.history`
+ticks. Live results stay in memory and are written to the cache when the loop
+stops.
 
 Open a notebook file by hand (`:e`) and the plugin attaches too.
 
@@ -242,6 +377,10 @@ Query pane:
 | `\p` | edit parameter values |
 | `\g` | generate SQL from the `-- ?` prompt (asks for one when missing) |
 | `\a` | pick the coding agent for this notebook |
+| `\A` | analyze the plan with the agent (`EXPLAIN ANALYZE`, rolled back) |
+| `\!` | explain the last error with the agent |
+| `\i` | try the suggested index hypothetically (hypopg) |
+| `\H` | query history |
 | `\t` | edit tags |
 | `\c` | pick the connection |
 | `\s` / `\S` | refresh the schema cache / pick a table (inserts the name) |
@@ -263,7 +402,9 @@ Results pane:
 | `\w` | toggle column truncation |
 | `\s` | sort by the column under the cursor (asc → desc → off) |
 | `\f` | filter rows by text |
-| `\yc` / `\yr` / `\ya` / `\yi` | yank value / row as JSON / result as CSV / row as INSERT |
+| `\d` | diff against the previous run of the cell (toggle) |
+| `\h` | sparkline of the column under the cursor across live ticks |
+| `\yc` / `\yr` / `\ya` / `\yi` / `\yp` | yank value / row as JSON / result as CSV / row as INSERT / plan JSON |
 | `<Tab>` / `<S-Tab>` | next / previous column (next / previous row in record view) |
 | `]c` / `[c` | next / previous cell |
 | `\<Tab>` | focus the query pane |
@@ -282,6 +423,14 @@ do everywhere.
 |---|---|
 | `open [name]` | open a notebook (picker when no name) |
 | `new [title]` | create one |
+| `new --template <name> [title]` | create one from a template (`templates` picks) |
+| `analyze` / `explain-error` / `try-index [sql]` | agent analysis of the plan / of the error; hypothetical index |
+| `params [name value | clear]` | edit, set or forget parameter values |
+| `live [interval | stop]` | start / stop the live loop of the cell |
+| `diff [connection]` | diff against the previous run, or run the cell on another connection and diff |
+| `schema diff [a] [b]` / `settings diff [a] [b]` | compare two connections |
+| `history` | pick a statement from the history (Enter: new cell, `<C-y>`: yank) |
+| `aws add|login|refresh|tunnels|status|events|bluegreen [connection]` | the AWS layer |
 | `last` | jump to the most recent notebook |
 | `tags` | pick a tag, then a notebook |
 | `tag add x` / `tag remove x` | change tags of the current notebook |
@@ -295,7 +444,7 @@ do everywhere.
 | `schema refresh` / `schema tables` / `schema view` | refresh the cache / pick a table / toggle the schema document |
 | `describe <table>` | describe a table |
 | `rename <title>` / `delete` / `close` | notebook management |
-| `export csv|json [path]` | current result to the clipboard or a file |
+| `export csv|json|md [path]` | current result (or the whole notebook as markdown) to the clipboard or a file |
 | `cancel` | stop what is running |
 
 ## Running queries
@@ -312,7 +461,17 @@ diagnostic in the query buffer. Notices (`RAISE NOTICE`) show above the grid.
   `query.limit = nil` turns it off.
 - **Writes:** `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL and `DO`/`CALL`
   blocks ask for confirmation, with a louder prompt when an `UPDATE` or
-  `DELETE` has no `WHERE`. `query.confirm_writes = false` turns it off.
+  `DELETE` has no `WHERE`. The prompt says how many rows an `UPDATE` /
+  `DELETE` touches (the same `WHERE` as a `SELECT count(*)`,
+  `query.preview_writes`). `query.confirm_writes = false` turns it off.
+- **Dry run:** `-- @dryrun` (or `query.dry_run = true`) runs a write with
+  `RETURNING *` inside a transaction that is rolled back, so you see the rows
+  first. It is allowed on read-only connections.
+- **DDL warnings:** `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` on a
+  big table, `ALTER TABLE` (with specifics for type changes, `SET NOT NULL`,
+  constraints without `NOT VALID`, volatile defaults), `TRUNCATE`,
+  `VACUUM FULL`, `CLUSTER` and `REINDEX` are called out in the confirmation,
+  and so is a write connection with no `lock_timeout_ms`.
 - **Index check:** explainable statements are sent through `EXPLAIN (FORMAT
   JSON)` first. A `Seq Scan` on a table with at least `index_check.min_rows`
   rows (from the schema cache) produces a warning such as
@@ -454,6 +613,57 @@ differ. In a Rails project the agent is also told about Rails conventions
 (plural tables, `id`, `created_at`, `<singular>_id`), and the Rails
 bookkeeping tables are left out of the schema it sees.
 
+## Plan analysis, errors and hypothetical indexes
+
+`\A` (`:Dbgrid analyze`) takes the cell under the cursor, runs
+`EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON)` inside a transaction that
+is rolled back (`ai.analyze.mode = "estimate"` skips the ANALYZE; a write
+statement asks first), collects the tables' columns, indexes and
+`pg_stat_user_tables` counters, runs the rules below, and sends everything to
+the agent with a fixed answer shape: what is slow, why, the fix as SQL, what
+to verify. The answer opens in a markdown window under the results: `i`
+inserts its `sql` blocks as new cells below the analyzed cell, `y` yanks,
+`q` closes. The analysis is kept with the cell's result and shown in the plan
+view (`\p`).
+
+Rules on analyzed plans (`analyze_rules`): the planner's estimate off by more
+than `estimate_ratio`, sorts and hashes spilling to disk, the node with the
+highest exclusive time, and filters that discard most of what a node reads.
+The plan view renders actual times, loops and buffers.
+
+`\!` sends the SQL, the error with its hint and detail, and the tables
+involved to the agent for a cause and a fix. `\i` needs the
+[hypopg](https://github.com/HypoPG/hypopg) extension (available on RDS and
+Aurora): it creates the suggested index hypothetically in the same session,
+re-explains, and shows the estimated cost before and after.
+
+`ai.redact_literals = true` replaces string and numeric literals in the SQL
+and the plan before anything leaves the machine; `ai = false` on a connection
+disables the agent for it entirely. `ai.investigate = true` gives the agent a
+`dbgrid-query` shell helper bound to the same connection (read-only, 15 s
+statement timeout) and, for the `claude` agent, allows exactly that command,
+so it can check statistics or try EXPLAIN variants before answering.
+
+## Diffs
+
+- `\d` in the results pane diffs the current result against the previous run
+  of the same cell: rows added, removed and changed, matched by the table's
+  primary key when the result has it (else by an `id` column, else as whole
+  rows). `:Dbgrid diff <connection>` runs the cell on another connection and
+  diffs against the cached result: blue versus green row counts in one key.
+- `:Dbgrid schema diff a b` compares tables, columns, indexes, constraints and
+  enums of two connections in a scratch buffer (`]c` / `[c` jump between
+  tables). `:Dbgrid settings diff a b` does the same for `pg_settings` that
+  are not at their default.
+
+## History and export
+
+Every statement run is appended to `<store>/history.jsonl` (connection,
+notebook, cell, SQL, rows, timing, error; `history.max_entries` caps the
+file). `\H` / `:Dbgrid history` picks an entry into a new cell below the
+cursor, `<C-y>` yanks it. `:Dbgrid export md [path]` writes the notebook as
+markdown with every cell's SQL, its last result as a table and its analysis.
+
 ## Schema, indexes, completion
 
 The schema (tables, columns with types, primary/foreign keys, indexes, enums)
@@ -497,13 +707,21 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   rails = { enabled = true, environments = { "development", "test" } },
   storage = { mode = "auto", project_dir = ".dbgrid", data_dir = vim.fn.stdpath("data") .. "/dbgrid", cache_rows = 500 },
   layout = { results = "left", size = 0.5, tab = true },   -- results: "left" | "right" | "bottom"
-  query = { limit = 500, confirm_writes = true, transaction_per_cell = true, timeout_ms = nil,
+  query = { limit = 500, confirm_writes = true, preview_writes = true, dry_run = false, ddl_warnings = true,
+            transaction_per_cell = true, timeout_ms = nil, session = false,
             server_cancel = true, cancel_grace_ms = 1500 },
   format = { on_save = false, formatter = "auto", keyword_case = "keep", width = 100, indent = 2,
              order = { "pg_format", "sql-formatter", "sqlfluff", "sqlformat" }, commands = { ... } },
   index_check = { mode = "warn", min_rows = 10000 },        -- "off" | "warn" | "confirm"
+  analyze_rules = { estimate_ratio = 10, spill = true, hot_node = true, min_rows = 1000 },
+  live = { min_interval_ms = 1000, history = 60, max_cells = 4 },
+  templates = { dir = nil },
+  history = { enabled = true, max_entries = 2000 },
+  aws = { cli = "aws", endpoint_ttl_seconds = 86400, tunnel_ready_ms = 15000, probe_ms = 500,
+          login_cmd = { "aws", "sso", "login", "--profile", "{profile}" }, ssl = "require" },
   results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },
-  ai = { agent = "claude", agents = { ... }, max_tables = 40, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18" },
+  ai = { agent = "claude", agents = { ... }, max_tables = 40, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18",
+         analyze = { mode = "analyze", include_stats = true }, redact_literals = false, investigate = false },
   schema = { ttl_seconds = 3600, exclude = {} },
   completion = { omnifunc = true, keywords = true },
   keymaps = { query = { ... }, results = { ... } },          -- see lua/dbgrid/config.lua
@@ -513,8 +731,9 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
 
 Highlight groups (`DbgridCellHeader`, `DbgridCellHeaderActive`, `DbgridNull`,
 `DbgridNumber`, `DbgridCurrentColumn`, `DbgridWarn`, `DbgridSchemaTable`,
-`DbgridSchemaIndex`, `DbgridFindingWarn`, …) link to standard groups and can
-be overridden.
+`DbgridSchemaIndex`, `DbgridFindingWarn`, `DbgridChanged`, `DbgridDiffAdd`,
+`DbgridDiffDelete`, `DbgridDiffChange`, `DbgridLive`, …) link to standard
+groups and can be overridden.
 
 ## Other databases
 
@@ -538,6 +757,7 @@ require("dbgrid").register_adapter({
   run = function(conn, statements, opts, cb) ... end,          -- cb(dbgrid.RunResult)
   explain = function(conn, statements, cb) ... end,            -- cb(plans) (may be empty)
   explain_text = function(conn, sql, analyze, cb) ... end,     -- cb(lines, err, { plan, marks, findings })
+  explain_json = function(conn, sql, opts, cb) ... end,        -- cb(plan, err); opts.analyze runs inside a rolled back tx
   schema = function(conn, cb) ... end,                         -- cb(schema_json, err)
   test = function(conn, cb) ... end,                           -- cb(ok, message)
   cancel = function(job, conn) ... end,
@@ -564,13 +784,14 @@ DBGRID_TEST_URL=postgres://user:pass@localhost/db tests/run.sh   # plus Postgres
 DBGRID_TEST_URL=... nvim -u tests/minimal_init.lua -c 'luafile tests/demo.lua'   # try the UI
 ```
 
-The Postgres tests expect tables `users(id, email, plan_id, balance,
-created_at, note)` with a few thousand rows, `plans(id, name)` and
-`invoices(id, user_id, amount, paid_at, due_on)`.
+The Postgres tests expect `tests/seed.sql` loaded into the database
+(`users`, `plans`, `invoices`) and `pg_stat_statements` available. The AWS
+and agent features are tested against a fake `aws` CLI and a fake agent in
+`tests/fixtures`, so no account and no model are needed.
 
 ## Ideas not built yet
 
-- Result history per cell (diff two runs), pinned results
+- Pinned results
 - Result view in a floating window for one-off peeks from any buffer (`:Dbgrid run` on a visual selection)
 - Column statistics popup (distinct count, min/max) on demand
 - Django awareness: read `settings.py` for connections

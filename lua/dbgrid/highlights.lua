@@ -44,6 +44,12 @@ local groups = {
   DbgridSchemaDim = { link = "Comment" },
   DbgridFindingWarn = { link = "DiagnosticWarn" },
   DbgridFindingInfo = { link = "DiagnosticInfo" },
+  DbgridWinbarLive = { link = "DiagnosticInfo" },
+  DbgridChanged = { link = "DiffChange" },
+  DbgridDiffAdd = { link = "DiffAdd" },
+  DbgridDiffDelete = { link = "DiffDelete" },
+  DbgridDiffChange = { link = "DiffText" },
+  DbgridLive = { link = "DiagnosticInfo" },
 }
 
 function M.setup()

@@ -518,4 +518,103 @@ function M.to_lines(plan, opts)
   return lines, marks
 end
 
+---Root node and top-level element (times, triggers) of a decoded plan.
+---@param plan table
+---@return table? root, table? top
+local function root_of(plan)
+  if type(plan) ~= "table" then
+    return nil, nil
+  end
+  local top = plan[1] or plan
+  if type(top) ~= "table" or type(top.Plan) ~= "table" then
+    return nil, nil
+  end
+  return top.Plan, top
+end
+
+---Relations a plan touches, unique by schema and name, in tree order.
+---@param plan table
+---@return { name: string, schema?: string, alias?: string }[]
+function M.relations(plan)
+  local root = root_of(plan)
+  local out, seen = {}, {}
+  walk(root, function(node)
+    local name = node["Relation Name"]
+    if name then
+      local key = tostring(node.Schema) .. "." .. name
+      if not seen[key] then
+        seen[key] = true
+        out[#out + 1] = { name = name, schema = node.Schema, alias = node.Alias }
+      end
+    end
+  end)
+  return out
+end
+
+---@class dbgrid.PlanSummary
+---@field execution_ms number?
+---@field planning_ms number?
+---@field total_cost number?
+---@field analyzed boolean   true for EXPLAIN ANALYZE plans (nodes carry actual rows and times)
+
+---@param plan table
+---@return dbgrid.PlanSummary
+function M.summary(plan)
+  local root, top = root_of(plan)
+  return {
+    execution_ms = top and top["Execution Time"] or nil,
+    planning_ms = top and top["Planning Time"] or nil,
+    total_cost = root and root["Total Cost"] or nil,
+    analyzed = root ~= nil and (root["Actual Rows"] ~= nil or root["Actual Total Time"] ~= nil),
+  }
+end
+
+---@class dbgrid.PlanFinding
+---@field kind "estimate"|"spill"|"hot"|"filter"
+---@field message string
+---@field node table
+---@field relation string?
+---@field severity "warn"|"info"
+
+---Statements that try an index hypothetically (hypopg) and explain the query
+---with it; they must run in one session.
+---@param index_sql string   `CREATE INDEX ...`
+---@param explain_sql string   the query to explain
+---@return string[]
+function M.hypopg_script(index_sql, explain_sql)
+  local stripped = require("dbgrid.sql").strip_semicolon(index_sql)
+  return {
+    "select hypopg_reset()",
+    "select indexrelid, indexname from hypopg_create_index(" .. util.sql_literal(stripped) .. ")",
+    "EXPLAIN (FORMAT JSON) " .. explain_sql,
+  }
+end
+
+---@class dbgrid.CostDelta
+---@field before number
+---@field after number
+---@field pct number   percent change of the total cost (negative means cheaper)
+---@field used boolean   a hypothetical index (`<oid>name`) appears in the plan after
+
+
+
+---Estimated cost before and after a hypothetical index, and whether the
+---planner used it (hypopg index names start with "<").
+---@param before_plan table
+---@param after_plan table
+---@return { before: number, after: number, pct: number, used: boolean }
+function M.cost_delta(before_plan, after_plan)
+  local before = M.total_cost(before_plan) or 0
+  local after = M.total_cost(after_plan) or 0
+  local used = false
+  walk((root_of(after_plan)), function(node)
+    local name = node["Index Name"]
+    if type(name) == "string" and name:sub(1, 1) == "<" then
+      used = true
+    end
+  end)
+  local pct = before > 0 and (after - before) / before * 100 or 0
+  return { before = before, after = after, pct = pct, used = used }
+end
+
 return M

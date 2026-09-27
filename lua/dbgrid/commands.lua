@@ -20,7 +20,231 @@ M.subcommands = {
     require("dbgrid").open(args[1])
   end,
   new = function(args)
+    if args[1] == "--template" or args[1] == "-t" then
+      local name = args[2]
+      local title = #args > 2 and table.concat(vim.list_slice(args, 3, #args), " ") or nil
+      if not name then
+        return M.subcommands.templates({})
+      end
+      return require("dbgrid.templates").create_interactive(name, { title = title }, function(nb)
+        if nb then
+          require("dbgrid.ui.layout").open(nb)
+        end
+      end)
+    end
     require("dbgrid").new(#args > 0 and table.concat(args, " ") or nil)
+  end,
+  templates = function(args)
+    local templates = require("dbgrid.templates")
+    if args[1] == "list" then
+      for _, t in ipairs(templates.list()) do
+        util.notify(string.format("%s — %s%s", t.name, t.description, t.builtin and "" or " (user)"))
+      end
+      return
+    end
+    templates.pick(function(tpl)
+      if not tpl then
+        return
+      end
+      templates.create_interactive(tpl, {}, function(nb)
+        if nb then
+          require("dbgrid.ui.layout").open(nb)
+        end
+      end)
+    end)
+  end,
+  analyze = function()
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if cell then
+      require("dbgrid.runner").analyze_cell(s, cell)
+    end
+  end,
+  ["explain-error"] = function()
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if cell then
+      require("dbgrid.runner").explain_error(s, cell)
+    end
+  end,
+  ["try-index"] = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if cell then
+      require("dbgrid.runner").try_index(s, cell, #args > 0 and table.concat(args, " ") or nil)
+    end
+  end,
+  live = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local runner = require("dbgrid.runner")
+    if args[1] == "stop" then
+      return runner.stop_all_live(s, "cancelled")
+    end
+    local cell = current_cell(s)
+    if not cell then
+      return
+    end
+    if s.live[cell.id] then
+      return runner.stop_live(s, cell.id, "cancelled")
+    end
+    local ms = require("dbgrid.cells").interval_ms(args[1] or "5s")
+    if not ms then
+      return util.error("usage: :Dbgrid live [interval|stop]")
+    end
+    runner.run_cell(s, cell, {
+      cb = function(r)
+        if r.ok and not s.live[cell.id] then
+          runner.start_live(s, cell, ms)
+        end
+      end,
+    })
+  end,
+  history = function()
+    local s = require("dbgrid.state").current()
+    require("dbgrid.history").pick(function(entry, action)
+      if not entry then
+        return
+      end
+      if action == "yank" or not s then
+        vim.fn.setreg('"', entry.sql)
+        pcall(vim.fn.setreg, "+", entry.sql)
+        return util.notify("yanked")
+      end
+      local cells = require("dbgrid.cells")
+      local cell = current_cell(s)
+      local id, lnum = cells.insert(s.buf, cell and "below" or "end", cell, "from history")
+      local lines = require("dbgrid.util").lines(entry.sql)
+      vim.api.nvim_buf_set_lines(s.buf, lnum, lnum, false, lines)
+      vim.b[s.buf].dbgrid_cells_cache = nil
+      require("dbgrid.ui.query").render(s)
+      pcall(vim.api.nvim_win_set_cursor, s.query_win or 0, { lnum + 1, 0 })
+      util.notify("inserted cell " .. id)
+    end)
+  end,
+  diff = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if not cell then
+      return
+    end
+    if not args[1] then
+      return require("dbgrid.ui.results").diff_previous(s)
+    end
+    require("dbgrid.runner").diff_on(s, cell, args[1])
+  end,
+  settings = function(args)
+    if args[1] ~= "diff" then
+      return util.error("usage: :Dbgrid settings diff <a> <b>")
+    end
+    M.pair_command(args[2], args[3], function(a, b)
+      require("dbgrid.compare").settings(a, b)
+    end)
+  end,
+  aws = function(args)
+    local aws = require("dbgrid.aws")
+    local sub = args[1] or "status"
+    local s = require("dbgrid.state").current()
+    local function with_aws_conn(cb)
+      local name = args[2] or (s and s.nb.meta.connection)
+      local conn = name and require("dbgrid.connections").get(name)
+      if not conn or not conn.aws then
+        return util.error("pick an AWS connection first (:Dbgrid aws " .. sub .. " <connection>)")
+      end
+      cb(conn)
+    end
+    local function show(rows, columns, err, title)
+      if err then
+        return util.error("aws " .. sub .. ": " .. tostring(err))
+      end
+      require("dbgrid.ui.results").show_rows(s, { columns = columns, rows = rows }, { title = title })
+    end
+    if sub == "add" then
+      return aws.add_interactive(function(conn)
+        if conn then
+          util.notify("saved AWS connection " .. conn.name)
+        end
+      end)
+    elseif sub == "login" then
+      return with_aws_conn(function(conn)
+        aws.login(conn.aws, function(ok)
+          util.notify(ok and "credentials refreshed" or "login failed")
+          require("dbgrid.connections").forget(conn.name)
+        end)
+      end)
+    elseif sub == "refresh" then
+      return with_aws_conn(function(conn)
+        aws.forget_endpoints(conn.aws)
+        if aws.forget_credentials then
+          aws.forget_credentials(conn.aws)
+        end
+        require("dbgrid.connections").forget(conn.name)
+        util.notify("endpoint cache dropped for " .. conn.name)
+      end)
+    elseif sub == "tunnels" then
+      local tunnel = require("dbgrid.tunnel")
+      local list = tunnel.list()
+      if #list == 0 then
+        return util.notify("no tunnels")
+      end
+      local items = {}
+      for _, t in ipairs(list) do
+        items[#items + 1] = {
+          text = string.format(
+            "%s  localhost:%d  pid %s  %s",
+            t.key,
+            t.port or 0,
+            tostring(t.pid),
+            t.ok and "up" or "dead"
+          ),
+          data = t,
+        }
+      end
+      return require("dbgrid.ui.picker").pick(items, {
+        prompt = "Tunnels (Enter: kill)",
+        preview = false,
+        on_select = function(item)
+          if item then
+            tunnel.kill(item.data.key)
+            util.notify("killed tunnel " .. item.data.key)
+          end
+        end,
+      })
+    elseif sub == "status" then
+      return with_aws_conn(function(conn)
+        util.notify("fetching status of " .. conn.name .. "…")
+        aws.status(conn, function(rows, columns, err)
+          show(rows, columns, err, "aws status · " .. conn.name)
+        end)
+      end)
+    elseif sub == "events" then
+      return with_aws_conn(function(conn)
+        aws.events(conn, function(rows, columns, err)
+          show(rows, columns, err, "aws events · " .. conn.name)
+        end)
+      end)
+    elseif sub == "bluegreen" or sub == "blue-green" then
+      return with_aws_conn(function(conn)
+        aws.bluegreen(conn, function(rows, columns, err)
+          show(rows, columns, err, "blue/green deployments")
+        end)
+      end)
+    end
+    util.error("usage: :Dbgrid aws add|login|refresh|tunnels|status|events|bluegreen [connection]")
   end,
   last = function()
     require("dbgrid").last()
@@ -121,6 +345,11 @@ M.subcommands = {
     require("dbgrid.ai").generate(s, cell)
   end,
   schema = function(args)
+    if args[1] == "diff" then
+      return M.pair_command(args[2], args[3], function(a, b)
+        require("dbgrid.compare").schema(a, b)
+      end)
+    end
     local s = current_or_warn()
     if not s then
       return
@@ -247,7 +476,16 @@ M.subcommands = {
       return
     end
     local results = require("dbgrid.ui.results")
-    if args[1] == "json" then
+    if args[1] == "md" or args[1] == "markdown" then
+      local text = require("dbgrid.export").markdown(s)
+      if args[2] then
+        util.write_file(vim.fn.expand(args[2]), text)
+        return util.notify("written " .. args[2])
+      end
+      vim.fn.setreg('"', text)
+      pcall(vim.fn.setreg, "+", text)
+      return util.notify("yanked the notebook as markdown")
+    elseif args[1] == "json" then
       results.yank_row_json(s)
     else
       results.yank_csv(s)
@@ -262,6 +500,35 @@ M.subcommands = {
     vim.cmd("checkhealth dbgrid")
   end,
 }
+
+---Resolve two connection names (asking for the missing ones) and call back.
+---@param a? string
+---@param b? string
+---@param cb fun(a: dbgrid.Connection, b: dbgrid.Connection)
+function M.pair_command(a, b, cb)
+  local connections = require("dbgrid.connections")
+  local picker = require("dbgrid.ui.picker")
+  local s = require("dbgrid.state").current()
+  local function need(name, prompt, exclude, k)
+    if name then
+      local c = connections.get(name)
+      if not c then
+        return util.error("no connection named " .. name)
+      end
+      return k(c)
+    end
+    picker.connection(function(c)
+      if c then
+        k(c)
+      end
+    end, { prompt = prompt, exclude = exclude })
+  end
+  need(a or (s and s.nb.meta.connection), "First connection", nil, function(ca)
+    need(b, "Second connection", ca.name, function(cb2)
+      cb(ca, cb2)
+    end)
+  end)
+end
 
 ---@param opts table  command opts from nvim_create_user_command
 function M.run(opts)
@@ -303,11 +570,31 @@ function M.complete(arglead, cmdline)
   elseif sub == "explain" then
     candidates = { "analyze" }
   elseif sub == "schema" then
-    candidates = { "refresh", "tables", "view" }
+    candidates = { "refresh", "tables", "view", "diff" }
+  elseif sub == "settings" then
+    candidates = { "diff" }
   elseif sub == "tag" then
     candidates = { "add", "remove" }
   elseif sub == "export" then
-    candidates = { "csv", "json" }
+    candidates = { "csv", "json", "md" }
+  elseif sub == "aws" then
+    candidates = { "add", "login", "refresh", "tunnels", "status", "events", "bluegreen" }
+  elseif sub == "new" then
+    candidates = { "--template" }
+    if words[3] == "--template" then
+      candidates = {}
+      for _, t in ipairs(require("dbgrid.templates").list()) do
+        candidates[#candidates + 1] = t.name
+      end
+    end
+  elseif sub == "diff" then
+    for _, c in ipairs(require("dbgrid.connections").all()) do
+      candidates[#candidates + 1] = c.name
+    end
+  elseif sub == "live" then
+    candidates = { "stop", "5s", "30s", "2m" }
+  elseif sub == "templates" then
+    candidates = { "list" }
   elseif sub == "format" then
     candidates = { "all" }
   elseif sub == "agent" then

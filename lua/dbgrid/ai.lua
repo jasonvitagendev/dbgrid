@@ -195,14 +195,78 @@ local function build_argv(agent, prompt, output_path)
   return argv, uses_output
 end
 
----Run the agent with a prompt.
+---Replace string and numeric literals so production values never leave the machine.
+---@param text string
+---@return string
+function M.redact(text)
+  if not text then
+    return text
+  end
+  local out = text:gsub("'[^']*'", "'?'"):gsub("(%W)%-?%d+%.?%d*", "%1?")
+  return out
+end
+
+---The `dbgrid-query` helper the agent may call when `ai.investigate` is on:
+---a script bound to one connection, read-only, with a statement timeout.
+---@param conn dbgrid.Connection
+---@return string dir, table<string,string> env
+local function investigate_helper(conn)
+  local dir = vim.fn.tempname()
+  util.mkdirp(dir)
+  local script = table.concat({
+    "#!/bin/sh",
+    "# dbgrid-query: run one read-only statement on the connection the notebook analyzes.",
+    'if [ -z "$1" ]; then echo "usage: dbgrid-query \'<sql>\'" >&2; exit 2; fi',
+    'exec psql "$DBGRID_QUERY_URL" -X -v ON_ERROR_STOP=1 -c "$1"',
+  }, "\n") .. "\n"
+  util.write_file(dir .. "/dbgrid-query", script)
+  pcall(vim.uv.fs_chmod, dir .. "/dbgrid-query", 493) -- 0755
+  local env = {
+    DBGRID_QUERY_URL = conn.url,
+    PGOPTIONS = "-c default_transaction_read_only=on -c statement_timeout=15000",
+    PATH = dir .. ":" .. (vim.env.PATH or ""),
+  }
+  for k, v in pairs(conn.env or {}) do
+    env[k] = v
+  end
+  return dir, env
+end
+
+---Argv of an agent with the investigation tool allowed (claude: Bash(dbgrid-query:*)).
+---@param agent table
+---@return table agent
+local function investigate_agent(agent)
+  local copy = vim.deepcopy(agent)
+  if copy.investigate_cmd then
+    copy.cmd = copy.investigate_cmd
+    return copy
+  end
+  local cmd = copy.cmd
+  for i, a in ipairs(cmd) do
+    if a == "--disallowedTools" and cmd[i + 1] then
+      cmd[i + 1] = table.concat(
+        vim.tbl_filter(function(t)
+          return t ~= "Bash"
+        end, vim.split(cmd[i + 1], ",", { trimempty = true })),
+        ","
+      )
+      cmd[#cmd + 1] = "--allowedTools"
+      cmd[#cmd + 1] = "Bash(dbgrid-query:*)"
+      break
+    end
+  end
+  return copy
+end
+
+---Run the agent with a prompt and hand back the raw answer.
 ---@param prompt string
----@param cb fun(sql?: string, err?: string)
----@param agent_name? string
+---@param cb fun(text?: string, err?: string)
+---@param opts? { agent?: string, connection?: dbgrid.Connection }
 ---@return dbgrid.Job?
-function M.ask(prompt, cb, agent_name)
+function M.run_agent(prompt, cb, opts)
+  opts = opts or {}
   local cfg = config.get().ai
-  agent_name = agent_name or cfg.agent
+  local agent_name = opts.agent or cfg.agent
   local agent = cfg.agents[agent_name]
   if not agent then
     cb(nil, "unknown agent '" .. tostring(agent_name) .. "' (configure ai.agents)")
@@ -212,6 +276,15 @@ function M.ask(prompt, cb, agent_name)
     cb(nil, "'" .. agent.cmd[1] .. "' is not on PATH")
     return nil
   end
+  local env, helper_dir
+  if cfg.investigate and opts.connection and opts.connection.ai ~= false then
+    helper_dir, env = investigate_helper(opts.connection)
+    agent = investigate_agent(agent)
+    prompt = prompt
+      .. "\n## Tool\nYou may run read-only SQL against the same database with the shell command"
+      .. " `dbgrid-query '<sql>'` (one statement per call, 15 s timeout). Use it to check table statistics,"
+      .. " row counts, existing indexes or alternative EXPLAIN plans before answering.\n"
+  end
   local output_path = vim.fn.tempname()
   local argv, uses_output = build_argv(agent, prompt, output_path)
   local ok, job = pcall(vim.system, argv, {
@@ -219,12 +292,16 @@ function M.ask(prompt, cb, agent_name)
     text = true,
     timeout = cfg.timeout_ms,
     cwd = require("dbgrid.project").root(),
+    env = env,
   }, function(out)
     vim.schedule(function()
       local text = out.stdout or ""
       if uses_output then
         text = util.read_file(output_path) or ""
         pcall(os.remove, output_path)
+      end
+      if helper_dir then
+        pcall(vim.fn.delete, helper_dir, "rf")
       end
       if out.code ~= 0 and util.trim(text) == "" then
         cb(
@@ -233,8 +310,7 @@ function M.ask(prompt, cb, agent_name)
         )
         return
       end
-      local sql, err = M.clean_output(text)
-      cb(sql, err)
+      cb(text)
     end)
   end)
   if not ok then
@@ -242,6 +318,181 @@ function M.ask(prompt, cb, agent_name)
     return nil
   end
   return job
+end
+
+---Run the agent with a prompt; the answer must be SQL.
+---@param prompt string
+---@param cb fun(sql?: string, err?: string)
+---@param agent_name? string
+---@return dbgrid.Job?
+function M.ask(prompt, cb, agent_name)
+  return M.run_agent(prompt, function(text, err)
+    if not text then
+      return cb(nil, err)
+    end
+    cb(M.clean_output(text))
+  end, { agent = agent_name })
+end
+
+---Run the agent with a prompt; the answer is free text (markdown).
+---@param prompt string
+---@param cb fun(text?: string, err?: string)
+---@param opts? { agent?: string, connection?: dbgrid.Connection }
+---@return dbgrid.Job?
+function M.ask_text(prompt, cb, opts)
+  return M.run_agent(prompt, function(text, err)
+    if not text then
+      return cb(nil, err)
+    end
+    text = util.trim((text or ""):gsub("\r\n", "\n"))
+    if text == "" then
+      return cb(nil, "the agent returned nothing")
+    end
+    cb(text)
+  end, opts)
+end
+
+---@param tables dbgrid.SchemaTable[]
+---@return string
+local function describe_tables(tables)
+  local schema_mod = require("dbgrid.schema")
+  local parts = {}
+  for _, t in ipairs(tables or {}) do
+    parts[#parts + 1] = table.concat(schema_mod.describe_lines(t), "\n")
+  end
+  return table.concat(parts, "\n\n")
+end
+
+---@param stats { columns: string[], rows: any[][] }?
+---@return string?
+local function format_stats(stats)
+  if not stats or #stats.rows == 0 then
+    return nil
+  end
+  local lines = { table.concat(stats.columns, " | ") }
+  for _, row in ipairs(stats.rows) do
+    local vals = {}
+    for j = 1, #stats.columns do
+      local v = row[j]
+      vals[j] = (v == vim.NIL or v == nil) and "null" or tostring(v)
+    end
+    lines[#lines + 1] = table.concat(vals, " | ")
+  end
+  return table.concat(lines, "\n")
+end
+
+---Prompt for `:Dbgrid analyze`.
+---@param opts { sql: string, plan_lines: string[], summary?: table, findings?: string[], tables?: dbgrid.SchemaTable[],
+---  stats?: table, version?: string, analyzed?: boolean }
+---@return string
+function M.build_analyze_prompt(opts)
+  local cfg = config.get().ai
+  local redact = cfg.redact_literals and M.redact or function(t)
+    return t
+  end
+  local parts = {}
+  parts[#parts + 1] = string.format(
+    "You are a %s performance expert reading a query plan for a developer who is not a database specialist.\n"
+      .. "Answer in markdown with exactly these four sections, each short and concrete:\n"
+      .. "## What is slow\n## Why\n## Fix\n## Verify\n"
+      .. "In Fix, give the SQL to run (an index, a rewrite of the query, a setting) in ```sql fences,"
+      .. " one statement per fence,"
+      .. " and say what it costs (lock, disk, time). In Verify, say what to measure after the change."
+      .. " Refer to plan nodes by name. Do not repeat the plan. Do not invent tables or columns.",
+    opts.version and opts.version:match("^PostgreSQL [%d%.]+") or cfg.dialect or "PostgreSQL"
+  )
+  if (cfg.instructions or "") ~= "" then
+    parts[#parts + 1] = cfg.instructions
+  end
+  parts[#parts + 1] = "## Query\n```sql\n" .. redact(opts.sql) .. "\n```"
+  local head = opts.analyzed and "## Plan (EXPLAIN ANALYZE, BUFFERS)" or "## Plan (EXPLAIN, estimates only)"
+  if opts.summary then
+    local bits = {}
+    if opts.summary.execution_ms then
+      bits[#bits + 1] = string.format("execution %.1f ms", opts.summary.execution_ms)
+    end
+    if opts.summary.planning_ms then
+      bits[#bits + 1] = string.format("planning %.1f ms", opts.summary.planning_ms)
+    end
+    if opts.summary.total_cost then
+      bits[#bits + 1] = "total cost " .. tostring(opts.summary.total_cost)
+    end
+    if #bits > 0 then
+      head = head .. " · " .. table.concat(bits, ", ")
+    end
+  end
+  parts[#parts + 1] = head .. "\n```\n" .. redact(table.concat(opts.plan_lines or {}, "\n")) .. "\n```"
+  if opts.findings and #opts.findings > 0 then
+    parts[#parts + 1] = "## Rule-based findings (verify them)\n- " .. table.concat(opts.findings, "\n- ")
+  end
+  if opts.tables and #opts.tables > 0 then
+    parts[#parts + 1] = "## Tables involved (columns, indexes)\n" .. describe_tables(opts.tables)
+  end
+  local stats = format_stats(opts.stats)
+  if stats then
+    parts[#parts + 1] = "## Table statistics (pg_stat_user_tables)\n" .. stats
+  end
+  return table.concat(parts, "\n\n") .. "\n"
+end
+
+---Prompt for "explain this error".
+---@param opts { sql: string, error: dbgrid.RunError, tables?: dbgrid.SchemaTable[], version?: string,
+---  schema?: dbgrid.SchemaData }
+---@return string
+function M.build_error_prompt(opts)
+  local cfg = config.get().ai
+  local redact = cfg.redact_literals and M.redact or function(t)
+    return t
+  end
+  local parts = {}
+  parts[#parts + 1] = string.format(
+    "You help a developer fix a failing %s statement inside a SQL notebook.\n"
+      .. "Answer in markdown with two sections: ## Cause (one or two sentences) and ## Fix (the corrected SQL in a"
+      .. " ```sql fence, then one sentence on why it works). If the error is about data or permissions rather than"
+      .. " the SQL, say what to check instead. Only use tables and columns from the schema below.",
+    opts.version and opts.version:match("^PostgreSQL [%d%.]+") or cfg.dialect or "PostgreSQL"
+  )
+  if (cfg.instructions or "") ~= "" then
+    parts[#parts + 1] = cfg.instructions
+  end
+  parts[#parts + 1] = "## Statement\n```sql\n" .. redact(opts.sql) .. "\n```"
+  local e = opts.error
+  local err = { "ERROR: " .. tostring(e.message) }
+  if e.line then
+    err[#err + 1] = "at line " .. e.line .. (e.col and (", column " .. e.col) or "") .. " of the statement"
+  end
+  if e.detail then
+    err[#err + 1] = "DETAIL: " .. e.detail
+  end
+  if e.hint then
+    err[#err + 1] = "HINT: " .. e.hint
+  end
+  if e.context then
+    err[#err + 1] = "CONTEXT: " .. e.context
+  end
+  parts[#parts + 1] = "## Error\n" .. redact(table.concat(err, "\n"))
+  local tables = opts.tables or {}
+  if #tables == 0 and opts.schema then
+    tables = require("dbgrid.schema").relevant_tables(opts.schema, opts.sql .. " " .. tostring(e.message), opts.sql, 10)
+  end
+  if #tables > 0 then
+    parts[#parts + 1] = "## Tables\n" .. describe_tables(tables)
+  end
+  return table.concat(parts, "\n\n") .. "\n"
+end
+
+---Fenced SQL blocks of a markdown answer.
+---@param text string
+---@return string[]
+function M.sql_blocks(text)
+  local out = {}
+  for block in (text or ""):gmatch("```sql%s*\n(.-)```") do
+    block = util.trim(block)
+    if block ~= "" then
+      out[#out + 1] = block
+    end
+  end
+  return out
 end
 
 ---Replace the SQL of a cell, keeping prompt and directive lines on top.

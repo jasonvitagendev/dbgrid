@@ -38,7 +38,7 @@ local inflight = {} ---@type table<string, fun(schema?: dbgrid.SchemaData, err?:
 
 ---@param conn dbgrid.Connection
 function M.key(conn)
-  return util.hash(util.redact_url(conn.url or conn.name))
+  return util.hash(util.redact_url(conn.declared_url or conn.url or conn.name))
 end
 
 ---@param conn dbgrid.Connection
@@ -138,15 +138,21 @@ function M.refresh(conn, cb)
     done(nil, err)
     return
   end
-  adapter.schema(conn, function(raw, e)
-    if not raw then
-      done(nil, e or "schema fetch failed")
+  require("dbgrid.connections").resolve(conn, function(eff, rerr)
+    if not eff then
+      done(nil, rerr or "connection could not be resolved")
       return
     end
-    raw.fetched_at = util.epoch()
-    pcall(util.write_json, disk_path(conn), raw)
-    memory[key] = normalise(raw)
-    done(memory[key])
+    adapter.schema(eff, function(raw, e)
+      if not raw then
+        done(nil, e or "schema fetch failed")
+        return
+      end
+      raw.fetched_at = util.epoch()
+      pcall(util.write_json, disk_path(conn), raw)
+      memory[key] = normalise(raw)
+      done(memory[key])
+    end)
   end)
 end
 
@@ -411,6 +417,301 @@ function M.relevant_tables(schema, prompt, sql_context, max)
     end
   end
   return out
+end
+
+---@class dbgrid.SchemaDiff
+---@field lines string[]
+---@field changes integer
+---@field tables { name: string, lnum: integer }[]   1-based line of each `+ table` / `- table` / `~ table` line
+
+---@param list table[]
+---@return table<string, table>
+local function index_by_name(list)
+  local map = {}
+  for _, item in ipairs(list or {}) do
+    if item.name and not map[item.name] then
+      map[item.name] = item
+    end
+  end
+  return map
+end
+
+---@param c dbgrid.SchemaColumn
+local function null_desc(c)
+  return c.notnull and "not null" or "nullable"
+end
+
+---@param c dbgrid.SchemaColumn
+local function default_desc(c)
+  local def = nil_if_null(c.default)
+  return def and ("default " .. def) or "no default"
+end
+
+---`text not null default 'x'` for added / removed columns.
+---@param c dbgrid.SchemaColumn
+local function column_desc(c)
+  local s = c.type or ""
+  if c.notnull then
+    s = s .. " not null"
+  end
+  local def = nil_if_null(c.default)
+  if def then
+    s = s .. " default " .. def
+  end
+  return s
+end
+
+---Differences between two versions of one table.
+---@param ta dbgrid.SchemaTable
+---@param tb dbgrid.SchemaTable
+---@return { op: string, kind: string, name: string, detail: string }[]
+local function table_changes(ta, tb)
+  local out = {}
+  local function push(op, kind, name, detail)
+    out[#out + 1] = { op = op, kind = kind, name = name, detail = detail or "" }
+  end
+  local ca, cb = index_by_name(ta.columns), index_by_name(tb.columns)
+  for _, c in ipairs(ta.columns or {}) do
+    local d = cb[c.name]
+    if d then
+      if (c.type or "") ~= (d.type or "") then
+        push("~", "column", c.name, (c.type or "?") .. " → " .. (d.type or "?"))
+      end
+      if (c.notnull or false) ~= (d.notnull or false) then
+        push("~", "column", c.name, null_desc(c) .. " → " .. null_desc(d))
+      end
+      if (nil_if_null(c.default) or "") ~= (nil_if_null(d.default) or "") then
+        push("~", "column", c.name, default_desc(c) .. " → " .. default_desc(d))
+      end
+    end
+  end
+  for _, d in ipairs(tb.columns or {}) do
+    if not ca[d.name] then
+      push("+", "column", d.name, column_desc(d))
+    end
+  end
+  for _, c in ipairs(ta.columns or {}) do
+    if not cb[c.name] then
+      push("-", "column", c.name, column_desc(c))
+    end
+  end
+  for _, group in ipairs({ { "index", ta.indexes, tb.indexes }, { "constraint", ta.constraints, tb.constraints } }) do
+    local kind, la, lb = group[1], group[2] or {}, group[3] or {}
+    local ma, mb = index_by_name(la), index_by_name(lb)
+    for _, x in ipairs(la) do
+      local y = mb[x.name]
+      if y and (nil_if_null(x.def) or "") ~= (nil_if_null(y.def) or "") then
+        push("~", kind, x.name, (nil_if_null(x.def) or "?") .. " → " .. (nil_if_null(y.def) or "?"))
+      end
+    end
+    for _, y in ipairs(lb) do
+      if not ma[y.name] then
+        push("+", kind, y.name, nil_if_null(y.def))
+      end
+    end
+    for _, x in ipairs(la) do
+      if not mb[x.name] then
+        push("-", kind, x.name)
+      end
+    end
+  end
+  return out
+end
+
+---@param data dbgrid.SchemaData
+---@return table<string, dbgrid.SchemaTable> map, string[] keys
+local function table_map(data)
+  local map, keys = {}, {}
+  for _, t in ipairs(data.tables or {}) do
+    local key = (t.schema .. "." .. t.name):lower()
+    if not map[key] then
+      keys[#keys + 1] = key
+    end
+    map[key] = t
+  end
+  return map, keys
+end
+
+---Compare two schema snapshots (two databases, or one before and after a migration).
+---@param a dbgrid.SchemaData
+---@param b dbgrid.SchemaData
+---@param opts? { a_name?: string, b_name?: string }
+---@return dbgrid.SchemaDiff
+function M.diff(a, b, opts)
+  opts = opts or {}
+  local a_name, b_name = opts.a_name or "a", opts.b_name or "b"
+  local ma, ka = table_map(a)
+  local mb, kb = table_map(b)
+  local keys = util.uniq(vim.list_extend(ka, kb))
+  table.sort(keys)
+  local body, tables, changes = {}, {}, 0
+  for _, key in ipairs(keys) do
+    local ta, tb = ma[key], mb[key]
+    if not ta then
+      body[#body + 1] = string.format("+ table %s (%d columns)", M.display_name(tb), #(tb.columns or {}))
+      tables[#tables + 1] = { name = M.display_name(tb), lnum = #body }
+      changes = changes + 1
+    elseif not tb then
+      body[#body + 1] = "- table " .. M.display_name(ta)
+      tables[#tables + 1] = { name = M.display_name(ta), lnum = #body }
+      changes = changes + 1
+    else
+      local list = table_changes(ta, tb)
+      if #list > 0 then
+        body[#body + 1] = "~ table " .. M.display_name(ta)
+        tables[#tables + 1] = { name = M.display_name(ta), lnum = #body }
+        local w = 0
+        for _, c in ipairs(list) do
+          w = math.max(w, util.width(c.name))
+        end
+        for _, c in ipairs(list) do
+          local line = string.format("  %s %s %s", c.op, c.kind, c.name)
+          if c.detail ~= "" then
+            line = string.format("  %s %s %s  %s", c.op, c.kind, util.pad(c.name, w), c.detail)
+          end
+          body[#body + 1] = line
+          changes = changes + 1
+        end
+      end
+    end
+  end
+  -- enums: compared as sets of values
+  local ea, eb = index_by_name(a.enums), index_by_name(b.enums)
+  local names = {}
+  for _, e in ipairs(a.enums or {}) do
+    names[#names + 1] = e.name
+  end
+  for _, e in ipairs(b.enums or {}) do
+    names[#names + 1] = e.name
+  end
+  names = util.uniq(names)
+  table.sort(names)
+  local function values_of(e)
+    return type(e.values) == "table" and e.values or {}
+  end
+  for _, name in ipairs(names) do
+    local x, y = ea[name], eb[name]
+    if not x then
+      body[#body + 1] = string.format("+ enum %s (%s)", name, table.concat(values_of(y), ", "))
+      changes = changes + 1
+    elseif not y then
+      body[#body + 1] = "- enum " .. name
+      changes = changes + 1
+    else
+      local va, vb = {}, {}
+      for _, v in ipairs(values_of(x)) do
+        va[v] = true
+      end
+      for _, v in ipairs(values_of(y)) do
+        vb[v] = true
+      end
+      local parts = {}
+      for _, v in ipairs(values_of(y)) do
+        if not va[v] then
+          parts[#parts + 1] = "+ " .. v
+        end
+      end
+      for _, v in ipairs(values_of(x)) do
+        if not vb[v] then
+          parts[#parts + 1] = "- " .. v
+        end
+      end
+      if #parts > 0 then
+        body[#body + 1] = string.format("~ enum %s: %s", name, table.concat(parts, ", "))
+        changes = changes + 1
+      end
+    end
+  end
+  local header
+  if changes == 0 then
+    header = string.format("%s and %s: schemas match (%d tables)", a_name, b_name, #(a.tables or {}))
+  else
+    header = string.format("%s → %s: %d difference%s", a_name, b_name, changes, changes == 1 and "" or "s")
+  end
+  local lines = { header }
+  vim.list_extend(lines, body)
+  for _, t in ipairs(tables) do
+    t.lnum = t.lnum + 1
+  end
+  return { lines = lines, changes = changes, tables = tables }
+end
+
+---Non-default server settings, as rows of `{ name, setting, unit, source }`.
+M.SETTINGS_SQL = "select name, setting, unit, source from pg_settings"
+  .. " where source <> 'default' and name <> 'application_name' order by name"
+
+---`4096kB` for a pg_settings row; units like `8kB` are multiplied out.
+---@param row any[]
+---@return string
+local function setting_value(row)
+  local v = row[2]
+  if v == nil or v == vim.NIL then
+    return "NULL"
+  end
+  v = tostring(v)
+  local unit = row[3]
+  if unit ~= nil and unit ~= vim.NIL and unit ~= "" then
+    unit = tostring(unit)
+    local mult, suffix = unit:match("^(%d+)(%a+)$")
+    local n = tonumber(v)
+    if mult and n then
+      v = tostring(n * tonumber(mult)) .. suffix
+    else
+      v = v .. unit
+    end
+  end
+  return v
+end
+
+---Compare the non-default settings of two connections (rows from `SETTINGS_SQL`).
+---@param rows_a any[][]
+---@param rows_b any[][]
+---@param opts? { a_name?: string, b_name?: string }
+---@return { lines: string[], changes: integer }
+function M.settings_diff(rows_a, rows_b, opts)
+  opts = opts or {}
+  local a_name, b_name = opts.a_name or "a", opts.b_name or "b"
+  local ma, mb, names = {}, {}, {}
+  for _, r in ipairs(rows_a or {}) do
+    ma[tostring(r[1])] = r
+    names[#names + 1] = tostring(r[1])
+  end
+  for _, r in ipairs(rows_b or {}) do
+    mb[tostring(r[1])] = r
+    names[#names + 1] = tostring(r[1])
+  end
+  names = util.uniq(names)
+  table.sort(names)
+  local entries, w = {}, 0
+  for _, name in ipairs(names) do
+    local ra, rb = ma[name], mb[name]
+    local entry
+    if not ra then
+      entry = { "+", name, setting_value(rb) }
+    elseif not rb then
+      entry = { "-", name, setting_value(ra) }
+    else
+      local va, vb = setting_value(ra), setting_value(rb)
+      if va ~= vb then
+        entry = { "~", name, va .. " → " .. vb }
+      end
+    end
+    if entry then
+      entries[#entries + 1] = entry
+      w = math.max(w, util.width(name))
+    end
+  end
+  local lines
+  if #entries == 0 then
+    lines = { string.format("%s and %s: settings match (%d settings)", a_name, b_name, #(rows_a or {})) }
+  else
+    local n = #entries
+    lines = { string.format("%s → %s: %d difference%s", a_name, b_name, n, n == 1 and "" or "s") }
+    for _, e in ipairs(entries) do
+      lines[#lines + 1] = string.format("%s %s  %s", e[1], util.pad(e[2], w), e[3])
+    end
+  end
+  return { lines = lines, changes = #entries }
 end
 
 ---Forget cached schemas (tests).
