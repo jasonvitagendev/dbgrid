@@ -36,6 +36,12 @@ local groups = {
   DbgridWinbarOk = { link = "DiagnosticOk" },
   DbgridWinbarError = { link = "DiagnosticError" },
   DbgridWinbarWarn = { link = "DiagnosticWarn" },
+  DbgridWinbarLive = { link = "DiagnosticInfo" },
+  DbgridChanged = { link = "DiffChange" },
+  DbgridDiffAdd = { link = "DiffAdd" },
+  DbgridDiffDelete = { link = "DiffDelete" },
+  DbgridDiffChange = { link = "DiffText" },
+  DbgridLive = { link = "DiagnosticInfo" },
 }
 
 function M.setup()
