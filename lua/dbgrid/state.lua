@@ -12,6 +12,8 @@ local M = {}
 ---@field running table<string, { job: dbgrid.Job, started: number, kind: string }>
 ---@field runtime table<string, table>   per-cell transient status (warnings, generated flag)
 ---@field view table              results view state
+---@field live table<string, table>      live (`@every`) cells: timer, interval, ticks, history, changed
+---@field previous table<string, table>  result before the last run, per cell (for the diff view)
 
 M.by_buf = {} ---@type table<integer, dbgrid.State>
 
@@ -30,7 +32,7 @@ function M.attach(buf, nb)
     s.nb = nb
     return s
   end
-  s = { buf = buf, nb = nb, running = {}, runtime = {}, view = {} }
+  s = { buf = buf, nb = nb, running = {}, runtime = {}, view = {}, live = {}, previous = {} }
   M.by_buf[buf] = s
   return s
 end
