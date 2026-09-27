@@ -38,7 +38,9 @@ function M.pick(items, opts)
         actions[name] = function(picker, item)
           picker:close()
           if item and item.item then
-            fn(item.item)
+            vim.schedule(function()
+              fn(item.item)
+            end)
           end
         end
         keys[key] = { name, mode = { "n", "i" } }
@@ -54,7 +56,10 @@ function M.pick(items, opts)
         win = { input = { keys = keys } },
         confirm = function(picker, item)
           picker:close()
-          opts.on_select(item and item.item or nil)
+          -- close() queues a stopinsert; defer so a follow-up input starts in insert mode
+          vim.schedule(function()
+            opts.on_select(item and item.item or nil)
+          end)
         end,
       })
     end)
