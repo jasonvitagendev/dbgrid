@@ -194,6 +194,22 @@ H.describe("aws parsers", function()
     local managed = aws.parse_secret('{"SecretString": "{\\"username\\":\\"postgres\\",\\"password\\":\\"x\\"}"}')
     H.eq(managed.username, "postgres")
     H.eq(managed.dbname, nil)
+    -- hand-written secrets: db / hostWrite / hostRead and a string port
+    local custom = aws.parse_secret({
+      SecretString = vim.json.encode({
+        port = "5432",
+        hostWrite = "vpce-w.us-west-1.vpce.amazonaws.com",
+        hostRead = "vpce-r.us-west-1.vpce.amazonaws.com",
+        password = "pw",
+        db = "jobs",
+        username = "je_next_user",
+      }),
+    })
+    H.eq(custom.dbname, "jobs")
+    H.eq(custom.port, 5432)
+    H.eq(custom.host, "vpce-w.us-west-1.vpce.amazonaws.com")
+    H.eq(custom.read_host, "vpce-r.us-west-1.vpce.amazonaws.com")
+    H.eq(aws.parse_secret({ SecretString = '{"username":"u","password":"p","database":"d"}' }).dbname, "d")
     local bad, err = aws.parse_secret('{"SecretString": "{\\"foo\\":1}"}')
     H.eq(bad, nil)
     H.matches(err, "username/password")
@@ -773,6 +789,86 @@ H.describe("aws bastions", function()
     H.falsy(aws.is_instance_id(nil))
   end)
 
+  H.it("falls back to the running EC2 instances when the SSM listing is denied", function()
+    -- pure: without the ssm listing every running instance is a candidate of unknown status
+    local ec2 = {
+      Reservations = {
+        {
+          Instances = {
+            { InstanceId = "i-jump", VpcId = "vpc-a", Tags = { { Key = "Name", Value = "jump-1" } } },
+            { InstanceId = "i-web", VpcId = "vpc-a", Tags = { { Key = "Name", Value = "web-1" } } },
+          },
+        },
+      },
+    }
+    local list = aws.parse_bastions(nil, ec2)
+    H.eq(#list, 2)
+    H.eq(list[1].id, "i-jump")
+    H.eq(list[1].online, nil)
+    local ranked = aws.rank_bastions(list, { vpc = "vpc-a" })
+    H.eq(ranked[1].id, "i-jump")
+    H.eq(ranked[1].why, { "name", "same vpc" })
+    local _, perr = aws.parse_bastions(nil, nil)
+    H.matches(perr, "neither")
+    -- through the CLI: ssm denied, ec2 allowed
+    vim.env.DBGRID_FAKE_AWS_DENY = "ssm describe-instance-information"
+    local got, err, note = sync(function(cb)
+      aws.bastions(prod.aws, cb)
+    end)
+    H.eq(err, nil)
+    H.matches(note, "AccessDeniedException")
+    H.eq(#got, 3)
+    for _, c in ipairs(got) do
+      H.eq(c.online, nil)
+    end
+    -- the one jumpbox in the database's vpc is still taken without a prompt
+    local orig_select, orig_input = vim.ui.select, vim.ui.input
+    local asked = {}
+    vim.ui.select = function(items, opts, on_choice)
+      asked[#asked + 1] = vim.tbl_map(opts.format_item, items)
+      vim.schedule(function()
+        on_choice(nil)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      asked[#asked + 1] = opts.prompt
+      vim.schedule(function()
+        on_confirm("i-0typed")
+      end)
+    end
+    local picked = sync(function(cb)
+      aws.pick_bastion(prod.aws, { vpc = "vpc-0app" }, cb)
+    end)
+    H.eq(picked, "i-0bastion")
+    H.eq(#asked, 0, "no prompt")
+    -- without the vpc hint two names match: the list is shown, statuses unknown
+    local _, cancelled = sync(function(cb)
+      aws.pick_bastion(prod.aws, {}, cb)
+    end)
+    H.eq(cancelled, true)
+    H.eq(asked[1][1], "i-0bastion  bastion-prod  ssm status unknown")
+    H.eq(asked[1][2], "i-0oldjump  jumpbox-legacy  ssm status unknown")
+    -- both listings denied: the typed prompt, saying why
+    vim.env.DBGRID_FAKE_AWS_DENY = "ssm describe-instance-information,ec2 describe-instances"
+    asked = {}
+    picked = sync(function(cb)
+      aws.pick_bastion(prod.aws, { vpc = "vpc-0app" }, cb)
+    end)
+    vim.env.DBGRID_FAKE_AWS_DENY = ""
+    vim.ui.select, vim.ui.input = orig_select, orig_input
+    H.eq(picked, "i-0typed")
+    H.eq(asked, { "SSM target instance id (lookup failed, see :messages; empty = connect directly): " })
+    -- the runtime lookup by name works from the ec2 listing alone
+    vim.env.DBGRID_FAKE_AWS_DENY = "ssm describe-instance-information"
+    local id, ierr = sync(function(cb)
+      aws.bastion_id({ profile = "prod", region = "ap-southeast-1", bastion = "web-1" }, {}, cb)
+    end)
+    vim.env.DBGRID_FAKE_AWS_DENY = ""
+    H.eq(ierr, nil)
+    H.eq(id, "i-0web")
+    aws.forget_bastion({ profile = "prod", region = "ap-southeast-1", bastion = "web-1" })
+  end)
+
   H.it("resolves a bastion by its Name tag or auto, and caches the id", function()
     local ec2_before = log_count("ec2 describe-instances")
     local conn = vim.deepcopy(prod)
@@ -872,7 +968,7 @@ H.describe("aws bastions", function()
 end)
 
 H.describe("aws database name", function()
-  H.it("falls back to the cluster's initial database, then postgres, when the secret has none", function()
+  H.it("falls back to the cluster's initial database when the secret has none, else asks once", function()
     local info = aws.parse_cluster(CLUSTER_JSON)
     H.eq(info.database, nil)
     local fake_info, err = sync(function(cb)
@@ -890,7 +986,7 @@ H.describe("aws database name", function()
     creds = sync(function(cb)
       aws.credentials(nodb, { writer = { host = "h2", port = 5432 } }, cb)
     end)
-    H.eq(creds.dbname, "postgres", "the maintenance database is the last resort")
+    H.eq(creds.dbname, nil, "nothing names the database: resolve() asks")
     nodb.database = "app"
     creds = sync(function(cb)
       aws.credentials(nodb, { writer = { host = "h3", port = 5432 }, database = "initial" }, cb)
@@ -902,6 +998,61 @@ H.describe("aws database name", function()
       aws.credentials(full, { writer = { host = "h4", port = 5432 }, database = "initial" }, cb)
     end)
     H.eq(creds.dbname, "dbgrid_test")
+    -- end to end: a saved connection on a cluster without an initial database is asked once, and remembers
+    local connections = require("dbgrid.connections")
+    connections.save({
+      name = "nodb",
+      url = "aws://prod/app-nodb",
+      ssl = "disable",
+      aws = { profile = "prod", region = "ap-southeast-1", cluster = "app-nodb" },
+    }, "global")
+    local prompts = {}
+    local orig_input = vim.ui.input
+    vim.ui.input = function(opts, on_confirm)
+      prompts[#prompts + 1] = opts
+      vim.schedule(function()
+        on_confirm("jobs")
+      end)
+    end
+    local eff, rerr = sync(function(cb)
+      aws.resolve(connections.get("nodb"), cb)
+    end)
+    vim.ui.input = orig_input
+    H.eq(rerr, nil)
+    H.eq(eff.dbname, "jobs")
+    H.matches(eff.url, "/jobs%?")
+    H.eq(#prompts, 1)
+    H.eq(prompts[1].prompt, "Database for nodb (the secret names none): ")
+    H.eq(prompts[1].default, "postgres")
+    H.eq(connections.saved_entry("nodb").aws.database, "jobs", "the answer is kept on the saved connection")
+    -- a fresh copy of the connection resolves without asking
+    vim.ui.input = function()
+      error("must not ask again")
+    end
+    local again, aerr2 = sync(function(cb)
+      aws.resolve(connections.get("nodb"), cb)
+    end)
+    vim.ui.input = orig_input
+    H.eq(aerr2, nil)
+    H.eq(again.dbname, "jobs")
+    -- an empty answer is a plain error, not a connection to postgres
+    aws.forget_credentials({ profile = "prod", region = "ap-southeast-1", cluster = "app-nodb" })
+    vim.ui.input = function(_, on_confirm)
+      vim.schedule(function()
+        on_confirm("")
+      end)
+    end
+    local _, eerr = sync(function(cb)
+      aws.resolve({
+        name = "nodb2",
+        url = "aws://prod/app-nodb",
+        ssl = "disable",
+        aws = { profile = "prod", region = "ap-southeast-1", cluster = "app-nodb" },
+      }, cb)
+    end)
+    vim.ui.input = orig_input
+    H.matches(eerr, "no database chosen for nodb2")
+    connections.remove("nodb")
   end)
 
   H.it("add asks for the database only when the secret names none", function()

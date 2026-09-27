@@ -372,7 +372,8 @@ endpoints are resolved with the aws CLI and cached (`aws.endpoint_ttl_seconds`),
 an SSM port forward to the bastion is started and kept for the session,
 the password comes from Secrets Manager (or `auth = "iam"`) and goes to psql
 through the environment. The database is `aws.database`, else the secret's
-`dbname`, else the cluster's initial database, else `postgres`. The URL keeps the real host with `hostaddr=127.0.0.1`
+`dbname` (or `db`), else the cluster's initial database; otherwise you are
+asked once and the answer is saved on the connection. The URL keeps the real host with `hostaddr=127.0.0.1`
 so `ssl = "verify-full"` with `sslrootcert` and ~/.pgpass work. Expired
 credentials run `aws.login_cmd` (`{profile}` substituted) in a terminal
 split and retry. Without `bastion` the connection is direct; `aws.document`
@@ -384,7 +385,9 @@ first started (`ssm describe-instance-information` + `ec2 describe-instances`)
 and cached with the endpoints; a tunnel that fails to start, and `aws
 refresh`, drop the cached id so a replaced jumpbox is found again. "auto"
 takes the online instance whose name contains one of `aws.bastion_names`
-(`{ "bastion", "jump" }`), preferring the database's VPC.
+(`{ "bastion", "jump" }`), preferring the database's VPC. Without permission
+to list SSM instances the running EC2 instances are offered by name; when
+neither listing works the instance id is asked for, and the prompt says why.
 
 `:Dbgrid aws add` builds an entry interactively (the bastion is picked from
 the SSM-managed instances; one clear jumpbox is taken without asking);

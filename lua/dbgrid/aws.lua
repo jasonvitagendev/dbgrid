@@ -17,7 +17,7 @@ local M = {}
 ---@field secret? string                 Secrets Manager id/ARN (default: the RDS managed master secret)
 ---@field auth? "secret"|"iam"
 ---@field user? string                   database user for iam auth
----@field database? string               database name (default: the secret's dbname, the cluster's initial database, postgres)
+---@field database? string               database name (default: the secret's dbname/db, the cluster's initial database, else asked once)
 ---@field document? string               SSM document for the port forward
 ---@field parameters? table<string,string>
 ---@field login_cmd? string|string[]     overrides config.aws.login_cmd
@@ -193,12 +193,15 @@ function M.parse_secret(json)
   if not nz(s.username) or not nz(s.password) then
     return nil, "the secret has no username/password fields"
   end
+  -- hand-written secrets name their keys freely: {db, hostWrite, hostRead, port: "5432"} is common
+  local dbname = nz(s.dbname) or nz(s.db) or nz(s.database) or nz(s.dbName)
   return {
     username = tostring(s.username),
     password = tostring(s.password),
-    host = nz(s.host),
+    host = nz(s.host) or nz(s.hostWrite) or nz(s.hostname),
+    read_host = nz(s.hostRead),
     port = tonumber(nz(s.port)),
-    dbname = nz(s.dbname),
+    dbname = dbname and tostring(dbname) or nil,
     engine = nz(s.engine),
   }
 end
@@ -333,17 +336,25 @@ function M.is_instance_id(s)
 end
 
 ---Merge `ssm describe-instance-information` and `ec2 describe-instances` into
----the instances an SSM session can target, with their Name tag and VPC.
----@param ssm_json string|table
+---the instances an SSM session can target, with their Name tag and VPC. Without
+---the SSM listing (nil) every running EC2 instance is a candidate and `online`
+---is nil: unknown.
+---@param ssm_json? string|table
 ---@param ec2_json? string|table
----@return table[]? list  { id, name?, online, vpc?, ip?, platform? }, string? err
+---@return table[]? list  { id, name?, online?, vpc?, ip?, platform? }, string? err
 function M.parse_bastions(ssm_json, ec2_json)
-  local ssm, err = decode(ssm_json)
-  if not ssm then
-    return nil, err
+  if ssm_json == nil and ec2_json == nil then
+    return nil, "neither the SSM nor the EC2 listing is available"
+  end
+  local ssm, err
+  if ssm_json ~= nil then
+    ssm, err = decode(ssm_json)
+    if not ssm then
+      return nil, err
+    end
   end
   local ec2 = ec2_json and decode(ec2_json) or {}
-  local by_id = {}
+  local by_id, ids = {}, {}
   for _, r in ipairs(nz(ec2.Reservations) or {}) do
     for _, i in ipairs(nz(r.Instances) or {}) do
       local name
@@ -352,22 +363,33 @@ function M.parse_bastions(ssm_json, ec2_json)
           name = nz(t.Value)
         end
       end
-      by_id[nz(i.InstanceId) or ""] = { name = name, vpc = nz(i.VpcId), ip = nz(i.PrivateIpAddress) }
+      local id = nz(i.InstanceId)
+      if id then
+        ids[#ids + 1] = id
+        by_id[id] = { name = name, vpc = nz(i.VpcId), ip = nz(i.PrivateIpAddress) }
+      end
     end
   end
   local out = {}
-  for _, m in ipairs(nz(ssm.InstanceInformationList) or {}) do
-    local id = nz(m.InstanceId)
-    if id then
-      local e = by_id[id] or {}
-      out[#out + 1] = {
-        id = id,
-        name = e.name or nz(m.Name) or nz(m.ComputerName),
-        online = nz(m.PingStatus) == "Online",
-        vpc = e.vpc,
-        ip = e.ip or nz(m.IPAddress),
-        platform = nz(m.PlatformName),
-      }
+  if ssm then
+    for _, m in ipairs(nz(ssm.InstanceInformationList) or {}) do
+      local id = nz(m.InstanceId)
+      if id then
+        local e = by_id[id] or {}
+        out[#out + 1] = {
+          id = id,
+          name = e.name or nz(m.Name) or nz(m.ComputerName),
+          online = nz(m.PingStatus) == "Online",
+          vpc = e.vpc,
+          ip = e.ip or nz(m.IPAddress),
+          platform = nz(m.PlatformName),
+        }
+      end
+    end
+  else
+    for _, id in ipairs(ids) do
+      local e = by_id[id]
+      out[#out + 1] = { id = id, name = e.name, online = nil, vpc = e.vpc, ip = e.ip }
     end
   end
   table.sort(out, function(a, b)
@@ -407,7 +429,7 @@ function M.rank_bastions(list, hints)
       r.score = r.score + 2
       r.why[#r.why + 1] = "same vpc"
     end
-    if not c.online then
+    if c.online == false then
       r.score = r.score - 16
       r.why[#r.why + 1] = "offline"
     end
@@ -993,15 +1015,9 @@ function M.credentials(aws_cfg, info, cb, endpoint)
       return cb(nil, err)
     end
     -- RDS-managed master secrets carry only username/password: fall back to the
-    -- cluster's initial database, then to the maintenance database
+    -- cluster's initial database; when that is unknown too, dbname stays nil and
+    -- resolve() asks once
     local dbname = aws_cfg.database or secret.dbname or info.database
-    if not dbname then
-      dbname = "postgres"
-      util.notify(
-        "dbgrid: the secret names no database and the cluster has no initial one; connecting to postgres"
-          .. " (set `database` in the aws block, or :Dbgrid connections edit)"
-      )
-    end
     local creds = { username = secret.username, password = secret.password, dbname = dbname }
     creds_cache[key] = creds
     cb(creds)
@@ -1020,6 +1036,33 @@ end
 ---@field role string
 ---@field username string
 ---@field dbname string
+
+---The secret names no database and the cluster has no initial one: ask, and
+---keep the answer on the saved connection (or say how to set it in setup()).
+---@param conn dbgrid.Connection
+---@param info table   endpoints info
+---@param cb fun(database?: string)
+function M.ask_database(conn, info, cb)
+  local name = conn.parent or conn.name or "?"
+  local prompt = string.format("Database for %s (the secret names none): ", name)
+  vim.ui.input({ prompt = prompt, default = info.database or "postgres" }, function(v)
+    v = v and util.trim(v) or ""
+    if v == "" then
+      return cb(nil)
+    end
+    conn.aws.database = v
+    local connections = require("dbgrid.connections")
+    local entry, scope = connections.saved_entry(name)
+    if entry and type(entry.aws) == "table" then
+      entry.aws.database = v
+      connections.save(entry, scope)
+      util.notify("dbgrid: database " .. v .. " saved on connection " .. name)
+    else
+      util.notify(string.format('dbgrid: using database %s; add `database = "%s"` to the aws block of %s', v, v, name))
+    end
+    cb(v)
+  end)
+end
 
 ---Everything needed to connect: endpoints, credentials and (with a bastion) the tunnel.
 ---@param conn dbgrid.Connection
@@ -1041,6 +1084,15 @@ function M.resolve(conn, cb)
     M.credentials(a, info, function(creds, cerr)
       if not creds then
         return cb(nil, cerr)
+      end
+      if not creds.dbname then
+        return M.ask_database(conn, info, function(db)
+          if not db then
+            return cb(nil, "no database chosen for " .. tostring(conn.name))
+          end
+          creds.dbname = db -- the cached credentials carry it from now on
+          M.resolve(conn, cb)
+        end)
       end
       local ssl = { ssl = conn.ssl or cfg().ssl or "require", sslrootcert = conn.sslrootcert }
       local function finish(local_port, tunnel_key)
@@ -1092,9 +1144,10 @@ end
 
 ---SSM-managed instances of the account (with EC2 Name tags and VPCs), for
 ---picking a jumpbox. Both CLI calls run in parallel; a failing ec2 call only
----loses the names.
+---loses the names, a failing ssm call falls back to the running EC2 instances
+---(their SSM status unknown) and says so in `note`.
 ---@param aws_cfg dbgrid.AwsConfig
----@param cb fun(list?: table[], err?: string)
+---@param cb fun(list?: table[], err?: string, note?: string)
 function M.bastions(aws_cfg, cb)
   local ssm_res, ec2_res
   parallel({
@@ -1112,10 +1165,17 @@ function M.bastions(aws_cfg, cb)
       end)
     end,
   }, function()
-    if not ssm_res.ok or not ssm_res.json then
-      return cb(nil, cli_error(aws_cfg, "listing SSM managed instances", ssm_res))
+    local ec2_json = ec2_res.ok and ec2_res.json or nil
+    if ssm_res.ok and ssm_res.json then
+      return cb(M.parse_bastions(ssm_res.json, ec2_json))
     end
-    cb(M.parse_bastions(ssm_res.json, ec2_res.ok and ec2_res.json or nil))
+    local why = cli_error(aws_cfg, "listing SSM managed instances", ssm_res)
+    if ec2_json then
+      -- usually a role without ssm:DescribeInstanceInformation: offer the running instances by name
+      local list, perr = M.parse_bastions(nil, ec2_json)
+      return cb(list, perr, why)
+    end
+    cb(nil, why)
   end)
 end
 
@@ -1161,7 +1221,7 @@ function M.bastion_id(aws_cfg, hints, cb)
         )
       )
     end
-    if not best.online then
+    if best.online == false then
       return cb(nil, string.format("bastion %s (%s) is not online in SSM", best.name or best.id, best.id))
     end
     store_bastion(aws_cfg, best.id)
@@ -1379,7 +1439,7 @@ local function bastion_label(c)
   if c.name then
     parts[#parts + 1] = c.name
   end
-  parts[#parts + 1] = c.online and "online" or "offline"
+  parts[#parts + 1] = c.online == true and "online" or (c.online == false and "offline" or "ssm status unknown")
   local why = vim.tbl_filter(function(w)
     return w == "same vpc" or w == "current"
   end, c.why or {})
@@ -1399,8 +1459,8 @@ end
 ---@param cb fun(bastion?: string, cancelled?: boolean)
 function M.pick_bastion(aws_cfg, hints, cb)
   hints = hints or {}
-  local function manual()
-    local prompt = "SSM target instance id (empty = connect directly): "
+  local function manual(reason)
+    local prompt = "SSM target instance id (" .. (reason and (reason .. "; ") or "") .. "empty = connect directly): "
     vim.ui.input({ prompt = prompt, default = hints.current }, function(v)
       if v == nil then
         -- Esc: while adding it means "directly" (as it always did), while editing it cancels
@@ -1410,26 +1470,30 @@ function M.pick_bastion(aws_cfg, hints, cb)
       cb(v ~= "" and v or nil)
     end)
   end
-  M.bastions(aws_cfg, function(list, err)
+  M.bastions(aws_cfg, function(list, err, note)
+    if note then
+      util.warn("dbgrid: " .. note .. "; offering the running EC2 instances instead")
+    end
     if not list or #list == 0 then
-      -- say why the old prompt appears: the lookup failed, or nothing is registered with SSM there
+      -- say why the old prompt appears: the lookup failed, or nothing is registered there
       if err then
         util.warn("dbgrid: could not list SSM instances (" .. err .. ")")
-      else
-        util.warn(
-          string.format(
-            "dbgrid: no SSM-managed instances for profile %s in %s; enter the bastion instance id",
-            profile_of(aws_cfg),
-            aws_cfg.region or "the default region"
-          )
-        )
+        return manual("lookup failed, see :messages")
       end
-      return manual()
+      util.warn(
+        string.format(
+          "dbgrid: no %s for profile %s in %s; enter the bastion instance id",
+          note and "running EC2 instances" or "SSM-managed instances",
+          profile_of(aws_cfg),
+          aws_cfg.region or "the default region"
+        )
+      )
+      return manual("none found")
     end
     local ranked = M.rank_bastions(list, { vpc = hints.vpc, current = hints.current })
     local best, second = ranked[1], ranked[2]
     local clear = best.match
-      and best.online
+      and best.online ~= false
       and not hints.current
       and not hints.public
       and (not second or second.score < best.score or second.name == best.name)

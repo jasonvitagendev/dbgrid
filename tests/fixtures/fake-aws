@@ -3,6 +3,7 @@
 
 Environment:
   DBGRID_FAKE_AWS_LOG            append one line per invocation (the argv) to this file
+  DBGRID_FAKE_AWS_DENY           comma-separated "<service> <command>" pairs that fail with AccessDeniedException
   DBGRID_FAKE_AWS_EXPIRED_UNTIL  until this file exists every call fails like an expired SSO token
   DBGRID_TEST_URL                the port of this URL becomes the cluster port (default 5433)
 
@@ -130,6 +131,12 @@ def main():
     if len(words) < 2:
         fail("usage: aws [options] <command> <subcommand> [parameters]", 252)
     svc, cmd = words[0], words[1]
+    deny = [d.strip() for d in os.environ.get("DBGRID_FAKE_AWS_DENY", "").split(",") if d.strip()]
+    if "%s %s" % (svc, cmd) in deny:
+        op = "".join(part.capitalize() for part in cmd.split("-"))
+        fail("An error occurred (AccessDeniedException) when calling the %s operation: User: "
+             "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Db_abc/jason is not authorized to perform: %s:%s"
+             % (op, ACCOUNT, svc, op))
 
     if svc == "configure" and cmd == "list-profiles":
         sys.stdout.write("default\nprod\nstaging\n")
@@ -143,6 +150,13 @@ def main():
         })
     elif svc == "rds" and cmd == "describe-db-clusters":
         cid = opts.get("db-cluster-identifier")
+        if cid == "app-nodb":
+            # created without an initial database; its managed secret has username/password only
+            c = cluster("app-nodb")
+            del c["DatabaseName"]
+            c["MasterUserSecret"]["SecretArn"] = SECRET_ARN.replace("app-prod", "app-nodb")
+            out({"DBClusters": [c]})
+            return
         if cid and cid != "app-prod":
             fail("An error occurred (DBClusterNotFoundFault) when calling the DescribeDBClusters operation: "
                  "DBCluster %s not found." % cid)

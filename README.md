@@ -228,7 +228,7 @@ the session; `:Dbgrid aws refresh` or a failed run drops it.
     secret  = "prod/db",              -- Secrets Manager id or ARN; optional when RDS manages the master password
     login_cmd = { "company-aws-login", "--profile", "{profile}" },  -- default: aws sso login
     -- auth = "iam", user = "app",    -- IAM database authentication instead of a secret
-    -- database = "app",              -- default: the secret's dbname, else the cluster's initial database, else postgres
+    -- database = "app",              -- default: the secret's dbname/db, else the cluster's initial database, else asked once
   },
   index_check = "confirm",
 }
@@ -240,8 +240,10 @@ read-only. `-- @conn prod/reader` works per cell, and `prod` alone means the
 writer.
 
 RDS-managed master secrets hold only a username and a password, so the
-database comes from `aws.database`, else the secret's `dbname`, else the
-cluster's initial database (`DatabaseName`), else `postgres`.
+database comes from `aws.database`, else the secret's `dbname` (`db` and
+`database` keys work too), else the cluster's initial database
+(`DatabaseName`). When none of those exists you are asked once, and the
+answer is saved on the connection.
 
 On the first run the plugin calls `describe-db-clusters` (or
 `describe-db-instances`) and caches the endpoints for a day, starts
@@ -260,7 +262,9 @@ started and cached with the endpoints, so a jumpbox replaced by its autoscaling
 group is found again: a tunnel that fails to start drops the cached id, and so
 does `aws refresh`. `auto` takes the online instance whose name contains one
 of `aws.bastion_names` (`{ "bastion", "jump" }`), preferring the database's
-VPC.
+VPC. A role that may not call `ssm:DescribeInstanceInformation` gets the
+running EC2 instances by name instead (their SSM status unknown); when
+neither listing works, the instance id is asked for and the prompt says why.
 
 Expired credentials are recognised from the CLI's stderr; the plugin runs
 `aws.login_cmd` (global, `{profile}` substituted; a company CLI goes here or
