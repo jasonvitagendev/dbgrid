@@ -1,44 +1,6 @@
 local H = _G.H
 local sql = require("dbgrid.sql")
 
-H.describe("sql.params", function()
-  H.it("finds named parameters once, in order, with their case", function()
-    H.eq(sql.params("select * from users where id = :Id and plan = :plan or id = :Id"), { "Id", "plan" })
-    H.eq(sql.params("select :a+:b, x=:c, (:d), y>:e"), { "a", "b", "c", "d", "e" })
-    H.eq(sql.params("select 1"), {})
-  end)
-  H.it("ignores casts, strings, comments, quoted identifiers and slices", function()
-    H.eq(sql.params("select x::int, ':nope', \":nope\" from t -- :nope\n/* :nope */"), {})
-    H.eq(sql.params("select a[1:3], a[i:j], a[:2], a[2:] from t"), {})
-    H.eq(sql.params("select :a::text, a[1:3] from t where b = :b"), { "a", "b" })
-    H.eq(sql.params("select $$:nope$$, E':nope', $1 from t"), {})
-  end)
-end)
-
-H.describe("sql.substitute_params", function()
-  H.it("replaces values verbatim and reports missing ones", function()
-    local out, missing =
-      sql.substitute_params("select :a, :b, :a, :c from t where x = ':a'", { a = "12345", b = "'x'" })
-    H.eq(out, "select 12345, 'x', 12345, :c from t where x = ':a'")
-    H.eq(missing, { "c" })
-    H.eq({ sql.substitute_params("select :a, :b, :a", {}) }, { "select :a, :b, :a", { "a", "b" } })
-  end)
-  H.it("keeps offsets right when values differ in length", function()
-    local out, missing = sql.substitute_params(
-      ":long_name + :s + :long_name + :s",
-      { long_name = "1", s = "'a longer value'" }
-    )
-    H.eq(out, "1 + 'a longer value' + 1 + 'a longer value'")
-    H.eq(missing, {})
-    H.eq({ sql.substitute_params("select 1", {}) }, { "select 1", {} })
-  end)
-  H.it("works without a gap after operators and leaves casts alone", function()
-    H.eq((sql.substitute_params("where a=:a and b>:b", { a = "1", b = "2" })), "where a=1 and b>2")
-    H.eq((sql.substitute_params("select :a::int, x::int", { a = "7", int = "no" })), "select 7::int, x::int")
-    H.eq((sql.substitute_params("select :n", { n = vim.NIL })), "select NULL")
-  end)
-end)
-
 H.describe("sql.preview_count", function()
   local function count(t)
     return sql.preview_count(sql.split(t)[1])

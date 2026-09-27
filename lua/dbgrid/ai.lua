@@ -7,8 +7,89 @@ local sqlmod = require("dbgrid.sql")
 
 local M = {}
 
+---Agents known to the configuration, sorted, with whether they are installed.
+---@return { name: string, installed: boolean }[]
+function M.agents()
+  local cfg = config.get().ai
+  local names = vim.tbl_keys(cfg.agents or {})
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    local agent = cfg.agents[name]
+    out[#out + 1] = { name = name, installed = agent and agent.cmd and vim.fn.executable(agent.cmd[1]) == 1 }
+  end
+  return out
+end
+
+---The agent a cell's prompt goes to: `-- @agent name` in the cell, then the
+---notebook's choice (:Dbgrid agent), then `ai.agent`.
+---@param s? dbgrid.State
+---@param cell? dbgrid.Cell
+---@return string
+function M.agent_name(s, cell)
+  local d = cell and cells.directives(cell) or {}
+  if type(d.agent) == "string" and d.agent ~= "" then
+    return d.agent
+  end
+  if s and s.nb and s.nb.meta.agent and s.nb.meta.agent ~= "" then
+    return s.nb.meta.agent
+  end
+  return config.get().ai.agent
+end
+
+---Switch the notebook's agent (nil = back to the configured default).
+---@param s dbgrid.State
+---@param name string?
+---@return boolean ok
+function M.set_agent(s, name)
+  local cfg = config.get().ai
+  if name and not cfg.agents[name] then
+    util.error("unknown agent '" .. name .. "' (configure ai.agents)")
+    return false
+  end
+  require("dbgrid.notebook").set_agent(s.nb, name)
+  require("dbgrid.ui.query").refresh_winbar(s)
+  util.notify("agent: " .. M.agent_name(s))
+  return true
+end
+
+---Pick the agent for the notebook.
+---@param s dbgrid.State
+---@param cb? fun(name?: string)
+function M.pick_agent(s, cb)
+  local current = M.agent_name(s)
+  local items = {}
+  for _, a in ipairs(M.agents()) do
+    local cfg_agent = config.get().ai.agents[a.name]
+    items[#items + 1] = {
+      text = string.format(
+        "%s%s%s",
+        a.name,
+        a.name == current and "  (current)" or "",
+        a.installed and "" or "  (not on PATH)"
+      ),
+      data = a.name,
+      preview = { table.concat(cfg_agent.cmd or {}, " ") },
+    }
+  end
+  items[#items + 1] = { text = "use the configured default (" .. config.get().ai.agent .. ")", data = false }
+  require("dbgrid.ui.picker").pick(items, {
+    prompt = "Coding agent for prompts",
+    preview = false,
+    on_select = function(item)
+      if not item then
+        return cb and cb(nil)
+      end
+      local name = item.data or nil
+      if M.set_agent(s, name) and cb then
+        cb(M.agent_name(s))
+      end
+    end,
+  })
+end
+
 ---Build the text handed to the agent.
----@param opts { prompt: string, existing_sql?: string, schema?: dbgrid.SchemaData, context_sql?: string[], dialect?: string, instructions?: string, max_tables?: integer }
+---@param opts { prompt: string, existing_sql?: string, schema?: dbgrid.SchemaData, context_sql?: string[], dialect?: string, instructions?: string, max_tables?: integer, framework?: string, params?: string[] }
 ---@return string
 function M.build_prompt(opts)
   local cfg = config.get().ai
@@ -24,6 +105,13 @@ function M.build_prompt(opts)
   if (opts.instructions or cfg.instructions or "") ~= "" then
     parts[#parts + 1] = opts.instructions or cfg.instructions
   end
+  if opts.framework == "rails" then
+    parts[#parts + 1] = require("dbgrid.rails").AGENT_HINT
+  end
+  if opts.params and #opts.params > 0 then
+    parts[#parts + 1] = "Parameters available as `:name` placeholders (keep them as placeholders, do not invent values): :"
+      .. table.concat(opts.params, ", :")
+  end
   parts[#parts + 1] = "## Request\n" .. opts.prompt
   if opts.existing_sql and util.trim(opts.existing_sql) ~= "" then
     parts[#parts + 1] = "## Existing SQL in this cell (modify it according to the request, keep its intent)\n"
@@ -37,6 +125,12 @@ function M.build_prompt(opts)
       (opts.existing_sql or "") .. "\n" .. table.concat(opts.context_sql or {}, "\n"),
       max
     )
+    if opts.framework == "rails" then
+      local system = require("dbgrid.rails").SYSTEM_TABLES
+      tables = vim.tbl_filter(function(t)
+        return not system[t.name]
+      end, tables)
+    end
     local lines = {}
     for _, t in ipairs(tables) do
       lines[#lines + 1] = schema.format_table_for_ai(t)
@@ -476,13 +570,21 @@ function M.generate(s, cell)
         end
       end
       local existing_sql = util.trim(table.concat(existing, "\n"))
+      local params = {}
+      for _, p in ipairs(require("dbgrid.expand").notebook_params(s)) do
+        params[#params + 1] = p.name
+      end
+      local adapter = require("dbgrid.adapters").for_connection(conn)
       local text = M.build_prompt({
         prompt = prompt,
         existing_sql = existing_sql ~= "" and existing_sql or nil,
         schema = sch,
         context_sql = context,
+        framework = require("dbgrid.project").framework(),
+        params = params,
+        dialect = (adapter and adapter.name ~= "postgres" and adapter.dialect) or nil,
       })
-      local agent_name = config.get().ai.agent
+      local agent_name = M.agent_name(s, cell)
       util.notify("asking " .. agent_name .. "…")
       local started = util.now()
       s.running[cell.id] = { started = started, kind = "ai" }
@@ -507,7 +609,7 @@ function M.generate(s, cell)
         query_ui.render(s)
         require("dbgrid.ui.results").render(s)
         util.notify(string.format("generated in %s — review, then run", util.fmt_ms((util.now() - started) * 1000)))
-      end)
+      end, agent_name)
       if job then
         s.running[cell.id].job = job
       else

@@ -22,6 +22,8 @@ local M = {}
 ---@field title string
 ---@field tags string[]
 ---@field connection string?
+---@field agent string?            coding agent used for prompts (overrides ai.agent)
+---@field params table<string,string>  parameter values entered for this notebook
 ---@field created_at integer
 ---@field updated_at integer
 ---@field cells table<string, dbgrid.CellMeta>
@@ -59,6 +61,13 @@ local function load_meta(nb)
   meta.title = meta.title or nb.name
   meta.tags = meta.tags or {}
   meta.cells = meta.cells or {}
+  meta.params = meta.params or {}
+  if meta.params == vim.NIL then
+    meta.params = {}
+  end
+  if meta.agent == vim.NIL then
+    meta.agent = nil
+  end
   meta.created_at = meta.created_at or util.epoch()
   meta.updated_at = meta.updated_at or meta.created_at
   if meta.connection == vim.NIL then
@@ -108,11 +117,15 @@ function M.from_path(path)
   if not path:match("%.sql$") then
     return nil
   end
+  -- buffer names are symlink-resolved (macOS /var -> /private/var), config paths may not be
+  local function real(p)
+    return vim.uv.fs_realpath(p) or p
+  end
   local dir = vim.fs.dirname(path)
   local name = vim.fn.fnamemodify(path, ":t:r")
   local st = config.get().storage
-  local data_projects = vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects/"
-  local in_data = dir:sub(1, #data_projects) == data_projects
+  local data_projects = real(vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects") .. "/"
+  local in_data = real(dir):sub(1, #data_projects) == data_projects
   local in_project = vim.fs.basename(dir) == st.project_dir
   if not (in_data or in_project) then
     return nil
@@ -157,6 +170,7 @@ function M.create(title, opts)
     created_at = util.epoch(),
     updated_at = util.epoch(),
     cells = {},
+    params = {},
   }
   if opts.body then
     util.write_file(nb.path, opts.body:gsub("\n?$", "\n"))
@@ -301,6 +315,7 @@ local function slim(result)
     cancelled = result.cancelled,
     dry_run = result.dry_run,
     params = result.params,
+    refs = result.refs,
     statements = {},
   }
   for i, st in ipairs(result.statements or {}) do
@@ -418,19 +433,21 @@ function M.prune(nb, live_ids)
   end
 end
 
----Remembered parameter values (`-- @param` / `:name`).
----@param nb dbgrid.Notebook
----@return table<string,string>
-function M.params(nb)
-  nb.meta.params = nb.meta.params or {}
-  return nb.meta.params
-end
-
+---Remember a parameter value (nil forgets it).
 ---@param nb dbgrid.Notebook
 ---@param name string
 ---@param value string?
 function M.set_param(nb, name, value)
-  M.params(nb)[name] = value
+  nb.meta.params = nb.meta.params or {}
+  nb.meta.params[name] = value
+  M.save_meta(nb)
+end
+
+---Coding agent for this notebook (nil = the configured default).
+---@param nb dbgrid.Notebook
+---@param agent string?
+function M.set_agent(nb, agent)
+  nb.meta.agent = agent
   M.save_meta(nb)
 end
 

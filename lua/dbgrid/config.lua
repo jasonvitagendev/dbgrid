@@ -4,12 +4,12 @@ local M = {}
 
 ---@class dbgrid.Connection
 ---@field name string             display name, referenced by notebooks
----@field url string              postgres://user:pass@host:port/db  ($VAR and ${VAR} are expanded)
+---@field url string              postgres://user:pass@host:port/db or sqlite:path/to.db ($VAR and ${VAR} are expanded)
 ---@field readonly? boolean       enforce read-only transactions server side (PGOPTIONS)
 ---@field index_check? "off"|"warn"|"confirm"  per-connection override
 ---@field statement_timeout_ms? integer          server-side statement_timeout
 ---@field password_cmd? string    shell command printing the password (1Password, pass, ...)
----@field adapter? string         force an adapter instead of deriving it from the url scheme
+---@field adapter? string         force an adapter instead of deriving it from the url scheme ("postgres", "sqlite")
 ---@field env? table<string,string> extra environment for the client process
 ---@field lock_timeout_ms? integer server-side lock_timeout (recommended for DDL on a busy database)
 ---@field aws? table              AWS RDS / Aurora block: profile, region, cluster|instance, bastion, secret, auth, ...
@@ -70,6 +70,40 @@ M.defaults = {
     -- Keep one psql per connection alive across runs (temp tables and SET carry over,
     -- the connection handshake is paid once). Also per connection: `session = true`.
     session = false,
+    -- When a cancel (SIGINT) has not stopped the query after `cancel_grace_ms`,
+    -- ask the server to cancel it (pg_cancel_backend) through a second
+    -- connection; for sessions behind proxies that swallow cancel requests.
+    server_cancel = true,
+    cancel_grace_ms = 1500,
+  },
+
+  format = {
+    -- Reformat every cell's SQL when the notebook is written.
+    on_save = false,
+    -- "auto": conform.nvim when it has a formatter for the sql filetype, else
+    -- the first of `order` found on PATH, else the built-in formatter.
+    -- Also: "builtin", "conform", a name from `commands`, or { cmd = { ... } }.
+    formatter = "auto", ---@type "auto"|"builtin"|"conform"|string|{ cmd: string[] }
+    order = { "pg_format", "sql-formatter", "sqlfluff", "sqlformat" },
+    -- External formatters: SQL on stdin, formatted SQL on stdout. `{dialect}`
+    -- becomes "postgresql" or "sqlite" depending on the connection.
+    commands = {
+      pg_format = { "pg_format" },
+      ["sql-formatter"] = { "sql-formatter", "-l", "{dialect}" },
+      sqlfluff = { "sqlfluff", "format", "--dialect", "postgres", "-" },
+      sqlformat = { "sqlformat", "-r", "-" },
+    },
+    -- Built-in formatter options.
+    keyword_case = "keep", ---@type "keep"|"upper"|"lower"
+    width = 100,
+    indent = 2,
+    timeout_ms = 5000,
+  },
+
+  -- Rails projects: connections from config/database.yml (no setup needed).
+  rails = {
+    enabled = true,
+    environments = { "development", "test" },
   },
 
   -- `-- @every 5s` cells.
@@ -216,11 +250,14 @@ M.defaults = {
       connection = "<localleader>c",
       schema_refresh = "<localleader>s",
       tables = "<localleader>S",
+      schema_view = "<localleader>b",
       describe = "K",
-      analyze = "<localleader>a",
-      explain_error = "<localleader>A",
+      format = "<localleader>=",
+      params = "<localleader>p",
+      agent = "<localleader>a",
+      analyze = "<localleader>A",
+      explain_error = "<localleader>!",
       try_index = "<localleader>i",
-      params = "<localleader>P",
       history = "<localleader>H",
       focus_results = "<localleader><Tab>",
       zoom = "<localleader>z",
@@ -232,6 +269,7 @@ M.defaults = {
       inspect = { "<CR>", "K" },
       record_view = "<localleader>v",
       plan_view = "<localleader>p",
+      schema_view = "<localleader>b",
       toggle_truncate = "<localleader>w",
       sort = "<localleader>s",
       filter = "<localleader>f",
@@ -263,6 +301,10 @@ M.defaults = {
     tag = "#",
     connection = "⛁",
     cell = "▸",
+    agent = "✦",
+    param = ":",
+    table = "▤",
+    index = "⌗",
     live = "◉",
     changed = "Δ",
   },
