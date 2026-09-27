@@ -56,7 +56,10 @@ Connections are also discovered from `DATABASE_URL` (and `DB_URL`,
 `POSTGRES_URL`, `PG_URL`) in the environment and in `.env` files of the
 project, from `config/database.yml` of a Rails project (as
 `rails:development`, `rails:development.cable`, `rails:test`, ...), and
-saved interactively with `:Dbgrid connections`.
+saved interactively with `:Dbgrid connections`. Saved connections are edited
+(`<C-e>` in the picker, `:Dbgrid connections edit`), removed (`<C-x>`,
+`:Dbgrid connections remove`) or opened as JSON (`:Dbgrid connections file`);
+a renamed connection is followed by the open notebooks that used it.
 
 SQLite urls: `sqlite:path/to.db` (relative to the project root),
 `sqlite:///abs/path.db`, `~/x.db`, or a bare path ending in .sqlite3 / .db.
@@ -104,7 +107,11 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid last                   jump to the most recent notebook
 :Dbgrid tags                   pick a tag, then a notebook
 :Dbgrid tag add {t}            add a tag (`tag remove {t}` removes one)
-:Dbgrid connections            pick or add a connection
+:Dbgrid connections            pick or add a connection (<C-e> edits, <C-x>
+                               removes the saved one under the cursor)
+:Dbgrid connections edit [n]   edit a saved connection, prompts prefilled
+:Dbgrid connections remove [n] remove a saved connection
+:Dbgrid connections file       open connections.json (saving drops the cache)
 :Dbgrid connect [name]         set the connection of the notebook
 :Dbgrid run [all]              run the current cell or all cells
 :Dbgrid explain [analyze]      plan of the current cell (with findings)
@@ -370,7 +377,17 @@ credentials run `aws.login_cmd` (`{profile}` substituted) in a terminal
 split and retry. Without `bastion` the connection is direct; `aws.document`
 and `aws.parameters` cover custom SSM documents.
 
-`:Dbgrid aws add` builds an entry interactively; `aws login`, `aws refresh`,
+`bastion` is an instance id, the Name tag of an instance or "auto". A name
+or "auto" is looked up among the SSM-managed instances when the tunnel is
+first started (`ssm describe-instance-information` + `ec2 describe-instances`)
+and cached with the endpoints; a tunnel that fails to start, and `aws
+refresh`, drop the cached id so a replaced jumpbox is found again. "auto"
+takes the online instance whose name contains one of `aws.bastion_names`
+(`{ "bastion", "jump" }`), preferring the database's VPC.
+
+`:Dbgrid aws add` builds an entry interactively (the bastion is picked from
+the SSM-managed instances; one clear jumpbox is taken without asking);
+`aws login`, `aws refresh`,
 `aws tunnels`, `aws status` (status, version, maintenance, five CloudWatch
 metrics), `aws events` (last day), `aws bluegreen` (deployments and
 switchover status). `:checkhealth dbgrid` covers the CLI, the Session

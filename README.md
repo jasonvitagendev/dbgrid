@@ -199,6 +199,16 @@ does the connecting. When you paste a URL with a password into `+ add
 connection`, the plugin offers to move the password to `~/.pgpass` instead of
 keeping it in its own JSON.
 
+Saved connections can be changed later. In the connection picker `<C-e>`
+edits the one under the cursor and `<C-x>` removes it (snacks.picker);
+`:Dbgrid connections edit [name]` and `:Dbgrid connections remove [name]` do
+the same anywhere. Every prompt of the edit is prefilled: name, URL (for an
+AWS entry: bastion and secret), read-only and scope. Renaming a connection
+updates the open notebooks that used it. `:Dbgrid connections file` opens the
+JSON itself for the fields the prompts do not cover (`tunnel`, `env`,
+timeouts); saving it drops the cached resolved connections. Connections from
+`setup()`, the environment or `database.yml` are changed at their source.
+
 Every run goes through a resolve step: the declared connection becomes an
 effective one (endpoints looked up, tunnel started or re-probed, credentials
 fetched, `password_cmd` run asynchronously). The result is cached per name for
@@ -214,7 +224,7 @@ the session; `:Dbgrid aws refresh` or a failed run drops it.
     region  = "ap-southeast-1",
     cluster = "app-prod",             -- Aurora cluster id
     -- instance = "app-prod",         -- plain RDS instance id instead of cluster
-    bastion = "i-0123456789abcdef0",  -- SSM target that can reach the database port
+    bastion = "i-0123456789abcdef0",  -- SSM target that can reach the database port: an id, a Name tag or "auto"
     secret  = "prod/db",              -- Secrets Manager id or ARN; optional when RDS manages the master password
     login_cmd = { "company-aws-login", "--profile", "{profile}" },  -- default: aws sso login
     -- auth = "iam", user = "app",    -- IAM database authentication instead of a secret
@@ -238,6 +248,16 @@ through the environment only. The URL psql gets keeps the real host name with
 keep working. Before every run the local port is probed; a dead tunnel (SSM
 idle timeout is 20 minutes by default) is restarted. Tunnels die with Neovim.
 
+The bastion is an instance id, the `Name` tag of an instance
+(`bastion = "bastion-prod"`) or `"auto"`. A name or `auto` is looked up among
+the account's SSM-managed instances (`ssm describe-instance-information`, plus
+`ec2 describe-instances` for the tags and VPCs) when the tunnel is first
+started and cached with the endpoints, so a jumpbox replaced by its autoscaling
+group is found again: a tunnel that fails to start drops the cached id, and so
+does `aws refresh`. `auto` takes the online instance whose name contains one
+of `aws.bastion_names` (`{ "bastion", "jump" }`), preferring the database's
+VPC.
+
 Expired credentials are recognised from the CLI's stderr; the plugin runs
 `aws.login_cmd` (global, `{profile}` substituted; a company CLI goes here or
 per connection in `aws.login_cmd`) in a terminal split, waits for it, and
@@ -245,8 +265,9 @@ retries. Without `bastion` the plugin connects directly. `aws.document` and
 `aws.parameters` cover custom SSM documents.
 
 Commands: `:Dbgrid aws add` (interactive: profile, region, cluster, bastion,
-secret), `aws login`, `aws refresh` (drop the endpoint cache), `aws tunnels`
-(list / kill), `aws status` (instance status, engine version, pending
+secret; the bastion is chosen from the SSM-managed instances, and one clear
+online jumpbox in the database's VPC is taken without asking), `aws login`,
+`aws refresh` (drop the endpoint cache), `aws tunnels` (list / kill), `aws status` (instance status, engine version, pending
 maintenance, five CloudWatch metrics over the last five minutes), `aws events`
 (last day of RDS events), `aws bluegreen` (blue/green deployments and their
 switchover status). `:checkhealth dbgrid` reports the CLI, the Session
@@ -434,7 +455,7 @@ do everywhere.
 | `last` | jump to the most recent notebook |
 | `tags` | pick a tag, then a notebook |
 | `tag add x` / `tag remove x` | change tags of the current notebook |
-| `connections` / `connect [name]` | pick or set the connection |
+| `connections [edit|remove|file] [name]` / `connect [name]` | pick, edit or remove a saved connection / set the notebook's connection |
 | `run` / `run all` | run the current cell / all cells (dependencies first) |
 | `explain [analyze]` | plan of the current cell |
 | `format [all]` | format the current cell / every cell |
@@ -718,7 +739,8 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   templates = { dir = nil },
   history = { enabled = true, max_entries = 2000 },
   aws = { cli = "aws", endpoint_ttl_seconds = 86400, tunnel_ready_ms = 15000, probe_ms = 500,
-          login_cmd = { "aws", "sso", "login", "--profile", "{profile}" }, ssl = "require" },
+          login_cmd = { "aws", "sso", "login", "--profile", "{profile}" }, ssl = "require",
+          bastion_names = { "bastion", "jump" } },
   results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },
   ai = { agent = "claude", agents = { ... }, max_tables = 40, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18",
          analyze = { mode = "analyze", include_stats = true }, redact_literals = false, investigate = false },

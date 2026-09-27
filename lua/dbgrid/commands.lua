@@ -267,7 +267,34 @@ M.subcommands = {
     end
     require("dbgrid.ui.query").refresh_winbar(s)
   end,
-  connections = function()
+  connections = function(args)
+    local connections = require("dbgrid.connections")
+    local sub = args[1]
+    if sub == "file" then
+      return connections.open_file()
+    elseif sub == "edit" or sub == "remove" then
+      local function act(conn)
+        if not conn then
+          return
+        end
+        if sub == "edit" then
+          connections.edit_interactive(conn)
+        else
+          connections.remove_interactive(conn)
+        end
+      end
+      if args[2] then
+        local conn = connections.get(args[2])
+        if not conn then
+          return util.error("no connection named " .. args[2])
+        end
+        return act(conn)
+      end
+      local prompt = sub == "edit" and "Edit connection" or "Remove connection"
+      return require("dbgrid.ui.picker").connection(act, { prompt = prompt, saved_only = true, allow_new = false })
+    elseif sub then
+      return util.error("usage: :Dbgrid connections [edit|remove|file] [name]")
+    end
     require("dbgrid.ui.picker").connection(function(conn)
       if not conn then
         return
@@ -277,7 +304,7 @@ M.subcommands = {
         require("dbgrid.notebook").set_connection(s.nb, conn.name)
         require("dbgrid.ui.query").refresh_winbar(s)
       else
-        require("dbgrid.connections").test(conn, function(ok, msg)
+        connections.test(conn, function(ok, msg)
           util.notify((ok and "connected: " or "failed: ") .. msg)
         end)
       end
@@ -564,6 +591,16 @@ function M.complete(arglead, cmdline)
   elseif sub == "connect" then
     for _, c in ipairs(require("dbgrid.connections").all()) do
       candidates[#candidates + 1] = c.name
+    end
+  elseif sub == "connections" then
+    if n == 2 then
+      candidates = { "edit", "remove", "file" }
+    elseif words[3] == "edit" or words[3] == "remove" then
+      for _, c in ipairs(require("dbgrid.connections").all()) do
+        if c.source == "saved" or c.source == "project" then
+          candidates[#candidates + 1] = c.name
+        end
+      end
     end
   elseif sub == "run" then
     candidates = { "all" }

@@ -13,7 +13,7 @@ local M = {}
 ---@field region? string
 ---@field cluster? string                Aurora cluster identifier (or `instance`)
 ---@field instance? string               RDS instance identifier
----@field bastion? string                SSM target instance id; nil = connect directly
+---@field bastion? string                SSM target: an instance id, the Name tag of one, or "auto"; nil = connect directly
 ---@field secret? string                 Secrets Manager id/ARN (default: the RDS managed master secret)
 ---@field auth? "secret"|"iam"
 ---@field user? string                   database user for iam auth
@@ -158,6 +158,8 @@ function M.parse_instance(json)
     replicas = {},
     source = nz(i.ReadReplicaSourceDBInstanceIdentifier),
     secret_arn = nz(i.MasterUserSecret) and nz(i.MasterUserSecret.SecretArn) or nil,
+    vpc = nz(i.DBSubnetGroup) and nz(i.DBSubnetGroup.VpcId) or nil,
+    public = nz(i.PubliclyAccessible) == true,
   }
   for _, r in ipairs(nz(i.ReadReplicaDBInstanceIdentifiers) or {}) do
     info.replicas[#info.replicas + 1] = r
@@ -321,6 +323,103 @@ function M.parse_pending_maintenance(json)
   return table.concat(parts, "; ")
 end
 
+---Is this an EC2 / SSM managed-instance id (as opposed to a Name tag or "auto")?
+---@param s any
+---@return boolean
+function M.is_instance_id(s)
+  return type(s) == "string" and (s:match("^i%-%x+$") ~= nil or s:match("^mi%-%x+$") ~= nil)
+end
+
+---Merge `ssm describe-instance-information` and `ec2 describe-instances` into
+---the instances an SSM session can target, with their Name tag and VPC.
+---@param ssm_json string|table
+---@param ec2_json? string|table
+---@return table[]? list  { id, name?, online, vpc?, ip?, platform? }, string? err
+function M.parse_bastions(ssm_json, ec2_json)
+  local ssm, err = decode(ssm_json)
+  if not ssm then
+    return nil, err
+  end
+  local ec2 = ec2_json and decode(ec2_json) or {}
+  local by_id = {}
+  for _, r in ipairs(nz(ec2.Reservations) or {}) do
+    for _, i in ipairs(nz(r.Instances) or {}) do
+      local name
+      for _, t in ipairs(nz(i.Tags) or {}) do
+        if nz(t.Key) == "Name" then
+          name = nz(t.Value)
+        end
+      end
+      by_id[nz(i.InstanceId) or ""] = { name = name, vpc = nz(i.VpcId), ip = nz(i.PrivateIpAddress) }
+    end
+  end
+  local out = {}
+  for _, m in ipairs(nz(ssm.InstanceInformationList) or {}) do
+    local id = nz(m.InstanceId)
+    if id then
+      local e = by_id[id] or {}
+      out[#out + 1] = {
+        id = id,
+        name = e.name or nz(m.Name) or nz(m.ComputerName),
+        online = nz(m.PingStatus) == "Online",
+        vpc = e.vpc,
+        ip = e.ip or nz(m.IPAddress),
+        platform = nz(m.PlatformName),
+      }
+    end
+  end
+  table.sort(out, function(a, b)
+    return (a.name or a.id) < (b.name or b.id)
+  end)
+  return out
+end
+
+---Order bastion candidates: the current one first, then online instances whose
+---Name matches `aws.bastion_names` ("bastion", "jump" by default), preferring
+---the database's VPC. Each copy carries `score`, `match` (name matched) and `why`.
+---@param list table[]              parse_bastions() output
+---@param hints? { vpc?: string, patterns?: string[], current?: string }
+---@return table[] ranked
+function M.rank_bastions(list, hints)
+  hints = hints or {}
+  local patterns = hints.patterns or cfg().bastion_names or { "bastion", "jump" }
+  local current = hints.current and hints.current:lower() or nil
+  local out = {}
+  for _, c in ipairs(list) do
+    local r = vim.deepcopy(c)
+    local lname = (c.name or ""):lower()
+    r.score, r.why, r.match = 0, {}, false
+    if current and (c.id:lower() == current or lname == current) then
+      r.score = r.score + 8
+      r.why[#r.why + 1] = "current"
+    end
+    for _, p in ipairs(patterns) do
+      if lname:find(p:lower(), 1, true) then
+        r.score = r.score + 4
+        r.match = true
+        r.why[#r.why + 1] = "name"
+        break
+      end
+    end
+    if hints.vpc and c.vpc == hints.vpc then
+      r.score = r.score + 2
+      r.why[#r.why + 1] = "same vpc"
+    end
+    if not c.online then
+      r.score = r.score - 16
+      r.why[#r.why + 1] = "offline"
+    end
+    out[#out + 1] = r
+  end
+  table.sort(out, function(a, b)
+    if a.score ~= b.score then
+      return a.score > b.score
+    end
+    return (a.name or a.id) < (b.name or b.id)
+  end)
+  return out
+end
+
 ---Does this stderr mean the credentials must be refreshed?
 ---@param stderr? string
 ---@return boolean
@@ -455,11 +554,64 @@ local function store_endpoints(aws_cfg, info)
   util.write_json(endpoints_path(), all)
 end
 
+---Cache key of a bastion looked up by name.
+---@param aws_cfg dbgrid.AwsConfig
+---@return string?
+local function bastion_key(aws_cfg)
+  if type(aws_cfg.bastion) ~= "string" or M.is_instance_id(aws_cfg.bastion) then
+    return nil
+  end
+  return "bastion|" .. profile_of(aws_cfg) .. "|" .. (aws_cfg.region or "") .. "|" .. aws_cfg.bastion:lower()
+end
+
+---Instance id a Name-tag / "auto" bastion resolved to, unless older than endpoint_ttl_seconds.
+---@param aws_cfg dbgrid.AwsConfig
+---@return string? id
+function M.cached_bastion(aws_cfg)
+  local key = bastion_key(aws_cfg)
+  local entry = key and read_endpoint_cache()[key] or nil
+  if type(entry) ~= "table" or type(entry.id) ~= "string" then
+    return nil
+  end
+  if util.epoch() - (tonumber(entry.fetched_at) or 0) > (cfg().endpoint_ttl_seconds or 86400) then
+    return nil
+  end
+  return entry.id
+end
+
+---@param aws_cfg dbgrid.AwsConfig
+---@param id string
+local function store_bastion(aws_cfg, id)
+  local key = bastion_key(aws_cfg)
+  if key then
+    local all = read_endpoint_cache()
+    all[key] = { fetched_at = util.epoch(), id = id }
+    util.write_json(endpoints_path(), all)
+  end
+end
+
+---Forget which instance a Name-tag / "auto" bastion resolved to (looked up again on the next run).
+---@param aws_cfg dbgrid.AwsConfig
+function M.forget_bastion(aws_cfg)
+  local key = bastion_key(aws_cfg)
+  local all = read_endpoint_cache()
+  if key and all[key] ~= nil then
+    all[key] = nil
+    util.write_json(endpoints_path(), all)
+  end
+end
+
 ---@param aws_cfg dbgrid.AwsConfig
 function M.forget_endpoints(aws_cfg)
   local all = read_endpoint_cache()
-  if all[cache_key(aws_cfg)] ~= nil then
-    all[cache_key(aws_cfg)] = nil
+  local changed = false
+  for _, key in ipairs({ cache_key(aws_cfg), bastion_key(aws_cfg) }) do
+    if all[key] ~= nil then
+      all[key] = nil
+      changed = true
+    end
+  end
+  if changed then
     util.write_json(endpoints_path(), all)
   end
 end
@@ -899,25 +1051,113 @@ function M.resolve(conn, cb)
       if not a.bastion then
         return finish(nil, nil)
       end
-      local key = "ssm|" .. (a.profile or "") .. "|" .. a.bastion .. "|" .. endpoint.host .. ":" .. endpoint.port
-      require("dbgrid.tunnel").ensure({
-        key = key,
-        kind = "ssm",
-        profile = a.profile,
-        region = a.region,
-        target = a.bastion,
-        host = endpoint.host,
-        port = endpoint.port,
-        document = a.document,
-        parameters = a.parameters,
-        cli = cli_exe(a),
-      }, function(port, terr)
-        if not port then
-          return cb(nil, terr)
+      M.bastion_id(a, { vpc = info.vpc }, function(target, berr)
+        if not target then
+          return cb(nil, berr)
         end
-        finish(port, key)
+        local key = "ssm|" .. (a.profile or "") .. "|" .. target .. "|" .. endpoint.host .. ":" .. endpoint.port
+        require("dbgrid.tunnel").ensure({
+          key = key,
+          kind = "ssm",
+          profile = a.profile,
+          region = a.region,
+          target = target,
+          host = endpoint.host,
+          port = endpoint.port,
+          document = a.document,
+          parameters = a.parameters,
+          cli = cli_exe(a),
+        }, function(port, terr)
+          if not port then
+            -- a jumpbox found by name may have been replaced: look it up again next time
+            M.forget_bastion(a)
+            return cb(nil, terr)
+          end
+          finish(port, key)
+        end)
       end)
     end, endpoint)
+  end)
+end
+
+-- Bastions ---------------------------------------------------------------------
+
+---SSM-managed instances of the account (with EC2 Name tags and VPCs), for
+---picking a jumpbox. Both CLI calls run in parallel; a failing ec2 call only
+---loses the names.
+---@param aws_cfg dbgrid.AwsConfig
+---@param cb fun(list?: table[], err?: string)
+function M.bastions(aws_cfg, cb)
+  local ssm_res, ec2_res
+  parallel({
+    function(done)
+      M.cli(aws_cfg, { "ssm", "describe-instance-information" }, function(res)
+        ssm_res = res
+        done()
+      end)
+    end,
+    function(done)
+      local args = { "ec2", "describe-instances", "--filters", "Name=instance-state-name,Values=running" }
+      M.cli(aws_cfg, args, function(res)
+        ec2_res = res
+        done()
+      end)
+    end,
+  }, function()
+    if not ssm_res.ok or not ssm_res.json then
+      return cb(nil, cli_error(aws_cfg, "listing SSM managed instances", ssm_res))
+    end
+    cb(M.parse_bastions(ssm_res.json, ec2_res.ok and ec2_res.json or nil))
+  end)
+end
+
+---Turn `aws.bastion` into an SSM target: an instance id is taken as is, "auto"
+---picks the best candidate by `aws.bastion_names`, anything else is the Name
+---tag of the instance (the first online one wins). Looked-up ids are cached
+---with the endpoints, so a replaced jumpbox costs one lookup per day.
+---@param aws_cfg dbgrid.AwsConfig
+---@param hints? { vpc?: string }
+---@param cb fun(id?: string, err?: string)
+function M.bastion_id(aws_cfg, hints, cb)
+  local want = aws_cfg.bastion
+  if type(want) ~= "string" or want == "" or M.is_instance_id(want) then
+    return cb(want)
+  end
+  local cached = M.cached_bastion(aws_cfg)
+  if cached then
+    return cb(cached)
+  end
+  M.bastions(aws_cfg, function(list, err)
+    if not list then
+      return cb(nil, err)
+    end
+    local ranked, what
+    if want == "auto" then
+      ranked = M.rank_bastions(list, hints)
+      what = "named like " .. table.concat(cfg().bastion_names or { "bastion", "jump" }, " / ")
+    else
+      local exact = vim.tbl_filter(function(c)
+        return (c.name or ""):lower() == want:lower()
+      end, list)
+      ranked = M.rank_bastions(#exact > 0 and exact or list, { vpc = hints and hints.vpc, patterns = { want } })
+      what = "named " .. want
+    end
+    local best = ranked[1]
+    if not best or not best.match then
+      return cb(
+        nil,
+        string.format(
+          "no SSM-managed instance %s for profile %s; set aws.bastion to an instance id",
+          what,
+          profile_of(aws_cfg)
+        )
+      )
+    end
+    if not best.online then
+      return cb(nil, string.format("bastion %s (%s) is not online in SSM", best.name or best.id, best.id))
+    end
+    store_bastion(aws_cfg, best.id)
+    cb(best.id)
   end)
 end
 
@@ -1124,6 +1364,123 @@ local function ask(prompt, default, cb)
   end)
 end
 
+---@param c table  ranked candidate
+---@return string
+local function bastion_label(c)
+  local parts = { c.id }
+  if c.name then
+    parts[#parts + 1] = c.name
+  end
+  parts[#parts + 1] = c.online and "online" or "offline"
+  local why = vim.tbl_filter(function(w)
+    return w == "same vpc" or w == "current"
+  end, c.why or {})
+  if #why > 0 then
+    parts[#parts + 1] = "(" .. table.concat(why, ", ") .. ")"
+  end
+  return table.concat(parts, "  ")
+end
+
+---Choose the SSM bastion for a connection from the account's SSM-managed
+---instances, likely jumpboxes first (`aws.bastion_names`, the database's VPC).
+---One clear online candidate is taken without asking; otherwise the list is
+---shown with "connect directly" and "type an id"; when the lookup fails, a
+---plain prompt. `cancelled` is set when the user backs out of the list.
+---@param aws_cfg dbgrid.AwsConfig
+---@param hints { vpc?: string, current?: string, public?: boolean }
+---@param cb fun(bastion?: string, cancelled?: boolean)
+function M.pick_bastion(aws_cfg, hints, cb)
+  hints = hints or {}
+  local function manual()
+    local prompt = "SSM target instance id (empty = connect directly): "
+    vim.ui.input({ prompt = prompt, default = hints.current }, function(v)
+      if v == nil then
+        -- Esc: while adding it means "directly" (as it always did), while editing it cancels
+        return cb(nil, hints.current ~= nil)
+      end
+      v = util.trim(v)
+      cb(v ~= "" and v or nil)
+    end)
+  end
+  M.bastions(aws_cfg, function(list, err)
+    if not list or #list == 0 then
+      if err then
+        util.warn("dbgrid: could not list SSM instances (" .. err .. ")")
+      end
+      return manual()
+    end
+    local ranked = M.rank_bastions(list, { vpc = hints.vpc, current = hints.current })
+    local best, second = ranked[1], ranked[2]
+    local clear = best.match
+      and best.online
+      and not hints.current
+      and not hints.public
+      and (not second or second.score < best.score or second.name == best.name)
+    if clear then
+      util.notify(
+        string.format(
+          "dbgrid: using bastion %s (%s); :Dbgrid connections edit changes it",
+          best.name or best.id,
+          best.id
+        )
+      )
+      return cb(best.id)
+    end
+    local items = {}
+    if hints.current then
+      items[#items + 1] = { kind = "keep", label = "keep " .. hints.current }
+    end
+    for _, c in ipairs(ranked) do
+      items[#items + 1] = { kind = "instance", id = c.id, label = bastion_label(c) }
+    end
+    local direct = { kind = "direct", label = "connect directly (no bastion)" }
+    if hints.public then
+      table.insert(items, 1, direct)
+    else
+      items[#items + 1] = direct
+    end
+    items[#items + 1] = { kind = "manual", label = "type an instance id" }
+    vim.ui.select(items, {
+      prompt = "SSM bastion",
+      format_item = function(item)
+        return item.label
+      end,
+    }, function(item)
+      if not item then
+        return cb(nil, true)
+      elseif item.kind == "keep" then
+        return cb(hints.current)
+      elseif item.kind == "instance" then
+        return cb(item.id)
+      elseif item.kind == "direct" then
+        return cb(nil)
+      end
+      manual()
+    end)
+  end)
+end
+
+---Edit the parts of an aws block that change over time: the bastion (jumpboxes
+---get replaced) and the secret. Profile, region and cluster identify the
+---connection; `:Dbgrid aws add` makes a new one for a different database.
+---@param conn dbgrid.Connection   a saved entry with an `aws` block, changed in place
+---@param cb fun(ok: boolean)
+function M.edit_interactive(conn, cb)
+  local a = conn.aws
+  local info = id_of(a) and M.cached_endpoints(a) or nil
+  local hints = { vpc = info and info.vpc, current = a.bastion, public = info and info.public }
+  M.pick_bastion(a, hints, function(bastion, cancelled)
+    if cancelled then
+      return cb(false)
+    end
+    a.bastion = bastion
+    ask("Secrets Manager secret (id or ARN; empty = the RDS managed secret): ", a.secret, function(secret)
+      a.secret = secret
+      cb(true)
+    end)
+  end)
+end
+
 ---Walk the user through profile, region, cluster/instance, bastion, secret and name, then save globally.
 ---@param cb? fun(conn?: dbgrid.Connection)
 function M.add_interactive(cb)
@@ -1156,7 +1513,7 @@ function M.add_interactive(cb)
     end, { text = true, no_login = true })
   end
   local function pick_database(aws_cfg, next_step)
-    local clusters, instances = {}, {}
+    local clusters, instances, placement = {}, {}, {}
     parallel({
       function(done)
         M.cli(aws_cfg, { "rds", "describe-db-clusters" }, function(res)
@@ -1169,7 +1526,13 @@ function M.add_interactive(cb)
       function(done)
         M.cli(aws_cfg, { "rds", "describe-db-instances" }, function(res)
           for _, i in ipairs(res.json and nz(res.json.DBInstances) or {}) do
-            if not nz(i.DBClusterIdentifier) then
+            local cid = nz(i.DBClusterIdentifier)
+            if cid then
+              -- cluster members tell the VPC and exposure of their cluster
+              placement[cid] = placement[cid] or {}
+              placement[cid].vpc = placement[cid].vpc or (nz(i.DBSubnetGroup) and nz(i.DBSubnetGroup.VpcId)) or nil
+              placement[cid].public = placement[cid].public or nz(i.PubliclyAccessible) == true
+            else
               instances[#instances + 1] = i
             end
           end
@@ -1179,10 +1542,18 @@ function M.add_interactive(cb)
     }, function()
       local items = {}
       for _, c in ipairs(clusters) do
-        items[#items + 1] = { kind = "cluster", id = c.DBClusterIdentifier, raw = c }
+        local where = placement[c.DBClusterIdentifier] or {}
+        items[#items + 1] =
+          { kind = "cluster", id = c.DBClusterIdentifier, raw = c, vpc = where.vpc, public = where.public }
       end
       for _, i in ipairs(instances) do
-        items[#items + 1] = { kind = "instance", id = i.DBInstanceIdentifier, raw = i }
+        items[#items + 1] = {
+          kind = "instance",
+          id = i.DBInstanceIdentifier,
+          raw = i,
+          vpc = nz(i.DBSubnetGroup) and nz(i.DBSubnetGroup.VpcId) or nil,
+          public = nz(i.PubliclyAccessible) == true,
+        }
       end
       if #items == 0 then
         util.error("dbgrid: no RDS clusters or instances found for profile " .. profile_of(aws_cfg))
@@ -1214,7 +1585,10 @@ function M.add_interactive(cb)
         if info then
           store_endpoints(aws_cfg, info)
         end
-        ask("SSM target instance id (empty = connect directly): ", nil, function(bastion)
+        M.pick_bastion(aws_cfg, { vpc = item.vpc, public = item.public }, function(bastion, cancelled)
+          if cancelled then
+            return cancel()
+          end
           aws_cfg.bastion = bastion
           local managed = info and info.secret_arn or nil
           ask("Secrets Manager secret (id or ARN): ", managed, function(secret)

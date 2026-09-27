@@ -93,6 +93,8 @@ def instance(iid, cluster_id=None, replicas=None, source=None):
         "Endpoint": {"Address": iid + ".abc123.%s.rds.amazonaws.com" % REGION, "Port": port, "HostedZoneId": "Z1"},
         "ReadReplicaDBInstanceIdentifiers": replicas or [],
         "PendingModifiedValues": {},
+        "DBSubnetGroup": {"DBSubnetGroupName": "app-private", "VpcId": "vpc-0app", "SubnetGroupStatus": "Complete"},
+        "PubliclyAccessible": False,
     }
     if cluster_id:
         d["DBClusterIdentifier"] = cluster_id
@@ -240,6 +242,31 @@ def main():
             "SecretString": json.dumps(secret),
             "VersionStages": ["AWSCURRENT"],
             "CreatedDate": "2026-09-01T00:00:00+00:00",
+        })
+    elif svc == "ssm" and cmd == "describe-instance-information":
+        out({
+            "InstanceInformationList": [
+                {"InstanceId": "i-0bastion", "PingStatus": "Online", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.0.1.10", "ComputerName": "ip-10-0-1-10",
+                 "ResourceType": "EC2Instance"},
+                {"InstanceId": "i-0web", "PingStatus": "Online", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.0.2.20", "ComputerName": "ip-10-0-2-20",
+                 "ResourceType": "EC2Instance"},
+                {"InstanceId": "i-0oldjump", "PingStatus": "ConnectionLost", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.9.9.9", "ComputerName": "ip-10-9-9-9",
+                 "ResourceType": "EC2Instance"},
+            ]
+        })
+    elif svc == "ec2" and cmd == "describe-instances":
+        def ec2(iid, name, vpc, ip):
+            return {"InstanceId": iid, "State": {"Code": 16, "Name": "running"}, "VpcId": vpc,
+                    "PrivateIpAddress": ip, "Tags": [{"Key": "Name", "Value": name}, {"Key": "env", "Value": "prod"}]}
+        out({
+            "Reservations": [
+                {"ReservationId": "r-1", "Instances": [ec2("i-0bastion", "bastion-prod", "vpc-0app", "10.0.1.10")]},
+                {"ReservationId": "r-2", "Instances": [ec2("i-0web", "web-1", "vpc-0app", "10.0.2.20"),
+                                                        ec2("i-0oldjump", "jumpbox-legacy", "vpc-0old", "10.9.9.9")]},
+            ]
         })
     elif svc == "ssm" and cmd == "start-session":
         params = dict(kv.split("=", 1) for kv in opts.get("parameters", "").split(",") if "=" in kv)

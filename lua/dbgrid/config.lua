@@ -153,6 +153,9 @@ M.defaults = {
     login_cmd = { "aws", "sso", "login", "--profile", "{profile}" },
     -- Default sslmode through the tunnel ("require" | "verify-full", the latter needs sslrootcert).
     ssl = "require",
+    -- Name tags (substrings, case-insensitive) that mark an SSM-managed instance as a jumpbox:
+    -- `aws add` picks a matching instance as the bastion, and `bastion = "auto"` resolves to one.
+    bastion_names = { "bastion", "jump" },
   },
 
   index_check = {

@@ -682,16 +682,191 @@ H.describe("aws add_interactive", function()
     H.eq(conn.aws.region, "ap-southeast-1")
     H.eq(conn.aws.cluster, "app-prod")
     H.eq(conn.aws.instance, nil)
-    H.eq(conn.aws.bastion, "i-0bastion")
+    H.eq(conn.aws.bastion, "i-0bastion", "the one online jumpbox in the database's VPC is taken without asking")
     H.eq(conn.aws.secret, nil, "the managed secret needs no explicit id")
     H.eq(conn.aws.auth, "secret")
     H.eq(select_prompts, { "AWS profile", "RDS cluster / instance" })
-    H.eq(#input_prompts, 4)
+    H.eq(#input_prompts, 3)
     H.matches(input_prompts[1], "region")
+    for _, prompt in ipairs(input_prompts) do
+      H.falsy(prompt:find("SSM target"), "the bastion must not be asked for")
+    end
+    H.eq(log_count("ssm describe-instance-information"), 1)
+    H.eq(log_count("ec2 describe-instances --filters Name=instance-state-name,Values=running"), 1)
     H.eq(log_count("configure get region --profile prod"), 1)
     H.truthy(aws.cached_endpoints(conn.aws), "endpoints from the picker should be cached")
     local saved = util.read_json(tmp .. "/data/connections.json")
     H.eq(saved.connections[#saved.connections].name, "app-prod")
+  end)
+end)
+
+H.describe("aws bastions", function()
+  H.it("parses ssm + ec2 into candidates and ranks jumpboxes first", function()
+    local ssm = {
+      InstanceInformationList = {
+        { InstanceId = "i-web", PingStatus = "Online" },
+        { InstanceId = "i-jump", PingStatus = "Online" },
+        { InstanceId = "i-old", PingStatus = "ConnectionLost", ComputerName = "ip-10-9-9-9" },
+        { InstanceId = "mi-hybrid", PingStatus = "Online", Name = "office-bastion" },
+      },
+    }
+    local ec2 = {
+      Reservations = {
+        {
+          Instances = {
+            {
+              InstanceId = "i-web",
+              VpcId = "vpc-a",
+              PrivateIpAddress = "10.0.2.20",
+              Tags = { { Key = "Name", Value = "web-1" } },
+            },
+            {
+              InstanceId = "i-jump",
+              VpcId = "vpc-a",
+              Tags = { { Key = "env", Value = "prod" }, { Key = "Name", Value = "Jump-Host" } },
+            },
+            { InstanceId = "i-old", VpcId = "vpc-b", Tags = { { Key = "Name", Value = "bastion-legacy" } } },
+            { InstanceId = "i-notssm", VpcId = "vpc-a", Tags = { { Key = "Name", Value = "bastion-noagent" } } },
+          },
+        },
+      },
+    }
+    local list = aws.parse_bastions(ssm, ec2)
+    H.eq(#list, 4, "only ssm-managed instances are candidates")
+    local by_id = {}
+    for _, c in ipairs(list) do
+      by_id[c.id] = c
+    end
+    H.eq(by_id["i-jump"].name, "Jump-Host")
+    H.eq(by_id["i-jump"].vpc, "vpc-a")
+    H.eq(by_id["i-old"].online, false)
+    H.eq(by_id["mi-hybrid"].name, "office-bastion")
+    H.eq(by_id["i-web"].ip, "10.0.2.20")
+    H.eq(by_id["i-old"].name, "bastion-legacy")
+    -- names win, the database's vpc breaks ties, offline instances sort last
+    local ranked = aws.rank_bastions(list, { vpc = "vpc-a" })
+    H.eq(ranked[1].id, "i-jump")
+    H.truthy(ranked[1].match)
+    H.eq(ranked[1].why, { "name", "same vpc" })
+    H.eq(ranked[2].id, "mi-hybrid")
+    H.eq(ranked[3].id, "i-web")
+    H.falsy(ranked[3].match)
+    H.eq(ranked[4].id, "i-old")
+    H.eq(ranked[4].why, { "name", "offline" })
+    -- the current bastion (by id or by name) comes first whatever it is called
+    H.eq(aws.rank_bastions(list, { current = "i-web" })[1].id, "i-web")
+    H.eq(aws.rank_bastions(list, { current = "web-1" })[1].why, { "current" })
+    -- aws.bastion_names can be overridden
+    H.eq(aws.rank_bastions(list, { patterns = { "web" } })[1].id, "i-web")
+    -- names only from ssm when ec2 is unavailable
+    local ssm_only = {}
+    for _, c in ipairs(aws.parse_bastions(ssm)) do
+      ssm_only[c.id] = c.name
+    end
+    H.eq(ssm_only, { ["i-old"] = "ip-10-9-9-9", ["mi-hybrid"] = "office-bastion" })
+    local _, err = aws.parse_bastions("not json")
+    H.matches(err, "did not return JSON")
+    H.truthy(aws.is_instance_id("i-0123456789abcdef0"))
+    H.truthy(aws.is_instance_id("mi-0123456789abcdef0"))
+    H.falsy(aws.is_instance_id("bastion-prod"))
+    H.falsy(aws.is_instance_id("auto"))
+    H.falsy(aws.is_instance_id(nil))
+  end)
+
+  H.it("resolves a bastion by its Name tag or auto, and caches the id", function()
+    local ec2_before = log_count("ec2 describe-instances")
+    local conn = vim.deepcopy(prod)
+    conn.name = "prod-by-name"
+    conn.aws.bastion = "bastion-prod"
+    local eff, err = sync(function(cb)
+      aws.resolve(conn, cb)
+    end)
+    H.eq(err, nil)
+    H.matches(eff.tunnel_key, "^ssm|prod|i%-0bastion|db%.internal:%d+$")
+    H.eq(aws.cached_bastion(conn.aws), "i-0bastion")
+    H.eq(log_count("ec2 describe-instances"), ec2_before + 1)
+    -- the second resolve reads the cached id
+    eff, err = sync(function(cb)
+      aws.resolve(vim.deepcopy(conn), cb)
+    end)
+    H.eq(err, nil)
+    H.matches(eff.tunnel_key, "i%-0bastion")
+    H.eq(log_count("ec2 describe-instances"), ec2_before + 1)
+    -- the cache is keyed by name and dropped with the endpoints
+    local auto = { profile = "prod", region = "ap-southeast-1", cluster = "app-prod", bastion = "auto" }
+    H.eq(aws.cached_bastion(auto), nil)
+    local id, aerr = sync(function(cb)
+      aws.bastion_id(auto, {}, cb)
+    end)
+    H.eq(aerr, nil)
+    H.eq(id, "i-0bastion", "jumpbox-legacy matches too but is offline")
+    H.eq(aws.cached_bastion(auto), "i-0bastion")
+    aws.forget_bastion(auto)
+    H.eq(aws.cached_bastion(auto), nil)
+    -- `aws refresh` (forget_endpoints) drops the looked-up bastion as well
+    local other = { profile = "prod", region = "ap-southeast-1", cluster = "other", bastion = "bastion-prod" }
+    H.eq(aws.cached_bastion(other), "i-0bastion", "the bastion cache is per name, not per database")
+    aws.forget_endpoints(other)
+    H.eq(aws.cached_bastion(conn.aws), nil)
+    H.truthy(aws.cached_endpoints(conn.aws), "the endpoints of app-prod are untouched")
+    -- instance ids pass through untouched; unknown names and offline instances are errors
+    H.eq(
+      sync(function(cb)
+        aws.bastion_id({ profile = "prod", bastion = "i-0123456789abcdef0" }, {}, cb)
+      end),
+      "i-0123456789abcdef0"
+    )
+    local _, nerr = sync(function(cb)
+      aws.bastion_id({ profile = "prod", bastion = "nope" }, {}, cb)
+    end)
+    H.matches(nerr, "no SSM%-managed instance named nope for profile prod")
+    local _, oerr = sync(function(cb)
+      aws.bastion_id({ profile = "prod", bastion = "jumpbox-legacy" }, {}, cb)
+    end)
+    H.matches(oerr, "jumpbox%-legacy %(i%-0oldjump%) is not online")
+  end)
+
+  H.it("edit offers the current bastion, the candidates and a direct option", function()
+    local items_seen
+    local orig_select, orig_input = vim.ui.select, vim.ui.input
+    vim.ui.select = function(items, opts, on_choice)
+      items_seen = vim.tbl_map(function(i)
+        return opts.format_item(i)
+      end, items)
+      vim.schedule(function()
+        on_choice(items[3], 3)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      vim.schedule(function()
+        on_confirm(opts.default or "")
+      end)
+    end
+    local draft = {
+      name = "prod",
+      aws = {
+        profile = "prod",
+        region = "ap-southeast-1",
+        cluster = "app-prod",
+        bastion = "i-0web",
+        secret = "prod/db",
+      },
+    }
+    local ok = sync(function(cb)
+      aws.edit_interactive(draft, cb)
+    end)
+    vim.ui.select, vim.ui.input = orig_select, orig_input
+    H.truthy(ok)
+    H.eq(items_seen, {
+      "keep i-0web",
+      "i-0web  web-1  online  (current)",
+      "i-0bastion  bastion-prod  online",
+      "i-0oldjump  jumpbox-legacy  offline",
+      "connect directly (no bastion)",
+      "type an instance id",
+    })
+    H.eq(draft.aws.bastion, "i-0bastion")
+    H.eq(draft.aws.secret, "prod/db", "the secret prompt is prefilled")
   end)
 end)
 
