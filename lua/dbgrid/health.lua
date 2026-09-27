@@ -28,25 +28,51 @@ function M.check()
       "no connections: add one in setup({ connections = ... }), in .env (DATABASE_URL) or with :Dbgrid connections"
     )
   end
+  local any_aws = false
   for _, c in ipairs(conns) do
     local a, err = require("dbgrid.adapters").for_connection(c)
+    if c.aws then
+      any_aws = true
+    end
     if not a then
       health.error(c.name .. ": " .. tostring(err))
+    elseif c.aws and c.aws_role ~= "writer" then
+      health.info(c.name .. ": reader entry of " .. tostring(c.parent))
     else
-      local ok_sys, res = pcall(function()
-        return vim
-          .system({ a.executable, c.url, "-X", "-A", "-t", "-c", "select 1" }, {
-            env = { PGCONNECT_TIMEOUT = "3" },
-            text = true,
-            timeout = 5000,
-          })
-          :wait()
+      local done, ok, msg = false, false, nil
+      require("dbgrid.connections").test(c, function(good, m)
+        done, ok, msg = true, good, m
       end)
-      if ok_sys and res.code == 0 then
-        health.ok(c.name .. " (" .. (c.source or "setup") .. "): reachable")
+      vim.wait(c.aws and 60000 or 8000, function()
+        return done
+      end, 50)
+      if done and ok then
+        health.ok(c.name .. " (" .. (c.source or "setup") .. "): reachable · " .. tostring(msg))
+      elseif done then
+        health.warn(c.name .. ": " .. vim.trim(tostring(msg)))
       else
-        health.warn(c.name .. ": " .. vim.trim(ok_sys and (res.stderr or "") or tostring(res)))
+        health.warn(c.name .. ": no answer within the timeout")
       end
+    end
+  end
+  if any_aws then
+    local ok_aws, aws = pcall(require, "dbgrid.aws")
+    if ok_aws and aws.health then
+      health.start("dbgrid: aws")
+      aws.health({
+        ok = health.ok,
+        warn = health.warn,
+        error = health.error,
+        info = health.info,
+      })
+    end
+  end
+  local ok_tunnel, tunnel = pcall(require, "dbgrid.tunnel")
+  if ok_tunnel and tunnel.list then
+    for _, t in ipairs(tunnel.list()) do
+      (t.ok and health.ok or health.warn)(
+        string.format("tunnel %s: localhost:%d%s", t.key, t.port or 0, t.ok and "" or " (dead)")
+      )
     end
   end
   local root = require("dbgrid.project").root()
