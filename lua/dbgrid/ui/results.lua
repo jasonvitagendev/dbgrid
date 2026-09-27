@@ -60,9 +60,9 @@ end
 
 ---Rows of a set after the view's filter and sort.
 ---@param s dbgrid.State
----@param entry table
+---@param entry { set: dbgrid.ResultSet, stmt: dbgrid.StatementResult, stmt_index: integer }
 ---@return any[][]
-local function display_rows(s, entry)
+function M.display_rows(s, entry)
   local rows = entry.set.rows
   local view = s.view
   if view.filter and view.filter ~= "" then
@@ -131,7 +131,7 @@ local function render_set(s, entry, ctx)
   local cfg = config.get().results
   local set = entry.set
   local columns = set.columns
-  local rows = display_rows(s, entry)
+  local rows = M.display_rows(s, entry)
   local truncate = s.view.truncate ~= false
   local ncols = #columns
   -- formatted values, numeric / bool detection, widths
@@ -436,7 +436,7 @@ local function render_record(s, result, ctx)
     add(" (no rows)", "DbgridStatusDim")
     return
   end
-  local rows = display_rows(s, entry)
+  local rows = M.display_rows(s, entry)
   local idx = math.max(1, math.min(s.view.record_row or 1, #rows))
   s.view.record_row = idx
   local row = rows[idx]
@@ -700,7 +700,7 @@ function M.winbar(s)
     parts[#parts + 1] = "%#DbgridWinbarWarn# "
       .. esc(icons.running)
       .. " "
-      .. (running.kind == "explain" and "planning" or "running")
+      .. require("dbgrid.ui.query").running_label(running)
       .. " "
   elseif meta then
     if meta.status == "ok" then
@@ -863,7 +863,7 @@ function M.yank_csv(s)
     return
   end
   local out = { table.concat(vim.tbl_map(util.csv_escape, entry.set.columns), ",") }
-  for _, row in ipairs(display_rows(s, entry)) do
+  for _, row in ipairs(M.display_rows(s, entry)) do
     local vals = {}
     for j = 1, #entry.set.columns do
       local v = row[j]
@@ -1006,6 +1006,13 @@ function M.attach(s)
   map(buf, k.yank_insert, function()
     M.yank_insert(s)
   end, "yank row as INSERT")
+  map(buf, k.ask, function()
+    local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id)
+    if not cell then
+      return util.notify("move to a cell first")
+    end
+    require("dbgrid.ai").review(s, cell)
+  end, "ask the agent about the query and its result")
   map(buf, k.next_col, function()
     M.move_column(s, 1)
   end, "next column / row")

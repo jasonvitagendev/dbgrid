@@ -154,6 +154,119 @@ H.describe("ai", function()
     H.matches(text, "Existing SQL")
     H.falsy(text:find("unrelated", 1, true), "unrelated table should be left out")
   end)
+  H.it("builds a review prompt from the query and its result", function()
+    local result = {
+      ok = true,
+      ran_at = 0,
+      elapsed_ms = 12,
+      server_ms = 3,
+      connection = "test",
+      truncated = true,
+      statements = {
+        {
+          sql = "select id, note from users",
+          kind = "select",
+          class = "read",
+          limit_applied = 2,
+          sets = {
+            {
+              columns = { "id", "note" },
+              rows = { { "1", vim.NIL }, { "2", "line one\nline two" }, { "3", "x" } },
+              row_count = 3,
+            },
+          },
+          tags = {},
+        },
+        { sql = "update users set note = null", kind = "update", class = "write", sets = {}, tags = { "UPDATE 1" } },
+      },
+      notices = { "NOTICE: hi" },
+      warnings = { { message = "Seq Scan on users (~5,000 rows)" } },
+    }
+    local text = ai.build_review_prompt({
+      question = "why so slow?",
+      sql = "select id, note from users;\nupdate users set note = null;",
+      sql_edited = true,
+      cell_label = "q1 slow",
+      result = result,
+      max_rows = 2,
+      rows_note = "sorted by id descending",
+      plan = { "Seq Scan on users" },
+      plan_kind = "EXPLAIN",
+      history = { { question = "earlier?", answer = "earlier answer" } },
+    })
+    H.matches(text, "## Question\nwhy so slow%?")
+    H.matches(text, "## Query %(cell q1 slow%)\nThe cell was edited after this run")
+    H.matches(text, "select id, note from users;\nupdate users set note = null;")
+    H.matches(text, "took 12 ms %(server 3 ms%)")
+    H.matches(text, "as displayed in the grid: sorted by id descending")
+    H.matches(text, "### Statement 1 of 2 %(SELECT%)\nThe notebook added LIMIT 2 to this statement, and it was hit")
+    H.matches(text, "3 rows, first 2 shown:\nid | note\n1 | NULL\n2 | line one line two\n")
+    H.falsy(text:find("3 | x", 1, true), "rows beyond max_rows should be left out")
+    H.matches(text, "### Statement 2 of 2 %(UPDATE%)\nUPDATE 1")
+    H.matches(text, "Notices from the server:\nNOTICE: hi")
+    H.matches(text, "Index check before the run warned:\n%- Seq Scan on users")
+    H.matches(text, "## Plan %(EXPLAIN%)\nSeq Scan on users")
+    H.matches(text, "## Earlier questions about this same result\nQ: earlier%?\nA: earlier answer")
+  end)
+  H.it("puts errors and the displayed rows into the review prompt", function()
+    local text = ai.build_review_prompt({
+      question = "q",
+      sql = "select nope",
+      result = {
+        ok = false,
+        statements = { { sql = "select nope", kind = "select", sets = {}, tags = {} } },
+        error = { message = 'column "nope" does not exist', line = 1, col = 8, hint = "Perhaps you meant note" },
+      },
+    })
+    H.matches(
+      text,
+      'The query failed with an error:\nERROR: column "nope" does not exist\n'
+        .. "at line 1, column 8 of the cell\nHINT: Perhaps you meant note"
+    )
+    H.falsy(text:find("Statement 1 of", 1, true), "a single statement needs no heading")
+    local text2 = ai.build_review_prompt({
+      question = "q",
+      sql = "select 1",
+      result = {
+        statements = {
+          { sql = "select 1", kind = "select", sets = { { columns = { "a" }, rows = { { "1" }, { "2" } } } } },
+        },
+      },
+      rows_of = function(entry)
+        return { entry.set.rows[2] }
+      end,
+    })
+    H.matches(text2, "2 rows, first 1 shown:\na\n2\n")
+    local text3 =
+      ai.build_review_prompt({ question = "q", sql = "select 1", plan = { "Result" }, plan_kind = "EXPLAIN" })
+    H.matches(text3, "The cell has not been run; only its plan is available")
+    H.matches(text3, "## Plan %(EXPLAIN%)\nResult")
+  end)
+  H.it("runs an agent and hands back its raw answer", function()
+    require("dbgrid.config").get().ai.agents.echo = { cmd = { "cat" }, stdin = true }
+    local answer, err
+    local job = ai.run("hello\nworld", function(text, e)
+      answer, err = text, e
+    end, "echo")
+    H.truthy(job)
+    H.truthy(H.wait(5000, function()
+      return answer ~= nil or err ~= nil
+    end))
+    H.eq(err, nil)
+    H.eq(answer, "hello\nworld")
+    local sql
+    ai.ask("select 1;", function(text)
+      sql = text
+    end, "echo")
+    H.truthy(H.wait(5000, function()
+      return sql ~= nil
+    end))
+    H.eq(sql, "select 1;")
+    ai.run("x", function(_, e)
+      err = e
+    end, "nope")
+    H.matches(err, "unknown agent")
+  end)
   H.it("writes sql under the prompt lines", function()
     local cells = require("dbgrid.cells")
     local b = vim.api.nvim_create_buf(false, true)

@@ -167,6 +167,70 @@ H.describe("notebook ui", function()
     require("dbgrid.ui.results").toggle_plan(s)
   end)
 
+  H.it("asks the agent about the query and the result", function()
+    local util = require("dbgrid.util")
+    local ai = require("dbgrid.ai")
+    local review = require("dbgrid.ui.review")
+    -- a fake agent: keeps the prompt it was given, answers with two lines
+    local script, captured = tmp .. "/agent.sh", tmp .. "/prompt.txt"
+    util.write_file(
+      script,
+      "#!/bin/sh\ncat > '" .. captured .. "'\necho 'The scan is fine.'\necho 'Add an index on balance.'\n"
+    )
+    vim.fn.setfperm(script, "rwxr-xr-x")
+    local cfg = require("dbgrid.config").get()
+    cfg.ai.agents.fake = { cmd = { script }, stdin = true }
+    cfg.ai.agent = "fake"
+    local cell = cells.parse(s.buf)[1]
+    ai.review(s, cell, "is this query ok?")
+    H.truthy(s.running.c4, "a review job should be running")
+    H.truthy(
+      H.wait(10000, function()
+        return s.runtime.c4 and s.runtime.c4.review ~= nil
+      end),
+      "answer timed out"
+    )
+    H.eq(s.running.c4, nil)
+    local turns = s.runtime.c4.review.turns
+    H.eq(#turns, 1)
+    H.eq(turns[1].question, "is this query ok?")
+    H.eq(turns[1].answer, "The scan is fine.\nAdd an index on balance.")
+    local prompt = util.read_file(captured)
+    H.matches(prompt, "## Question\nis this query ok%?")
+    H.matches(prompt, "## Query %(cell q1 scan%)\nselect %* from users where balance > 5%s+LIMIT 5;")
+    H.matches(prompt, "on connection test")
+    H.matches(prompt, "The notebook added LIMIT 5 to this statement, and it was hit")
+    H.matches(prompt, "5 rows:\nid | email | plan_id | balance | created_at | note\n%d+ | user%d+@example%.com")
+    H.matches(prompt, "Index check before the run warned:\n%- Seq Scan on users")
+    H.matches(prompt, "## Plan %(estimated.-\n%s*%-> Seq Scan on users")
+    H.falsy(prompt:find("Earlier questions", 1, true))
+    -- the answer float is open and focused on the transcript
+    H.truthy(s.review_win and vim.api.nvim_win_is_valid(s.review_win), "the answer float should be open")
+    H.eq(vim.api.nvim_get_current_win(), s.review_win)
+    local fbuf = vim.api.nvim_win_get_buf(s.review_win)
+    H.eq(vim.bo[fbuf].filetype, "markdown")
+    local flines = vim.api.nvim_buf_get_lines(fbuf, 0, -1, false)
+    H.eq(flines[1], "**Q:** is this query ok?")
+    H.matches(table.concat(flines, "\n"), "Add an index on balance%.")
+    review.close(s)
+    H.eq(s.review_win, nil)
+    -- a follow-up carries the earlier exchange
+    ai.review(s, cell, "which index?")
+    H.truthy(
+      H.wait(10000, function()
+        return #s.runtime.c4.review.turns == 2
+      end),
+      "follow-up timed out"
+    )
+    prompt = util.read_file(captured)
+    H.matches(prompt, "## Earlier questions about this same result\nQ: is this query ok%?\nA: The scan is fine%.")
+    flines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(s.review_win), 0, -1, false)
+    H.matches(table.concat(flines, "\n"), "%*%*Q:%*%* is this query ok%?.*\n%-%-%-\n.*%*%*Q:%*%* which index%?")
+    review.close(s)
+    cfg.ai.agent = "claude"
+    vim.api.nvim_set_current_win(s.query_win)
+  end)
+
   H.it("marks a cell stale after editing", function()
     vim.api.nvim_buf_set_lines(s.buf, 1, 2, false, { "select * from users where balance > 6" })
     vim.b[s.buf].dbgrid_cells_cache = nil

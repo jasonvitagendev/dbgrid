@@ -80,6 +80,7 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid run [all]              run the current cell or all cells
 :Dbgrid explain [analyze]      plan of the current cell
 :Dbgrid ask {prompt}           add a prompt to the cell and generate SQL
+:Dbgrid review [question]      ask the agent about the cell's query and result
 :Dbgrid schema refresh|tables  refresh the schema cache / browse tables
 :Dbgrid describe {table}       describe a table
 :Dbgrid rename {title}         rename the notebook
@@ -102,6 +103,7 @@ Query pane ~
   \n \o \O    new cell end/below/above
   \d          delete cell            \y          yank cell
   \m          rename cell            \g          generate SQL from prompt
+  \a          ask about the query and its result (|dbgrid-review|)
   \t          edit tags              \c          pick connection
   \s  \S      refresh schema / browse tables
   K           describe identifier    \<Tab>      focus results
@@ -113,6 +115,7 @@ Results pane ~
   \p          plan view              \w          toggle truncation
   \s          sort by column         \f          filter rows
   \yc \yr \ya \yi   yank value / row JSON / CSV / row INSERT
+  \a          ask about the query and its result (|dbgrid-review|)
   <Tab> <S-Tab>     next / previous column (row in record view)
   ]c  [c      next / previous cell   \<Tab>      focus query pane
   \z          zoom pane              q           close notebook
@@ -148,6 +151,19 @@ When the cell already has SQL the prompt is an edit request.
 Agents (`ai.agents`) are argv lists; `{prompt}` and `{output}` are
 substituted, `stdin = true` pipes the prompt. Defaults exist for `claude`,
 `kimi` and `codex`; add your own the same way.
+
+Asking about a result ~
+                                                              *dbgrid-review*
+`\a` (either pane) or `:Dbgrid review [question]` sends the cell's SQL and
+its result together to the agent with your question, and shows the answer
+in a float (`q` closes, `\a` inside asks a follow-up, an empty question
+re-opens the last answer). The prompt holds the SQL as it ran, the rows as
+displayed (filter and sort respected, at most `ai.max_result_rows`),
+command tags, notices, index-check warnings, the error with DETAIL and HINT,
+the EXPLAIN output when one was run (else the estimated plan from the index
+check), the tables the query reads, and the earlier questions about the
+same result. The transcript is kept per cell until the cell is run again;
+`\x` cancels a pending question.
 
 ==============================================================================
 8. COMPLETION                                              *dbgrid-completion*

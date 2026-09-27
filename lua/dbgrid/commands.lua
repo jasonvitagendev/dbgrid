@@ -120,6 +120,16 @@ M.subcommands = {
     end
     require("dbgrid.ai").generate(s, cell)
   end,
+  review = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if cell then
+      require("dbgrid.ai").review(s, cell, #args > 0 and table.concat(args, " ") or nil)
+    end
+  end,
   schema = function(args)
     local s = current_or_warn()
     if not s then

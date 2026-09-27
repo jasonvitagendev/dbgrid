@@ -98,6 +98,8 @@ M.defaults = {
     },
     -- How many tables of the schema are described to the agent.
     max_tables = 40,
+    -- How many result rows go to the agent when asking about a result.
+    max_result_rows = 100,
     timeout_ms = 180000,
     -- Extra instructions appended to every prompt (house style, naming, ...).
     instructions = "",
@@ -137,6 +139,7 @@ M.defaults = {
       yank_cell = "<localleader>y",
       rename_cell = "<localleader>m",
       generate = "<localleader>g",
+      ask = "<localleader>a",
       tags = "<localleader>t",
       connection = "<localleader>c",
       schema_refresh = "<localleader>s",
@@ -159,6 +162,7 @@ M.defaults = {
       yank_row_json = "<localleader>yr",
       yank_csv = "<localleader>ya",
       yank_insert = "<localleader>yi",
+      ask = "<localleader>a",
       next_col = "<Tab>",
       prev_col = "<S-Tab>",
       next_cell = "]c",

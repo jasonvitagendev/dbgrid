@@ -49,6 +49,10 @@ the cache, so moving between cells never re-runs anything.
 - **Prompt to SQL.** Write `-- ? users who never logged in` in a cell and press
   `<CR>` (or `<localleader>g`): the schema and the prompt go to `claude`,
   `kimi` or `codex`, the SQL comes back into the cell for review.
+- **Ask about a result.** `<localleader>a` sends the cell's SQL together with
+  what came back (rows, error, notices, the plan when there is one) to the
+  agent with your question — "which of these is blocking?", "why is this
+  slow?" — and shows the answer next to the grid. Follow-ups keep the context.
 - **Extensible.** Everything database-specific sits behind a small adapter
   interface; PostgreSQL ships, others plug in.
 
@@ -187,6 +191,7 @@ Query pane:
 | `\y` | yank the cell body |
 | `\m` | rename the cell |
 | `\g` | generate SQL from the `-- ?` prompt (asks for one when missing) |
+| `\a` | ask the agent about the cell's query and its result |
 | `\t` | edit tags |
 | `\c` | pick the connection |
 | `\s` / `\S` | refresh the schema cache / browse tables (inserts the name) |
@@ -207,6 +212,7 @@ Results pane:
 | `\s` | sort by the column under the cursor (asc → desc → off) |
 | `\f` | filter rows by text |
 | `\yc` / `\yr` / `\ya` / `\yi` | yank value / row as JSON / result as CSV / row as INSERT |
+| `\a` | ask the agent about the query and the result (again for a follow-up) |
 | `<Tab>` / `<S-Tab>` | next / previous column (next / previous row in record view) |
 | `]c` / `[c` | next / previous cell |
 | `\<Tab>` | focus the query pane |
@@ -227,6 +233,7 @@ Results pane:
 | `run` / `run all` | run the current cell / all cells |
 | `explain [analyze]` | plan of the current cell |
 | `ask <prompt>` | add a prompt to the current cell and generate |
+| `review [question]` | ask the agent about the current cell's query and result |
 | `schema refresh` / `schema tables` | refresh the cache / browse tables |
 | `describe <table>` | describe a table |
 | `rename <title>` / `delete` / `close` | notebook management |
@@ -303,6 +310,31 @@ disallowed list if you want it to read your repository (models, migrations)
 for extra context. Check `kimi --help` / `codex exec --help` if your versions
 differ.
 
+## Ask about a result
+
+Diagnostic queries (`pg_stat_activity`, lock waits, `pg_stat_user_tables`,
+an `EXPLAIN ANALYZE` that does not look right) are easier to read with a
+second pair of eyes. Press `\a` in the results pane (or in the query pane, on
+the cell) and type a question; leave it empty for "what does this result
+show, anything worth attention?". The agent gets, in one prompt:
+
+- the SQL that produced the result (as it ran, with the added `LIMIT`; a note
+  when the cell was edited since);
+- the rows — as displayed, so an active filter or sort is respected — up to
+  `ai.max_result_rows` (100), with `NULL`s spelled out and long values cut;
+- command tags, notices, index-check warnings and the error with its line,
+  `DETAIL` and `HINT` when the query failed;
+- the plan: the `EXPLAIN` / `EXPLAIN ANALYZE` output when you ran one (`\e` /
+  `\E`), otherwise the estimated plan the index check fetched before the run;
+- the definitions of the tables the query reads, from the schema cache;
+- your earlier questions about this same result, so follow-ups work.
+
+The answer opens in a float over the grid: `q` closes it, `\a` inside it asks
+a follow-up, and an empty question re-opens the last answer. The transcript
+is kept per cell until the cell is run again. `\x` in the query pane (or
+`:Dbgrid cancel`) stops a question that is taking too long; `:Dbgrid review
+[question]` asks one from the command line.
+
 ## Completion and hover
 
 The schema (tables, columns with types, primary/foreign keys, indexes, enums)
@@ -329,7 +361,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   query = { limit = 500, confirm_writes = true, transaction_per_cell = true, timeout_ms = nil },
   index_check = { mode = "warn", min_rows = 10000 },        -- "off" | "warn" | "confirm"
   results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },
-  ai = { agent = "claude", agents = { ... }, max_tables = 40, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18" },
+  ai = { agent = "claude", agents = { ... }, max_tables = 40, max_result_rows = 100, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18" },
   schema = { ttl_seconds = 3600, exclude = {} },
   completion = { omnifunc = true, keywords = true },
   keymaps = { query = { ... }, results = { ... } },          -- see lua/dbgrid/config.lua

@@ -11,6 +11,14 @@ M.ns = vim.api.nvim_create_namespace("dbgrid.cells")
 M.ns_active = vim.api.nvim_create_namespace("dbgrid.active")
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local RUNNING_LABEL = { run = "running", explain = "planning", ai = "generating", review = "asking" }
+
+---What a running job is doing, for status lines.
+---@param running { kind?: string }
+---@return string
+function M.running_label(running)
+  return RUNNING_LABEL[running.kind] or "running"
+end
 
 ---Map keys (string or list) to a function, buffer-locally.
 ---@param buf integer
@@ -72,10 +80,7 @@ function M.status_chunks(s, cell)
   if running then
     local frame = SPINNER[(s.spinner_frame or 0) % #SPINNER + 1]
     local secs = util.now() - (running.started or util.now())
-    add(
-      string.format(" %s %s %.1fs ", frame, running.kind == "explain" and "planning" or "running", secs),
-      "DbgridStatusRunning"
-    )
+    add(string.format(" %s %s %.1fs ", frame, M.running_label(running), secs), "DbgridStatusRunning")
     return chunks
   end
   if rt.status == "generating" then
@@ -648,6 +653,12 @@ function M.attach(s)
       require("dbgrid.ai").generate(s, cell)
     end
   end, "generate SQL from the cell prompt")
+  map(buf, "n", k.ask, function()
+    local cell = M.current_cell(s)
+    if cell then
+      require("dbgrid.ai").review(s, cell)
+    end
+  end, "ask the agent about the query and its result")
   map(buf, "n", k.tags, function()
     M.edit_tags(s)
   end, "edit notebook tags")
