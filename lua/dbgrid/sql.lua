@@ -620,4 +620,399 @@ function M.strip_semicolon(s)
   return (s:gsub("%s*;%s*$", ""))
 end
 
+---Qualified name (`schema.table`, quoted parts kept as written) starting at token k, or nil.
+---@param tokens dbgrid.Token[]
+---@param k integer
+---@return string? name, integer next
+local function qualified_name(tokens, k)
+  local t = tokens[k]
+  if not t or (t.type ~= "word" and t.type ~= "ident") or (t.type == "word" and CLAUSE_WORDS[t.lower]) then
+    return nil, k
+  end
+  local parts = { t.value }
+  local j = k + 1
+  while tokens[j] and tokens[j].type == "punct" and tokens[j].value == "." do
+    local nxt = tokens[j + 1]
+    if nxt and (nxt.type == "word" or nxt.type == "ident") then
+      parts[#parts + 1] = nxt.value
+      j = j + 2
+    else
+      break
+    end
+  end
+  return table.concat(parts, "."), j
+end
+
+---@param s string
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+---Byte ranges of `:name` parameter references, in order of appearance. A
+---reference is a colon directly followed by an identifier; `::` casts, array
+---slices (`a[1:3]`, `a[i:j]`) and anything inside strings, comments or quoted
+---identifiers do not count. The colon may share an op token with what comes
+---before it (`a=:a`, `b>:b`).
+---@param text string
+---@return { name: string, s: integer, e: integer }[]
+local function param_refs(text)
+  local tokens = M.tokenize(text)
+  local refs = {}
+  for i, t in ipairs(tokens) do
+    local nxt = tokens[i + 1]
+    if
+      t.type == "op"
+      and t.value:sub(-1) == ":"
+      and t.value:sub(-2) ~= "::"
+      and nxt
+      and nxt.type == "word"
+      and nxt.s == t.e + 1
+    then
+      -- the colon of a slice directly follows an identifier or a closing bracket
+      local before = t.e > 1 and text:sub(t.e - 1, t.e - 1) or ""
+      if not before:match("[%w_%]%)]") then
+        refs[#refs + 1] = { name = nxt.value, s = t.e, e = nxt.e }
+      end
+    end
+  end
+  return refs
+end
+
+---Named parameters (`:name`) in the text, unique and in first-occurrence order.
+---@param text string
+---@return string[]
+function M.params(text)
+  local out, seen = {}, {}
+  for _, r in ipairs(param_refs(text)) do
+    if not seen[r.name] then
+      seen[r.name] = true
+      out[#out + 1] = r.name
+    end
+  end
+  return out
+end
+
+---Replace `:name` references (colon included) with `values[name]` verbatim,
+---without quoting. Names without a value stay in place and come back in
+---`missing`, unique and ordered.
+---@param text string
+---@param values table<string, any>
+---@return string new_text, string[] missing
+function M.substitute_params(text, values)
+  values = values or {}
+  local refs = param_refs(text)
+  local missing, seen = {}, {}
+  for _, r in ipairs(refs) do
+    if values[r.name] == nil and not seen[r.name] then
+      seen[r.name] = true
+      missing[#missing + 1] = r.name
+    end
+  end
+  local out = text
+  -- right to left so earlier byte offsets stay valid
+  for i = #refs, 1, -1 do
+    local r = refs[i]
+    local v = values[r.name]
+    if v ~= nil then
+      if type(v) == "userdata" then
+        v = "NULL" -- vim.NIL
+      end
+      out = out:sub(1, r.s - 1) .. tostring(v) .. out:sub(r.e + 1)
+    end
+  end
+  return out, missing
+end
+
+---Index of the first top-level word token from `words` at or after `from`, or nil.
+---@param stmt dbgrid.Statement
+---@param words table<string, boolean>
+---@param from? integer
+---@return integer?
+local function top_level_index(stmt, words, from)
+  for i = from or 1, #stmt.tokens do
+    local t = stmt.tokens[i]
+    if t.depth == 0 and t.type == "word" and words[t.lower] then
+      return i
+    end
+  end
+end
+
+---`SELECT count(*) ...` over the rows an UPDATE / DELETE with a WHERE clause
+---would touch, or nil when the statement is not one (or too unusual to be sure).
+---@param stmt dbgrid.Statement
+---@return string?
+function M.preview_count(stmt)
+  if stmt.kind ~= "update" and stmt.kind ~= "delete" then
+    return nil
+  end
+  local tokens = stmt.tokens
+  local where_idx = top_level_index(stmt, { where = true })
+  if not where_idx then
+    return nil
+  end
+  local where = tokens[where_idx]
+  local after = tokens[where_idx + 1]
+  -- WHERE CURRENT OF cursor cannot be counted
+  if not after or (after.type == "word" and after.lower == "current") then
+    return nil
+  end
+  local target = M.referenced_tables(stmt.sql)[1]
+  if not target then
+    return nil
+  end
+  local from = target.name .. (target.alias and (" " .. target.alias) or "")
+  -- DELETE ... USING <list> / UPDATE ... FROM <list>: the list joins the count
+  local extra = ""
+  local list_word = stmt.kind == "delete" and "using" or "from"
+  local list_idx
+  for i = 2, where_idx - 1 do
+    local t = tokens[i]
+    if t.depth == 0 and t.type == "word" and t.lower == list_word then
+      list_idx = i
+    end
+  end
+  if list_idx then
+    local first = tokens[list_idx + 1]
+    if not first or first == where then
+      return nil
+    end
+    extra = ", " .. trim(stmt.sql:sub(first.s - stmt.s + 1, where.s - stmt.s))
+  end
+  -- WHERE ... up to the end of the statement, minus a trailing RETURNING clause
+  local end_rel = tokens[#tokens].e - stmt.s + 1
+  local returning_idx = top_level_index(stmt, { returning = true }, where_idx + 1)
+  if returning_idx then
+    end_rel = tokens[returning_idx].s - stmt.s
+  end
+  local where_text = trim(stmt.sql:sub(where.s - stmt.s + 1, end_rel))
+  return string.format("SELECT count(*) FROM %s%s %s", from, extra, where_text)
+end
+
+local RETURNING_KINDS = { insert = true, update = true, delete = true, merge = true }
+
+---Append `RETURNING *` to a write statement that has no RETURNING clause.
+---@param stmt dbgrid.Statement
+---@return string sql, boolean applied
+function M.ensure_returning(stmt)
+  if stmt.class ~= "write" or not RETURNING_KINDS[stmt.kind] then
+    return stmt.sql, false
+  end
+  if M.first_top_level_word(stmt, { returning = true }) then
+    return stmt.sql, false
+  end
+  return stmt.sql .. "\nRETURNING *", true
+end
+
+---@class dbgrid.DdlWarningOpts
+---@field table_rows? fun(name: string): integer|nil   row count from the schema cache, nil when unknown
+---@field min_rows? integer   tables below this size get no index-build warning (default 10000)
+---@field lock_timeout? boolean   false when the connection sets no lock_timeout
+
+local TABLE_PREFIX = { only = true, ["if"] = true, ["not"] = true, exists = true, table = true }
+local ADD_CONSTRAINT = {
+  constraint = true,
+  foreign = true,
+  check = true,
+  primary = true,
+  unique = true,
+  exclude = true,
+}
+
+---Plain-sentence warnings about the locks and rewrites a DDL statement implies
+---(also VACUUM FULL, CLUSTER and REINDEX). Empty for anything else.
+---@param stmt dbgrid.Statement
+---@param opts? dbgrid.DdlWarningOpts
+---@return string[]
+function M.ddl_warnings(stmt, opts)
+  opts = opts or {}
+  local min_rows = opts.min_rows or 10000
+  local kind = stmt.kind
+  local out = {}
+  if stmt.class ~= "ddl" and kind ~= "vacuum" and kind ~= "cluster" and kind ~= "reindex" then
+    return out
+  end
+  local tokens = stmt.tokens
+
+  local function add(msg)
+    out[#out + 1] = msg
+  end
+  local function word_at(k)
+    local t = tokens[k]
+    return t and t.type == "word" and t.lower or nil
+  end
+  local function skip(k, words)
+    while tokens[k] and tokens[k].type == "word" and words[tokens[k].lower] do
+      k = k + 1
+    end
+    return k
+  end
+  local function is_paren(k, value)
+    return tokens[k] ~= nil and tokens[k].type == "punct" and tokens[k].value == value
+  end
+  ---" (~N rows)" for a table, plus whether it is known to be small.
+  local function rows_note(tbl)
+    local rows = tbl and opts.table_rows and opts.table_rows(tbl) or nil
+    if rows and rows < min_rows then
+      return "", true
+    end
+    return rows and (" (~" .. require("dbgrid.util").fmt_int(rows) .. " rows)") or "", false
+  end
+  local waits = false -- does the statement wait for a lock on an existing relation?
+
+  local object = word_at(skip(2, { ["or"] = true, replace = true, unique = true }))
+  if kind == "create" and object == "index" then
+    waits = true
+    local on = top_level_index(stmt, { on = true })
+    local tbl = on and qualified_name(tokens, skip(on + 1, { only = true })) or nil
+    if tbl and not M.first_top_level_word(stmt, { concurrently = true }) then
+      local note, small = rows_note(tbl)
+      if not small then
+        add(
+          string.format(
+            "CREATE INDEX without CONCURRENTLY locks writes on %s%s for the whole build; use CREATE INDEX CONCURRENTLY",
+            tbl,
+            note
+          )
+        )
+      end
+    end
+  elseif kind == "create" and object == "trigger" then
+    waits = true
+  elseif kind == "drop" then
+    waits = true
+    if word_at(2) == "index" then
+      local name = qualified_name(tokens, skip(3, { concurrently = true, ["if"] = true, exists = true }))
+      if word_at(3) ~= "concurrently" then
+        add(
+          string.format(
+            "DROP INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on the table of %s; "
+              .. "use DROP INDEX CONCURRENTLY",
+            name or "the index"
+          )
+        )
+      end
+    end
+  elseif kind == "alter" then
+    waits = true
+    if word_at(2) == "table" then
+      local k = skip(3, TABLE_PREFIX)
+      local tbl = qualified_name(tokens, k) or "the table"
+      add(
+        string.format(
+          "ALTER TABLE takes an ACCESS EXCLUSIVE lock on %s; every query on it waits behind this statement",
+          tbl
+        )
+      )
+      local seen = {}
+      local function once(msg)
+        if not seen[msg] then
+          seen[msg] = true
+          add(msg)
+        end
+      end
+      local i = k
+      while i <= #tokens do
+        local t = tokens[i]
+        local w = t.depth == 0 and t.type == "word" and t.lower or nil
+        if w == "type" then
+          once("changing a column type rewrites the whole table")
+        elseif w == "set" and word_at(i + 1) == "not" and word_at(i + 2) == "null" then
+          once("SET NOT NULL scans the whole table unless a matching CHECK constraint exists")
+        elseif w == "add" then
+          -- one ADD action runs up to the next top-level comma
+          local is_constraint = ADD_CONSTRAINT[word_at(i + 1) or ""] == true
+          local needs_validate, not_valid, volatile = false, false, false
+          local j = i + 1
+          while tokens[j] and not (tokens[j].depth == 0 and tokens[j].type == "punct" and tokens[j].value == ",") do
+            local wj = tokens[j].depth == 0 and tokens[j].type == "word" and tokens[j].lower or nil
+            if is_constraint and (wj == "foreign" or wj == "check") then
+              needs_validate = true
+            elseif wj == "not" and word_at(j + 1) == "valid" then
+              not_valid = true
+            elseif not is_constraint and wj == "default" then
+              local d = tokens[j + 1]
+              if d and d.type == "word" and is_paren(j + 2, "(") then
+                volatile = true
+              end
+            end
+            j = j + 1
+          end
+          if needs_validate and not not_valid then
+            once("validate the constraint separately: ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT")
+          end
+          if volatile then
+            once("a volatile default rewrites the table; add the column first, then backfill")
+          end
+          i = j - 1
+        end
+        i = i + 1
+      end
+    end
+  elseif kind == "truncate" then
+    waits = true
+    local tbl = qualified_name(tokens, skip(2, TABLE_PREFIX))
+    add(string.format("TRUNCATE takes an ACCESS EXCLUSIVE lock on %s and cannot be undone", tbl or "the table"))
+  elseif kind == "vacuum" then
+    local full = word_at(2) == "full"
+    local k
+    if is_paren(2, "(") then
+      -- option list: VACUUM (FULL, ANALYZE) t
+      k = 3
+      while tokens[k] and not is_paren(k, ")") do
+        if tokens[k].type == "word" and tokens[k].lower == "full" then
+          local v = tokens[k + 1]
+          full = not (v and (v.lower == "false" or v.lower == "off" or v.value == "0"))
+        end
+        k = k + 1
+      end
+      k = k + 1
+    else
+      k = skip(2, { full = true, freeze = true, verbose = true, analyze = true })
+    end
+    if full then
+      local tbl = qualified_name(tokens, k)
+      add(
+        tbl and string.format("VACUUM FULL rewrites %s and locks the table for the whole run", tbl)
+          or "VACUUM FULL rewrites every table and locks each one for the whole run"
+      )
+    end
+  elseif kind == "cluster" then
+    waits = true
+    local tbl = qualified_name(tokens, skip(2, { verbose = true }))
+    add(
+      tbl and string.format("CLUSTER rewrites %s and locks the table for the whole run", tbl)
+        or "CLUSTER rewrites every clustered table and locks each one for the whole run"
+    )
+  elseif kind == "reindex" then
+    waits = true
+    local k = 2
+    if is_paren(2, "(") then
+      while tokens[k] and not is_paren(k, ")") do
+        k = k + 1
+      end
+      k = k + 1
+    end
+    local what = word_at(k) or "index"
+    local concurrently = word_at(k + 1) == "concurrently"
+    local name = qualified_name(tokens, skip(k + 1, { concurrently = true }))
+    if not concurrently then
+      add(
+        string.format(
+          "REINDEX without CONCURRENTLY locks %s %s for the whole run; use REINDEX %s CONCURRENTLY",
+          what,
+          name or "",
+          what:upper()
+        )
+      )
+    end
+  end
+  if opts.lock_timeout == false and stmt.class == "ddl" and waits then
+    add(
+      "no lock_timeout is set on this connection; if this DDL waits for a lock, everything behind it waits too "
+        .. "(set lock_timeout_ms on the connection)"
+    )
+  end
+  return out
+end
+
 return M

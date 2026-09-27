@@ -218,6 +218,44 @@ function M.directives(cell)
   return out
 end
 
+---`-- @param name` / `-- @param name = default` declarations of a cell, in order.
+---@param cell dbgrid.Cell
+---@return { name: string, default: string? }[]
+function M.params(cell)
+  local out = {}
+  for _, l in ipairs(cell.lines) do
+    local rest = l:match("^%s*%-%-%s*@param%s+(.-)%s*$")
+    if rest then
+      local name, value = rest:match("^([%w_]+)%s*=%s*(.-)%s*$")
+      if not name then
+        name = rest:match("^([%w_]+)%s*$")
+      end
+      if name then
+        out[#out + 1] = { name = name, default = value ~= "" and value or nil }
+      end
+    end
+  end
+  return out
+end
+
+---Parse an `@every` interval ("5s", "2m", "500ms", "1h") into milliseconds.
+---@param value string|boolean|nil
+---@return integer? ms
+function M.interval_ms(value)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local n, unit = value:match("^%s*(%d+%.?%d*)%s*(%a*)%s*$")
+  if not n then
+    return nil
+  end
+  local mult = ({ [""] = 1000, s = 1000, sec = 1000, ms = 1, m = 60000, min = 60000, h = 3600000 })[unit:lower()]
+  if not mult then
+    return nil
+  end
+  return math.floor(tonumber(n) * mult)
+end
+
 ---Stable hash of the executable text (whitespace-insensitive).
 ---@param cell dbgrid.Cell
 function M.hash(cell)
