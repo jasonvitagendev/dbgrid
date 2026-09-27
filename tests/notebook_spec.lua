@@ -311,7 +311,8 @@ H.describe("saved connection edit / remove", function()
     end)
     H.eq(again, first, "cached")
     connections.open_file()
-    H.eq(vim.api.nvim_buf_get_name(0), saved_file)
+    -- resolve both: on macOS the temp dir sits behind the /var -> /private/var symlink
+    H.eq(vim.fn.resolve(vim.api.nvim_buf_get_name(0)), vim.fn.resolve(saved_file))
     vim.cmd("silent write")
     local fresh
     connections.resolve(connections.get("plain"), function(c)

@@ -1290,7 +1290,14 @@ H.describe("aws health", function()
         msgs[#msgs + 1] = level .. ": " .. msg
       end
     end
+    -- the plugin lookup goes through PATH; a PATH with only python3 (the fake cli's interpreter) hides the real one
+    local bin = tmp .. "/health-bin"
+    vim.fn.mkdir(bin, "p")
+    vim.loop.fs_symlink(vim.fn.exepath("python3"), bin .. "/python3")
+    local path = vim.env.PATH
+    vim.env.PATH = bin
     aws.health({ ok = collect("ok"), warn = collect("warn"), error = collect("error"), info = collect("info") })
+    vim.env.PATH = path
     local text = table.concat(msgs, "\n")
     H.matches(text, "ok: aws CLI: aws%-cli/2%.17%.0")
     H.matches(text, "warn: session%-manager%-plugin not found")

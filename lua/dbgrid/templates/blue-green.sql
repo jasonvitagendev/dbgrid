@@ -209,33 +209,7 @@ order by 1, 2;
 -- %% green accepts writes
 -- @conn green
 -- After switchover both must be off / false: transactions default to read-write and the server is not in recovery.
--- If default_transaction_read_only is still on, an ALTER DATABASE ... SET from the blue-side lockdown is still in place.
+-- If default_transaction_read_only is still on, an ALTER DATABASE ... SET from a pre-switchover lockdown is still in place.
 show default_transaction_read_only;
 
 select pg_is_in_recovery() as in_recovery;
-
--- %% make blue read-only
--- @conn blue
--- @param database
--- @param app_user
--- Run right before switchover so stragglers fail loudly instead of writing to the old primary: new transactions on the
--- database default to read-only, then every session of the application role is terminated so it reconnects and picks up
--- the new default. database is a bare identifier, app_user a quoted literal like 'app'. The notebook asks for confirmation
--- because this is a write; undo with the next cell. Terminating other roles' sessions needs pg_signal_backend or rds_superuser.
-alter database :database set default_transaction_read_only = on;
-
-select pg_terminate_backend(a.pid) as terminated,
-       a.pid,
-       a.usename,
-       a.application_name,
-       a.client_addr
-from pg_stat_activity a
-where a.backend_type = 'client backend'
-  and a.usename = :app_user
-  and a.pid <> pg_backend_pid();
-
--- %% undo: make blue writable again
--- @conn blue
--- @param database
--- Reverts the lockdown above (for a rolled-back switchover); sessions must reconnect to see the change.
-alter database :database reset default_transaction_read_only;

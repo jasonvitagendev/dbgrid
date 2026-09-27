@@ -393,9 +393,9 @@ project store; `:Dbgrid templates` picks one. Two ship:
   cells cover slot lag, sender and subscription state, writes in flight, rows
   written since the last tick, application sessions, long transactions,
   tables without replica identity, row counts and sequence values on both
-  sides, whether green accepts writes, and a write cell that makes blue
-  read-only before switchover. `:Dbgrid schema diff blue green` covers the
-  DDL gap, since logical replication carries none.
+  sides, and whether green accepts writes. Every cell only reads, so the
+  notebook is safe to leave running against production. `:Dbgrid schema diff
+  blue green` covers the DDL gap, since logical replication carries none.
 
 Your own templates go in `templates.dir`; a template is a notebook file with
 a `-- template-name:` / `-- template-tags:` / `-- template-description:` /

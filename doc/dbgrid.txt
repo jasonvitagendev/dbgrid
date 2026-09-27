@@ -346,8 +346,8 @@ cache hit ratio, sizes, connections, wraparound, temp files, replica lag,
 replication, settings, extensions, locks on a table, cancel a backend.
 Blue-green: slot lag, sender and subscription state, writes in flight, rows
 written, application sessions, long transactions, tables without replica
-identity, row counts and sequences on both sides, green accepts writes, make
-blue read-only. Cells with `-- @conn blue|green` are bound to the
+identity, row counts and sequences on both sides, green accepts writes; every
+cell is read-only. Cells with `-- @conn blue|green` are bound to the
 connections you pick. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
 `-- template-connections:`).

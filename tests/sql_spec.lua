@@ -159,3 +159,15 @@ H.describe("sql.placeholders", function()
     )
   end)
 end)
+
+H.describe("bundled templates", function()
+  H.it("blue-green only reads", function()
+    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+    local text = require("dbgrid.util").read_file(root .. "/lua/dbgrid/templates/blue-green.sql")
+    local stmts = sql.split(text)
+    H.truthy(#stmts > 10)
+    for _, st in ipairs(stmts) do
+      H.eq(st.class, "read", st.kind)
+    end
+  end)
+end)
