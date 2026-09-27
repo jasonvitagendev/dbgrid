@@ -517,7 +517,7 @@ H.describe("aws resolve", function()
     local _, err = sync(function(cb)
       aws.resolve({ name = "x", aws = { profile = "prod" } }, cb)
     end)
-    H.matches(err, "needs `cluster` or `instance`")
+    H.matches(err, "needs `cluster`, `instance`, `host` or a `secret`")
     _, err = sync(function(cb)
       aws.resolve({ name = "x" }, cb)
     end)
@@ -1098,6 +1098,179 @@ H.describe("aws database name", function()
     H.matches(db_prompt.prompt, "the secret names none")
     H.eq(db_prompt.default, "dbgrid_test")
     H.eq(#input_prompts, 4)
+  end)
+end)
+
+H.describe("aws by host", function()
+  local vpce = "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com"
+
+  H.it("takes host, read_host and port from the block without describing anything", function()
+    local describes = log_count("rds describe-db-")
+    local a = { profile = "prod", region = "ap-southeast-2", host = "db-w.example", read_host = "db-r.example" }
+    a.port = "5433"
+    local info, err = sync(function(cb)
+      aws.endpoints(a, cb)
+    end)
+    H.eq(err, nil)
+    H.eq(info.kind, "host")
+    H.eq(info.writer, { host = "db-w.example", port = 5433 })
+    H.eq(info.reader, { host = "db-r.example", port = 5433 })
+    H.eq(log_count("rds describe-db-"), describes)
+    H.eq(aws.cached_endpoints(a).writer.host, "db-w.example")
+    H.eq(aws.pick_endpoint(info, "reader").host, "db-r.example")
+    local names = vim.tbl_map(function(c)
+      return c.name
+    end, aws.expand({ name = "byhost", aws = a }, nil))
+    H.eq(names, { "byhost/writer", "byhost/reader" })
+    -- the same host for reads is no reader
+    local same = { profile = "prod", host = "db.example", read_host = "db.example" }
+    H.eq(
+      sync(function(cb)
+        aws.endpoints(same, cb)
+      end).reader,
+      nil
+    )
+    H.eq(#aws.expand({ name = "same", aws = same }, nil), 1)
+    -- nothing that names the database
+    local _, e = sync(function(cb)
+      aws.endpoints({ profile = "prod" }, cb)
+    end)
+    H.matches(e, "needs `cluster`, `instance`, `host` or a `secret`")
+  end)
+
+  H.it("takes the hosts, port and database from the secret and reads it once", function()
+    local reads = log_count("get-secret-value --secret-id prod/link")
+    local a = { profile = "prod", region = "ap-southeast-2", secret = "prod/link", bastion = "i-0123456789abcdef0" }
+    local info, err = sync(function(cb)
+      aws.endpoints(a, cb)
+    end)
+    H.eq(err, nil)
+    H.eq(info.writer.host, vpce)
+    H.eq(info.reader, nil, "hostRead equals hostWrite")
+    H.eq(#aws.expand({ name = "link", aws = a }, aws.cached_endpoints(a)), 1)
+    local creds, cerr = sync(function(cb)
+      aws.credentials(a, info, cb)
+    end)
+    H.eq(cerr, nil)
+    H.eq(creds.username, "je_next_user")
+    H.eq(creds.dbname, "jobs")
+    H.eq(log_count("get-secret-value --secret-id prod/link"), reads + 1, "endpoints and credentials share one read")
+    -- end to end: the tunnel targets the PrivateLink host through the bastion
+    local conn = { name = "link", url = "aws://prod/link", ssl = "disable", aws = a }
+    local eff, rerr = sync(function(cb)
+      aws.resolve(conn, cb)
+    end)
+    H.eq(rerr, nil)
+    H.matches(eff.url, "^postgres://je_next_user@" .. vpce:gsub("%-", "%%-"):gsub("%.", "%%.") .. ":%d+/jobs%?")
+    H.matches(eff.url, "hostaddr=127.0.0.1&port=%d+")
+    H.eq(eff.env.PGPASSWORD, "pw")
+    H.eq(eff.tunnel_key, "ssm|prod|i-0123456789abcdef0|" .. vpce .. ":" .. tostring(eff.port))
+    -- a secret without a host is a plain error
+    local _, herr = sync(function(cb)
+      aws.endpoints({ profile = "prod", region = "ap-southeast-2", secret = "prod/nodb" }, cb)
+    end)
+    H.matches(herr, "names no host; set `host`")
+    -- the RDS views need a describable database
+    local _, _, verr = sync(function(cb)
+      aws.status(conn, cb)
+    end)
+    H.matches(verr, "needs `cluster` or `instance`.*reached by host")
+    H.matches(require("dbgrid.connections").describe(conn), "aws prod secret prod/link via i%-0123456789abcdef0")
+    aws.forget_credentials(a)
+    local _, cerr2 = sync(function(cb)
+      aws.credentials(a, info, cb)
+    end)
+    H.eq(cerr2, nil)
+    H.eq(log_count("get-secret-value --secret-id prod/link"), reads + 2, "forget_credentials drops the cached secret")
+  end)
+
+  H.it("add offers a database reached by host and fills it from the secret", function()
+    local input_prompts, select_prompts = {}, {}
+    local orig_select, orig_input = vim.ui.select, vim.ui.input
+    vim.ui.select = function(items, opts, on_choice)
+      select_prompts[#select_prompts + 1] = opts.prompt
+      local pick = items[1]
+      for _, item in ipairs(items) do
+        if opts.format_item then
+          opts.format_item(item)
+        end
+        if item == "prod" or (type(item) == "table" and item.kind == "host") then
+          pick = item
+        end
+      end
+      vim.schedule(function()
+        on_choice(pick, 1)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      input_prompts[#input_prompts + 1] = opts
+      local answer = opts.default
+      if opts.prompt:find("^Secrets Manager") then
+        answer = "prod/link"
+      end
+      vim.schedule(function()
+        on_confirm(answer or "")
+      end)
+    end
+    local conn = sync(function(cb)
+      aws.add_interactive(cb)
+    end)
+    vim.ui.select, vim.ui.input = orig_select, orig_input
+    H.truthy(conn, "no connection returned")
+    H.eq(conn.name, "jobs", "named after the database in the secret")
+    H.eq(conn.url, "aws://prod/" .. vpce)
+    H.eq(conn.aws.secret, "prod/link")
+    H.eq(conn.aws.host, nil, "the host stays in the secret")
+    H.eq(conn.aws.cluster, nil)
+    H.eq(conn.aws.database, nil, "the secret names the database")
+    H.eq(conn.aws.bastion, "i-0bastion")
+    H.eq(select_prompts, { "AWS profile", "RDS cluster / instance" })
+    local prompts = vim.tbl_map(function(o)
+      return o.prompt:match("^(%a+)")
+    end, input_prompts)
+    H.eq(prompts, { "AWS", "Secrets", "Connection" })
+  end)
+
+  H.it("add asks for host and database when the secret has neither", function()
+    local input_prompts = {}
+    local orig_select, orig_input = vim.ui.select, vim.ui.input
+    vim.ui.select = function(items, opts, on_choice)
+      local pick = items[1]
+      for _, item in ipairs(items) do
+        if item == "prod" or (type(item) == "table" and item.kind == "host") then
+          pick = item
+        end
+      end
+      vim.schedule(function()
+        on_choice(pick, 1)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      input_prompts[#input_prompts + 1] = opts
+      local answer = opts.default
+      if opts.prompt:find("^Secrets Manager") then
+        answer = "prod/nodb"
+      elseif opts.prompt:find("^Database host") then
+        answer = "db.other-account.internal"
+      elseif opts.prompt:find("^Connection name") then
+        answer = "other"
+      end
+      vim.schedule(function()
+        on_confirm(answer or "")
+      end)
+    end
+    local conn = sync(function(cb)
+      aws.add_interactive(cb)
+    end)
+    vim.ui.select, vim.ui.input = orig_select, orig_input
+    H.truthy(conn, "no connection returned")
+    H.eq(conn.aws.host, "db.other-account.internal")
+    H.eq(conn.aws.database, "postgres", "asked, prefilled with postgres")
+    H.eq(conn.aws.secret, "prod/nodb")
+    local prompts = vim.tbl_map(function(o)
+      return o.prompt:match("^(%a+ ?%a*)")
+    end, input_prompts)
+    H.eq(prompts, { "AWS region", "Secrets Manager", "Database host", "Database ", "Connection name" })
   end)
 end)
 

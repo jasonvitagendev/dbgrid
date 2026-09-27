@@ -389,8 +389,15 @@ takes the online instance whose name contains one of `aws.bastion_names`
 to list SSM instances the running EC2 instances are offered by name; when
 neither listing works the instance id is asked for, and the prompt says why.
 
+A database in another account reached through a VPC endpoint has nothing to
+describe: leave out `cluster` / `instance` and give `secret` (its `hostWrite`,
+`hostRead`, `port` and `db` are used) or `host` / `read_host` / `port`. The
+tunnel, credentials, writer/reader entries and health checks work as usual;
+`aws status`, `aws events` and `aws bluegreen` need a describable database.
+
 `:Dbgrid aws add` builds an entry interactively (the bastion is picked from
-the SSM-managed instances; one clear jumpbox is taken without asking);
+the SSM-managed instances; one clear jumpbox is taken without asking; the
+last entry of the cluster list reaches a database by host name);
 `aws login`, `aws refresh`,
 `aws tunnels`, `aws status` (status, version, maintenance, five CloudWatch
 metrics), `aws events` (last day), `aws bluegreen` (deployments and

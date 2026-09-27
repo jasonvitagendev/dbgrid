@@ -741,7 +741,7 @@ function M.describe(conn)
     parts[#parts + 1] = string.format(
       "aws %s %s%s",
       a.profile or "default",
-      a.cluster or a.instance or "?",
+      a.cluster or a.instance or a.host or (a.secret and ("secret " .. a.secret)) or "?",
       a.bastion and (" via " .. a.bastion) or ""
     )
   else

@@ -13,6 +13,9 @@ local M = {}
 ---@field region? string
 ---@field cluster? string                Aurora cluster identifier (or `instance`)
 ---@field instance? string               RDS instance identifier
+---@field host? string                   reach the database at this host instead (PrivateLink endpoint, another account); no describe calls
+---@field read_host? string              reader host of a `host` connection
+---@field port? integer|string           port of a `host` connection (default: the secret's, else 5432)
 ---@field bastion? string                SSM target: an instance id, the Name tag of one, or "auto"; nil = connect directly
 ---@field secret? string                 Secrets Manager id/ARN (default: the RDS managed master secret)
 ---@field auth? "secret"|"iam"
@@ -84,7 +87,13 @@ end
 
 ---@param aws_cfg dbgrid.AwsConfig
 local function id_of(aws_cfg)
-  return aws_cfg.cluster or aws_cfg.instance
+  return aws_cfg.cluster or aws_cfg.instance or aws_cfg.host or aws_cfg.secret
+end
+
+---Is the database reached by host name rather than through describe-db-*?
+---@param aws_cfg dbgrid.AwsConfig
+local function by_host(aws_cfg)
+  return not aws_cfg.cluster and not aws_cfg.instance
 end
 
 ---Key of the endpoint / credential caches.
@@ -531,10 +540,11 @@ function M.expand(conn, info)
   local readers
   if a.cluster then
     readers = (info and info.reader == nil) and 0 or 1
-  elseif info then
-    readers = #(info.replica_endpoints or info.replicas or {})
+  elseif a.instance then
+    readers = info and #(info.replica_endpoints or info.replicas or {}) or 1
   else
-    readers = 1
+    -- reached by host: a reader only when a distinct read host is known (block or cached secret)
+    readers = ((a.read_host and a.read_host ~= a.host) or (info and info.reader)) and 1 or 0
   end
   for n = 1, readers do
     out[#out + 1] = entry(n == 1 and "reader" or ("reader-" .. n), true)
@@ -846,13 +856,16 @@ function M.endpoints(aws_cfg, cb, opts)
   opts = opts or {}
   local id = id_of(aws_cfg)
   if not id then
-    return cb(nil, "the aws block of the connection needs `cluster` or `instance`")
+    return cb(nil, "the aws block of the connection needs `cluster`, `instance`, `host` or a `secret` naming the host")
   end
   if not opts.force then
     local cached = M.cached_endpoints(aws_cfg)
     if cached then
       return cb(cached)
     end
+  end
+  if by_host(aws_cfg) then
+    return M.host_endpoints(aws_cfg, cb)
   end
   if aws_cfg.cluster then
     M.cli(aws_cfg, { "rds", "describe-db-clusters", "--db-cluster-identifier", aws_cfg.cluster }, function(res)
@@ -910,6 +923,42 @@ function M.endpoints(aws_cfg, cb, opts)
   end)
 end
 
+---Endpoints of a database reached by host: `host` / `read_host` / `port` of
+---the aws block, else `hostWrite` / `hostRead` / `port` of the secret. No RDS
+---describe call; cached like described endpoints so the picker knows about the reader.
+---@param aws_cfg dbgrid.AwsConfig
+---@param cb fun(info?: table, err?: string)
+function M.host_endpoints(aws_cfg, cb)
+  local function finish(host, read_host, port)
+    local info = {
+      kind = "host",
+      id = host,
+      status = "reached by host",
+      writer = { host = host, port = port },
+      reader = (read_host and read_host ~= host) and { host = read_host, port = port } or nil,
+      members = {},
+    }
+    store_endpoints(aws_cfg, info)
+    cb(info)
+  end
+  local port = tonumber(aws_cfg.port)
+  if aws_cfg.host then
+    return finish(aws_cfg.host, aws_cfg.read_host, port or 5432)
+  end
+  if not aws_cfg.secret then
+    return cb(nil, "the aws block of the connection needs `cluster`, `instance`, `host` or a `secret` naming the host")
+  end
+  M.secret(aws_cfg, aws_cfg.secret, function(secret, err)
+    if not secret then
+      return cb(nil, err)
+    end
+    if not secret.host then
+      return cb(nil, "secret " .. aws_cfg.secret .. " names no host; set `host` in the aws block of the connection")
+    end
+    finish(secret.host, aws_cfg.read_host or secret.read_host, port or secret.port or 5432)
+  end)
+end
+
 ---The endpoint a role connects to.
 ---@param info table
 ---@param role string   "writer" | "reader" | "reader-N"
@@ -936,6 +985,7 @@ end
 -- Credentials -----------------------------------------------------------------
 
 local creds_cache = {} ---@type table<string, dbgrid.AwsCreds>
+local secret_cache = {} ---@type table<string, table>   parsed secrets, per profile/region/secret id
 
 ---@param aws_cfg dbgrid.AwsConfig
 ---@param endpoint? dbgrid.AwsEndpoint
@@ -946,11 +996,35 @@ end
 ---@param aws_cfg dbgrid.AwsConfig
 function M.forget_credentials(aws_cfg)
   local prefix = cache_key(aws_cfg) .. "|"
-  for k in pairs(creds_cache) do
-    if k:sub(1, #prefix) == prefix then
-      creds_cache[k] = nil
+  for _, cache in ipairs({ creds_cache, secret_cache }) do
+    for k in pairs(cache) do
+      if k:sub(1, #prefix) == prefix then
+        cache[k] = nil
+      end
     end
   end
+end
+
+---Read and parse a Secrets Manager secret, once per session (see forget_credentials).
+---@param aws_cfg dbgrid.AwsConfig
+---@param secret_id string
+---@param cb fun(secret?: table, err?: string)
+function M.secret(aws_cfg, secret_id, cb)
+  local key = cache_key(aws_cfg) .. "|secret|" .. secret_id
+  if secret_cache[key] then
+    return cb(secret_cache[key])
+  end
+  M.cli(aws_cfg, { "secretsmanager", "get-secret-value", "--secret-id", secret_id }, function(res)
+    if not res.ok then
+      return cb(nil, cli_error(aws_cfg, "reading secret " .. secret_id, res))
+    end
+    local secret, err = M.parse_secret(res.json or res.stdout)
+    if not secret then
+      return cb(nil, err)
+    end
+    secret_cache[key] = secret
+    cb(secret)
+  end)
 end
 
 ---Database credentials: the Secrets Manager secret, or an IAM auth token.
@@ -1006,11 +1080,7 @@ function M.credentials(aws_cfg, info, cb, endpoint)
   if not secret_id then
     return cb(nil, "no secret configured and RDS does not manage the master password")
   end
-  M.cli(aws_cfg, { "secretsmanager", "get-secret-value", "--secret-id", secret_id }, function(res)
-    if not res.ok then
-      return cb(nil, cli_error(aws_cfg, "reading secret " .. secret_id, res))
-    end
-    local secret, err = M.parse_secret(res.json or res.stdout)
+  M.secret(aws_cfg, secret_id, function(secret, err)
     if not secret then
       return cb(nil, err)
     end
@@ -1284,8 +1354,9 @@ local function aws_of(conn)
   if type(conn) ~= "table" or type(conn.aws) ~= "table" then
     return nil, "connection " .. tostring(conn and conn.name) .. " has no aws block"
   end
-  if not id_of(conn.aws) then
-    return nil, "the aws block of the connection needs `cluster` or `instance`"
+  if by_host(conn.aws) then
+    return nil,
+      "this view needs `cluster` or `instance` in the aws block; " .. tostring(conn.name) .. " is reached by host"
   end
   return conn.aws
 end
@@ -1560,7 +1631,13 @@ function M.edit_interactive(conn, cb)
       local prompt = "Database (empty = the secret's dbname, else the cluster's initial database, else postgres): "
       ask(prompt, a.database, function(database)
         a.database = database
-        cb(true)
+        if not a.host then
+          return cb(true)
+        end
+        ask("Database host: ", a.host, function(host)
+          a.host = host or a.host
+          cb(true)
+        end)
       end)
     end)
   end)
@@ -1580,8 +1657,7 @@ local function pick_database_name(aws_cfg, info, next_step)
   if not secret_id then
     return prompt("no secret to read it from")
   end
-  M.cli(aws_cfg, { "secretsmanager", "get-secret-value", "--secret-id", secret_id }, function(res)
-    local secret = res.ok and M.parse_secret(res.json or res.stdout) or nil
+  M.secret(aws_cfg, secret_id, function(secret)
     if secret and secret.dbname then
       return next_step(nil)
     end
@@ -1664,16 +1740,79 @@ function M.add_interactive(cb)
         }
       end
       if #items == 0 then
-        util.error("dbgrid: no RDS clusters or instances found for profile " .. profile_of(aws_cfg))
-        return next_step(nil)
+        util.warn("dbgrid: no RDS clusters or instances visible to profile " .. profile_of(aws_cfg))
       end
+      items[#items + 1] = { kind = "host", id = "by host", raw = {} }
       vim.ui.select(items, {
         prompt = "RDS cluster / instance",
         format_item = function(item)
+          if item.kind == "host" then
+            return "other: reach the database by host name (PrivateLink endpoint, another account)"
+          end
           local status = nz(item.raw.Status) or nz(item.raw.DBInstanceStatus) or ""
           return item.kind .. " " .. item.id .. "  " .. status
         end,
       }, next_step)
+    end)
+  end
+  ---Finish a connection: bastion, database (when the secret names none) and name, then save.
+  ---@param aws_cfg dbgrid.AwsConfig
+  ---@param info? table
+  ---@param hints table   pick_bastion hints
+  ---@param id string     what the url and the default name are built from
+  local function finish(aws_cfg, info, hints, id, default_name)
+    M.pick_bastion(aws_cfg, hints, function(bastion, cancelled)
+      if cancelled then
+        return cancel()
+      end
+      aws_cfg.bastion = bastion
+      pick_database_name(aws_cfg, info, function(database)
+        aws_cfg.database = database
+        ask("Connection name: ", default_name or id, function(name)
+          if not name then
+            return cancel()
+          end
+          local conn = {
+            name = name,
+            url = "aws://" .. profile_of(aws_cfg) .. "/" .. id,
+            adapter = "postgres",
+            aws = aws_cfg,
+            ssl = cfg().ssl or "require",
+          }
+          require("dbgrid.connections").save(conn, "global")
+          util.notify("dbgrid: saved aws connection " .. name)
+          cb(conn)
+        end)
+      end)
+    end)
+  end
+  ---A database reached by host: the secret carries host / port / db, or they are asked.
+  ---@param aws_cfg dbgrid.AwsConfig
+  local function add_by_host(aws_cfg)
+    ask("Secrets Manager secret (id or ARN) with the database credentials: ", nil, function(secret_id)
+      if not secret_id then
+        return cancel()
+      end
+      aws_cfg.secret = secret_id
+      aws_cfg.auth = "secret"
+      M.secret(aws_cfg, secret_id, function(secret, err)
+        if not secret then
+          util.warn("dbgrid: " .. tostring(err))
+        end
+        local function with_host(host)
+          if not host then
+            return cancel()
+          end
+          if not (secret and secret.host == host) then
+            aws_cfg.host = host -- not in the secret: keep it in the block
+          end
+          finish(aws_cfg, nil, {}, host, secret and secret.dbname or nil)
+        end
+        if secret and secret.host then
+          return with_host(secret.host)
+        end
+        ask("Database host (as reachable from the bastion): ", nil, with_host)
+      end)
     end)
   end
   pick_profile(function(profile)
@@ -1687,44 +1826,24 @@ function M.add_interactive(cb)
         if not item then
           return cancel()
         end
+        if item.kind == "host" then
+          return add_by_host(aws_cfg)
+        end
         aws_cfg[item.kind] = item.id
         local info = item.kind == "cluster" and M.parse_cluster({ DBClusters = { item.raw } })
           or M.parse_instance({ DBInstances = { item.raw } })
         if info then
           store_endpoints(aws_cfg, info)
         end
-        M.pick_bastion(aws_cfg, { vpc = item.vpc, public = item.public }, function(bastion, cancelled)
-          if cancelled then
-            return cancel()
+        local managed = info and info.secret_arn or nil
+        ask("Secrets Manager secret (id or ARN): ", managed, function(secret)
+          if secret and secret ~= managed then
+            aws_cfg.secret = secret
+          elseif not managed then
+            util.warn("dbgrid: no secret given; set aws.secret (or aws.auth = \"iam\") before connecting")
           end
-          aws_cfg.bastion = bastion
-          local managed = info and info.secret_arn or nil
-          ask("Secrets Manager secret (id or ARN): ", managed, function(secret)
-            if secret and secret ~= managed then
-              aws_cfg.secret = secret
-            elseif not managed then
-              util.warn("dbgrid: no secret given; set aws.secret (or aws.auth = \"iam\") before connecting")
-            end
-            aws_cfg.auth = "secret"
-            pick_database_name(aws_cfg, info, function(database)
-              aws_cfg.database = database
-              ask("Connection name: ", item.id, function(name)
-                if not name then
-                  return cancel()
-                end
-                local conn = {
-                  name = name,
-                  url = "aws://" .. profile .. "/" .. item.id,
-                  adapter = "postgres",
-                  aws = aws_cfg,
-                  ssl = cfg().ssl or "require",
-                }
-                require("dbgrid.connections").save(conn, "global")
-                util.notify("dbgrid: saved aws connection " .. name)
-                cb(conn)
-              end)
-            end)
-          end)
+          aws_cfg.auth = "secret"
+          finish(aws_cfg, info, { vpc = item.vpc, public = item.public }, item.id)
         end)
       end)
     end)
@@ -1776,7 +1895,7 @@ function M.health(report)
     local a = c.aws
     local label = c.name .. " (" .. profile_of(a) .. "/" .. tostring(id_of(a) or "?") .. ")"
     if not id_of(a) then
-      report.error(label .. ": the aws block needs `cluster` or `instance`")
+      report.error(label .. ": the aws block needs `cluster`, `instance`, `host` or a `secret` naming the host")
     else
       local info, fetched_at = M.cached_endpoints(a)
       if info then

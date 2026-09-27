@@ -282,6 +282,26 @@ maintenance, five CloudWatch metrics over the last five minutes), `aws events`
 switchover status). `:checkhealth dbgrid` reports the CLI, the Session
 Manager plugin, the caller identity per profile and every tunnel.
 
+### A database reached by host (PrivateLink, another account)
+
+```lua
+{ name = "jobs", aws = { profile = "dev-privileged", region = "ap-southeast-2",
+                         secret = "jobs/db", bastion = "bastion-dev" } }
+```
+
+When the RDS lives in another account and is reached through a VPC endpoint,
+there is nothing to describe: leave out `cluster` / `instance` and the plugin
+takes the host from the secret (`hostWrite`, `hostRead`, `port`, `db`) or from
+`host` / `read_host` / `port` in the aws block, and forwards to it through the
+bastion. The secret is read once per session for both the endpoints and the
+credentials. Everything else works as for a cluster: the SSM tunnel, expired
+credentials, `writer` and a `reader` when the read host differs, `aws
+tunnels`, `:checkhealth`. `aws status`, `aws events` and `aws bluegreen` need
+a describable `cluster` or `instance` and say so. `:Dbgrid aws add` offers
+this as the last entry of the cluster list ("reach the database by host
+name"); host and database are asked for only when the secret does not carry
+them.
+
 ### Tunnels
 
 ```lua

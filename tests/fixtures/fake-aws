@@ -252,6 +252,11 @@ def main():
         if "nodb" in sid:
             # an RDS-managed master secret: username and password only
             secret = {"username": "postgres", "password": "x"}
+        if "link" in sid:
+            # a hand-written secret for a database behind a PrivateLink endpoint
+            secret = {"port": str(db_port()), "hostWrite": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
+                      "hostRead": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
+                      "password": "pw", "db": "jobs", "username": "je_next_user"}
         out({
             "ARN": sid if sid.startswith("arn:") else SECRET_ARN,
             "Name": "rds!cluster-3f2c1a6e-app-prod",
