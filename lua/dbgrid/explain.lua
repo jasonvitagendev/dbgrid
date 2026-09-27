@@ -45,12 +45,15 @@ local function filter_columns(filter, columns)
   return found
 end
 
----@param plan table   decoded EXPLAIN JSON (an array with one {Plan=...} element)
+---@param plan table   decoded EXPLAIN JSON (an array with one {Plan=...} element), or a SQLite plan
 ---@param schema? table  schema cache (dbgrid.schema.Data) for row counts and columns
----@param opts { min_rows: integer }
+---@param opts { min_rows: integer, sql?: string }
 ---@return dbgrid.PlanWarning[]
 function M.warnings(plan, schema, opts)
   opts = opts or { min_rows = 10000 }
+  if type(plan) == "table" and plan.sqlite then
+    return M.sqlite_warnings(plan, schema, opts)
+  end
   local root = type(plan) == "table" and plan[1] and plan[1].Plan or (plan and plan.Plan)
   if not root then
     return {}
@@ -91,7 +94,7 @@ function M.warnings(plan, schema, opts)
     end
     local name = (
       node.Schema and (node.Schema .. ".")
-      or (table_info and table_info.schema ~= "public" and (table_info.schema .. "."))
+      or (table_info and not require("dbgrid.schema").is_default_schema(table_info.schema) and (table_info.schema .. "."))
       or ""
     ) .. rel
     local cols = {}
@@ -152,6 +155,369 @@ function M.total_cost(plan)
   return root and root["Total Cost"] or nil
 end
 
+---Warnings for a SQLite `EXPLAIN QUERY PLAN` tree: a full table scan
+---("SCAN t" without an index) on a big table that the statement filters.
+---@param plan { sqlite: boolean, nodes: { depth: integer, detail: string }[] }
+---@param schema? table
+---@param opts { min_rows: integer, sql?: string }
+---@return dbgrid.PlanWarning[]
+function M.sqlite_warnings(plan, schema, opts)
+  local out, seen = {}, {}
+  for _, node in ipairs(plan.nodes or {}) do
+    local rel = node.detail:match('^SCAN ([%w_"]+)$') or node.detail:match('^SCAN ([%w_"]+) AS')
+    if rel and not node.detail:find("USING", 1, true) and not seen[rel] then
+      seen[rel] = true
+      local table_info = schema and require("dbgrid.schema").find_table(schema, rel)
+      local rows = table_info and table_info.rows or 0
+      if rows >= (opts.min_rows or 0) then
+        local cols = {}
+        if opts.sql and table_info then
+          cols = require("dbgrid.sql").where_columns(
+            opts.sql,
+            vim.tbl_map(function(c)
+              return c.name
+            end, table_info.columns or {})
+          )
+        end
+        local name = table_info and table_info.name or rel
+        local suggestion = #cols > 0 and string.format("CREATE INDEX ON %s (%s);", name, table.concat(cols, ", "))
+          or nil
+        local msg = string.format("Full scan of %s (~%s rows) — no index used", name, util.fmt_int(rows))
+        if suggestion then
+          msg = msg .. "; consider " .. suggestion
+        end
+        out[#out + 1] = { message = msg, relation = name, rows = rows, suggestion = suggestion, node = node }
+      end
+    end
+  end
+  return out
+end
+
+---@class dbgrid.PlanFinding
+---@field message string
+---@field severity "warn"|"info"
+---@field suggestion string?
+---@field node table?
+
+local function fmt_num(n)
+  if n == nil then
+    return "?"
+  end
+  if n >= 100 then
+    return util.fmt_int(n)
+  end
+  return tostring(n)
+end
+
+---Short label for a node ("Seq Scan on users", "Hash Join").
+---@param node table
+local function node_label(node)
+  local ntype = node["Node Type"] or "?"
+  if ntype == "ModifyTable" then
+    ntype = tostring(node.Operation or "Modify")
+  end
+  if node["Relation Name"] then
+    return ntype .. " on " .. node["Relation Name"]
+  end
+  if node["Index Name"] and not node["Relation Name"] then
+    return ntype .. " using " .. node["Index Name"]
+  end
+  return ntype
+end
+
+---What an EXPLAIN ANALYZE plan reveals: row estimates that were far off,
+---sorts and hashes that spilled to disk, filters that discard almost
+---everything, nested loops repeating a scan, and where the time went.
+---@param plan table   decoded EXPLAIN (ANALYZE, FORMAT JSON)
+---@param opts? { estimate_ratio?: number, min_rows?: integer, schema?: table }
+---@return dbgrid.PlanFinding[]
+function M.analyze_findings(plan, opts)
+  opts = opts or {}
+  local function index_suggestion(node)
+    if not node["Relation Name"] or not node.Filter then
+      return nil
+    end
+    local tbl = opts.schema and require("dbgrid.schema").find_table(opts.schema, node["Relation Name"], node.Schema)
+    local cols = tbl
+        and filter_columns(
+          node.Filter,
+          vim.tbl_map(function(c)
+            return c.name
+          end, tbl.columns or {})
+        )
+      or {}
+    if #cols == 0 then
+      return "CREATE INDEX ON " .. node["Relation Name"] .. " (<filter columns>);"
+    end
+    return string.format("CREATE INDEX ON %s (%s);", node["Relation Name"], table.concat(cols, ", "))
+  end
+  local ratio_limit = opts.estimate_ratio or 10
+  local min_rows = opts.min_rows or 1000
+  local root = type(plan) == "table" and plan[1] and plan[1].Plan
+  if not root or root["Actual Rows"] == nil then
+    return {}
+  end
+  local out = {}
+  local function add(severity, message, node, suggestion)
+    out[#out + 1] = { severity = severity, message = message, node = node, suggestion = suggestion }
+  end
+  local total = (root["Actual Total Time"] or 0) * (root["Actual Loops"] or 1)
+  local hot -- { node, self_ms }
+  walk(root, function(node, parent)
+    local loops = node["Actual Loops"] or 1
+    local est, act = node["Plan Rows"], node["Actual Rows"]
+    if est and act and loops > 0 then
+      local big = math.max(est, act)
+      if big >= min_rows then
+        local r = (act + 1) / (est + 1)
+        if r >= ratio_limit or r <= 1 / ratio_limit then
+          local factor = r >= 1 and r or 1 / r
+          local dir = r >= 1 and "under" or "over"
+          local suggestion
+          if node["Relation Name"] then
+            suggestion = string.format("ANALYZE %s;", node["Relation Name"])
+          end
+          add(
+            "warn",
+            string.format(
+              "%s: planner expected %s rows, got %s (%d× %s-estimated%s)",
+              node_label(node),
+              fmt_num(est),
+              fmt_num(act),
+              math.floor(factor + 0.5),
+              dir,
+              node["Relation Name"] and "; statistics may be stale" or "; join or filter selectivity misjudged"
+            ),
+            node,
+            suggestion or "CREATE STATISTICS on the correlated columns, or rewrite the join"
+          )
+        end
+      end
+    end
+    if node["Sort Space Type"] == "Disk" then
+      add(
+        "warn",
+        string.format(
+          "%s spilled to disk (%s kB); raise work_mem or add an index on %s",
+          node_label(node),
+          fmt_num(node["Sort Space Used"] or 0),
+          type(node["Sort Key"]) == "table" and table.concat(node["Sort Key"], ", ") or "the sort key"
+        ),
+        node,
+        "SET work_mem = '64MB';"
+      )
+    end
+    if (node["Hash Batches"] or 1) > 1 then
+      add(
+        "warn",
+        string.format(
+          "%s used %d batches: the hash table did not fit in work_mem",
+          node_label(node),
+          node["Hash Batches"]
+        ),
+        node,
+        "SET work_mem = '64MB';"
+      )
+    end
+    if (node["HashAgg Batches"] or 1) > 1 or (node["Disk Usage"] or 0) > 0 then
+      add(
+        "warn",
+        string.format("%s spilled to disk (%s kB)", node_label(node), fmt_num(node["Disk Usage"] or 0)),
+        node,
+        "SET work_mem = '64MB';"
+      )
+    end
+    local removed = node["Rows Removed by Filter"]
+    if removed and removed >= min_rows and act then
+      local read = removed + act
+      if removed / read >= 0.9 then
+        add(
+          "warn",
+          string.format(
+            "%s reads %s rows to keep %s (%d%% discarded by filter %s)",
+            node_label(node),
+            fmt_num(read * loops),
+            fmt_num(act * loops),
+            math.floor(removed / read * 100 + 0.5),
+            tostring(node.Filter or "")
+          ),
+          node,
+          index_suggestion(node)
+        )
+      end
+    end
+    if parent and parent["Node Type"] == "Nested Loop" and loops >= 100 and node["Node Type"] == "Seq Scan" then
+      add(
+        "warn",
+        string.format(
+          "%s repeated %s times inside a nested loop; the join column has no usable index",
+          node_label(node),
+          fmt_num(loops)
+        ),
+        node,
+        node["Relation Name"] and ("CREATE INDEX ON " .. node["Relation Name"] .. " (<join column>);") or nil
+      )
+    end
+    -- time spent in this node alone
+    local own = (node["Actual Total Time"] or 0) * loops
+    for _, child in ipairs(node.Plans or {}) do
+      own = own - (child["Actual Total Time"] or 0) * (child["Actual Loops"] or 1)
+    end
+    if not hot or own > hot.self_ms then
+      hot = { node = node, self_ms = own }
+    end
+  end)
+  if hot and total >= 10 and hot.self_ms / total >= 0.5 then
+    add(
+      "info",
+      string.format(
+        "%d%% of the time (%s) is spent in %s",
+        math.floor(hot.self_ms / total * 100 + 0.5),
+        util.fmt_ms(hot.self_ms),
+        node_label(hot.node)
+      ),
+      hot.node
+    )
+  end
+  local temp = (root["Temp Written Blocks"] or 0)
+  if temp > 0 then
+    add("info", string.format("%s temp blocks written (work_mem overflow somewhere in the plan)", fmt_num(temp)), root)
+  end
+  return out
+end
+
+---Render a plan as indented text (one node per line). For EXPLAIN ANALYZE
+---plans the actual rows and time are added and estimates that were far off
+---are called out. The second value maps line numbers to highlight groups.
+---@param plan table   Postgres JSON plan or SQLite plan
+---@param opts? { estimate_ratio?: number }
+---@return string[] lines, table<integer, string> marks
+function M.to_lines(plan, opts)
+  opts = opts or {}
+  local lines, marks = {}, {}
+  if type(plan) == "table" and plan.sqlite then
+    for _, node in ipairs(plan.nodes or {}) do
+      lines[#lines + 1] = string.rep("  ", node.depth or 0) .. ((node.depth or 0) > 0 and "-> " or "") .. node.detail
+      if node.detail:match("^SCAN ") and not node.detail:find("USING", 1, true) then
+        marks[#lines] = "DbgridWarn"
+      end
+    end
+    return lines, marks
+  end
+  local root = type(plan) == "table" and plan[1] and plan[1].Plan
+  if not root then
+    return lines, marks
+  end
+  local ratio_limit = opts.estimate_ratio or 10
+  local function fmt(node, depth)
+    local parts = { node_label(node) }
+    if node["Relation Name"] and node.Alias and node.Alias ~= node["Relation Name"] then
+      parts[#parts + 1] = node.Alias
+    end
+    if node["Index Name"] and node["Relation Name"] then
+      parts[#parts + 1] = "using " .. node["Index Name"]
+    end
+    if node["Join Type"] then
+      parts[#parts + 1] = "(" .. node["Join Type"] .. ")"
+    end
+    if node.Strategy and node["Node Type"] == "Aggregate" then
+      parts[#parts + 1] = "(" .. tostring(node.Strategy) .. ")"
+    end
+    parts[#parts + 1] = string.format(
+      "(cost=%.2f..%.2f rows=%s width=%s)",
+      node["Startup Cost"] or 0,
+      node["Total Cost"] or 0,
+      tostring(node["Plan Rows"]),
+      tostring(node["Plan Width"])
+    )
+    local hl
+    if node["Actual Rows"] ~= nil then
+      parts[#parts + 1] = string.format(
+        "(actual time=%.3f..%.3f rows=%s loops=%s)",
+        node["Actual Startup Time"] or 0,
+        node["Actual Total Time"] or 0,
+        tostring(node["Actual Rows"]),
+        tostring(node["Actual Loops"] or 1)
+      )
+      local est, act = node["Plan Rows"] or 0, node["Actual Rows"] or 0
+      if math.max(est, act) >= 1000 then
+        local r = (act + 1) / (est + 1)
+        if r >= ratio_limit then
+          parts[#parts + 1] = string.format("⚠ %d× under-estimated", math.floor(r + 0.5))
+          hl = "DbgridWarn"
+        elseif r <= 1 / ratio_limit then
+          parts[#parts + 1] = string.format("⚠ %d× over-estimated", math.floor(1 / r + 0.5))
+          hl = "DbgridWarn"
+        end
+      end
+    end
+    lines[#lines + 1] = string.rep("  ", depth) .. (depth > 0 and "-> " or "") .. table.concat(parts, " ")
+    if not hl and node["Node Type"] == "Seq Scan" then
+      hl = "DbgridWarn"
+    end
+    if hl then
+      marks[#lines] = hl
+    end
+    local pad = string.rep("  ", depth) .. (depth > 0 and "   " or "")
+    for _, k in ipairs({
+      "Filter",
+      "Index Cond",
+      "Recheck Cond",
+      "Hash Cond",
+      "Merge Cond",
+      "Join Filter",
+      "Sort Key",
+      "Group Key",
+      "Rows Removed by Filter",
+      "Rows Removed by Join Filter",
+      "Sort Method",
+      "Hash Batches",
+    }) do
+      if node[k] ~= nil then
+        local v = node[k]
+        if type(v) == "table" then
+          v = table.concat(v, ", ")
+        end
+        if k == "Sort Method" then
+          v = tostring(v)
+            .. "  "
+            .. tostring(node["Sort Space Type"] or "")
+            .. ": "
+            .. tostring(node["Sort Space Used"] or "?")
+            .. "kB"
+          if node["Sort Space Type"] == "Disk" then
+            marks[#lines + 1] = "DbgridWarn"
+          end
+        elseif k == "Hash Batches" then
+          if v == 1 then
+            v = nil
+          else
+            marks[#lines + 1] = "DbgridWarn"
+          end
+        end
+        if v ~= nil then
+          lines[#lines + 1] = pad .. k .. ": " .. tostring(v)
+        end
+      end
+    end
+    for _, child in ipairs(node.Plans or {}) do
+      fmt(child, depth + 1)
+    end
+  end
+  fmt(root, 0)
+  local top = plan[1]
+  if top["Planning Time"] or top["Execution Time"] then
+    lines[#lines + 1] = ""
+    if top["Planning Time"] then
+      lines[#lines + 1] = string.format("Planning Time: %.3f ms", top["Planning Time"])
+    end
+    if top["Execution Time"] then
+      lines[#lines + 1] = string.format("Execution Time: %.3f ms", top["Execution Time"])
+    end
+  end
+  return lines, marks
+end
+
 ---Root node and top-level element (times, triggers) of a decoded plan.
 ---@param plan table
 ---@return table? root, table? top
@@ -164,28 +530,6 @@ local function root_of(plan)
     return nil, nil
   end
   return top.Plan, top
-end
-
----`users`, or `other_schema.users`, for a scan node; nil for the rest.
----@param node table
----@return string?
-local function relation_of(node)
-  local rel = node["Relation Name"]
-  if not rel then
-    return nil
-  end
-  if node.Schema and node.Schema ~= "public" then
-    return node.Schema .. "." .. rel
-  end
-  return rel
-end
-
----`Seq Scan on users` / `Hash Join`.
----@param node table
----@return string
-local function node_label(node)
-  local rel = relation_of(node)
-  return tostring(node["Node Type"]) .. (rel and (" on " .. rel) or "")
 end
 
 ---Relations a plan touches, unique by schema and name, in tree order.
@@ -232,280 +576,6 @@ end
 ---@field relation string?
 ---@field severity "warn"|"info"
 
----Time a node spent over all of its loops, or nil without ANALYZE.
----@param node table
----@return number?
-local function node_ms(node)
-  local t = node["Actual Total Time"]
-  if type(t) ~= "number" then
-    return nil
-  end
-  return t * (node["Actual Loops"] or 1)
-end
-
----Findings from an EXPLAIN ANALYZE plan: the hot node, bad row estimates,
----sorts and hashes that spilled to disk, filters that discard most rows.
----Empty for an estimate-only plan.
----@param plan table
----@param opts? { estimate_ratio?: number, min_rows?: integer }
----@return dbgrid.PlanFinding[]
-function M.analyze_findings(plan, opts)
-  opts = opts or {}
-  local ratio_limit = opts.estimate_ratio or 10
-  local min_rows = opts.min_rows or 1000
-  local root, top = root_of(plan)
-  if not root or root["Actual Rows"] == nil then
-    return {}
-  end
-  local out = {}
-  local function push(kind, node, severity, message)
-    out[#out + 1] = { kind = kind, message = message, node = node, relation = relation_of(node), severity = severity }
-  end
-
-  -- hot: the node with the most exclusive time (its time minus its children's)
-  local total_ms = top["Execution Time"] or node_ms(root) or 0
-  if total_ms >= 1 then
-    local hot, hot_ms = nil, -1
-    walk(root, function(node)
-      local own = node_ms(node)
-      if own then
-        for _, child in ipairs(node.Plans or {}) do
-          own = own - (node_ms(child) or 0)
-        end
-        if own > hot_ms then
-          hot, hot_ms = node, own
-        end
-      end
-    end)
-    if hot then
-      local pct = math.min(100, math.floor(hot_ms / total_ms * 100 + 0.5))
-      push(
-        "hot",
-        hot,
-        "info",
-        string.format("Most time (%.1f ms of %.1f ms, %d%%) is spent in %s", hot_ms, total_ms, pct, node_label(hot))
-      )
-    end
-  end
-
-  -- estimate: planned versus actual rows, both per loop
-  walk(root, function(node)
-    local planned, actual = node["Plan Rows"], node["Actual Rows"]
-    if type(planned) == "number" and type(actual) == "number" then
-      local ratio = math.max(actual, 1) / math.max(planned, 1)
-      if (ratio >= ratio_limit or ratio <= 1 / ratio_limit) and math.max(actual, planned) >= min_rows then
-        local rel = relation_of(node)
-        local msg = string.format(
-          "Planner expected %s rows and got %s on %s",
-          util.fmt_int(planned),
-          util.fmt_int(actual),
-          node_label(node)
-        )
-        if rel then
-          msg = msg .. string.format("; run ANALYZE %s to refresh statistics", rel)
-        end
-        push("estimate", node, "warn", msg)
-      end
-    end
-  end)
-
-  -- spill: work_mem was too small
-  walk(root, function(node)
-    local ntype = node["Node Type"]
-    local method = node["Sort Method"]
-    local external = type(method) == "string" and method:find("external", 1, true) ~= nil
-    if ntype == "Sort" and (node["Sort Space Type"] == "Disk" or external) then
-      push(
-        "spill",
-        node,
-        "warn",
-        string.format(
-          "Sort of %s rows spilled to disk (%s kB); raise work_mem for this query",
-          util.fmt_int(node["Actual Rows"] or 0),
-          tostring(node["Sort Space Used"] or "?")
-        )
-      )
-    elseif ntype == "Hash" and (node["Hash Batches"] or 1) > 1 then
-      push(
-        "spill",
-        node,
-        "warn",
-        string.format("Hash join used %s batches (spilled to disk); raise work_mem", tostring(node["Hash Batches"]))
-      )
-    elseif ntype == "Aggregate" and ((node["HashAgg Batches"] or 1) > 1 or (node["Disk Usage"] or 0) > 0) then
-      push(
-        "spill",
-        node,
-        "warn",
-        string.format("HashAggregate spilled to disk (%s kB); raise work_mem", tostring(node["Disk Usage"] or "?"))
-      )
-    end
-  end)
-
-  -- filter: rows read and thrown away
-  walk(root, function(node)
-    local actual = node["Actual Rows"] or 0
-    local removed = node["Rows Removed by Filter"]
-    if type(removed) == "number" and removed >= min_rows and removed > actual then
-      push(
-        "filter",
-        node,
-        "warn",
-        string.format(
-          "%s read %s rows to keep %s; the filter %s discards most of them "
-            .. "(an index on the filtered columns would avoid the read)",
-          node_label(node),
-          util.fmt_int(removed + actual),
-          util.fmt_int(actual),
-          tostring(node.Filter)
-        )
-      )
-    end
-    local rechecked = node["Rows Removed by Index Recheck"]
-    if type(rechecked) == "number" and rechecked >= min_rows and rechecked > actual then
-      push(
-        "filter",
-        node,
-        "info",
-        string.format(
-          "%s rechecked %s rows to keep %s; the bitmap was lossy (Rows Removed by Index Recheck), "
-            .. "raise work_mem so it fits in memory",
-          node_label(node),
-          util.fmt_int(rechecked + actual),
-          util.fmt_int(actual)
-        )
-      )
-    end
-  end)
-  return out
-end
-
-local REMOVED_KEYS = { "Rows Removed by Filter", "Rows Removed by Index Recheck", "Rows Removed by Join Filter" }
-
----Buffer usage of a node as one line, or nil when no counter is above zero.
----@param node table
----@return string?
-local function buffers_line(node)
-  local hit, read = node["Shared Hit Blocks"] or 0, node["Shared Read Blocks"] or 0
-  local dirtied, written = node["Shared Dirtied Blocks"] or 0, node["Shared Written Blocks"] or 0
-  local temp_read, temp_written = node["Temp Read Blocks"] or 0, node["Temp Written Blocks"] or 0
-  if hit + read + dirtied + written + temp_read + temp_written <= 0 then
-    return nil
-  end
-  local s = string.format("Buffers: shared hit=%s read=%s", tostring(hit), tostring(read))
-  if dirtied > 0 then
-    s = s .. " dirtied=" .. tostring(dirtied)
-  end
-  if written > 0 then
-    s = s .. " written=" .. tostring(written)
-  end
-  if temp_read > 0 or temp_written > 0 then
-    s = s .. string.format(", temp read=%s written=%s", tostring(temp_read), tostring(temp_written))
-  end
-  return s
-end
-
----Render the JSON plan as indented text (one node per line). Analyzed plans
----also show actual times, rows removed, sort methods, buffers and the totals.
----@param plan table
----@param opts? { actual?: boolean }   `actual = false` renders only the estimates
----@return string[]
-function M.to_lines(plan, opts)
-  local actual = not (opts and (opts.actual == false or opts.analyze == false))
-  local root = type(plan) == "table" and plan[1] and plan[1].Plan
-  local lines = {}
-  if not root then
-    return lines
-  end
-  local function fmt(node, depth)
-    local parts = { node["Node Type"] }
-    if node["Relation Name"] then
-      parts[#parts + 1] = "on "
-        .. node["Relation Name"]
-        .. (node.Alias and node.Alias ~= node["Relation Name"] and (" " .. node.Alias) or "")
-    end
-    if node["Index Name"] then
-      parts[#parts + 1] = "using " .. node["Index Name"]
-    end
-    if node["Join Type"] then
-      parts[#parts + 1] = "(" .. node["Join Type"] .. ")"
-    end
-    parts[#parts + 1] = string.format(
-      "(cost=%.2f..%.2f rows=%s width=%s)",
-      node["Startup Cost"] or 0,
-      node["Total Cost"] or 0,
-      tostring(node["Plan Rows"]),
-      tostring(node["Plan Width"])
-    )
-    if actual and node["Actual Total Time"] ~= nil then
-      parts[#parts + 1] = string.format(
-        "(actual time=%.3f..%.3f rows=%s loops=%s)",
-        node["Actual Startup Time"] or 0,
-        node["Actual Total Time"],
-        tostring(node["Actual Rows"]),
-        tostring(node["Actual Loops"])
-      )
-    end
-    lines[#lines + 1] = string.rep("  ", depth) .. (depth > 0 and "-> " or "") .. table.concat(parts, " ")
-    local pad = string.rep("  ", depth) .. (depth > 0 and "   " or "")
-    for _, k in ipairs({
-      "Filter",
-      "Index Cond",
-      "Recheck Cond",
-      "Hash Cond",
-      "Merge Cond",
-      "Join Filter",
-      "Sort Key",
-      "Group Key",
-    }) do
-      if node[k] then
-        local v = node[k]
-        if type(v) == "table" then
-          v = table.concat(v, ", ")
-        end
-        lines[#lines + 1] = pad .. k .. ": " .. tostring(v)
-      end
-    end
-    if actual then
-      for _, k in ipairs(REMOVED_KEYS) do
-        if node[k] ~= nil then
-          lines[#lines + 1] = pad .. k .. ": " .. tostring(node[k])
-        end
-      end
-      if node["Sort Method"] then
-        lines[#lines + 1] = pad
-          .. string.format(
-            "Sort Method: %s  %s: %skB",
-            node["Sort Method"],
-            node["Sort Space Type"] or "Memory",
-            tostring(node["Sort Space Used"] or 0)
-          )
-      end
-      if (node["Hash Batches"] or 1) > 1 then
-        lines[#lines + 1] = pad .. "Hash Batches: " .. tostring(node["Hash Batches"])
-      end
-      local buffers = buffers_line(node)
-      if buffers then
-        lines[#lines + 1] = pad .. buffers
-      end
-    end
-    for _, child in ipairs(node.Plans or {}) do
-      fmt(child, depth + 1)
-    end
-  end
-  fmt(root, 0)
-  if actual then
-    local top = plan[1]
-    if type(top["Planning Time"]) == "number" then
-      lines[#lines + 1] = string.format("Planning Time: %.3f ms", top["Planning Time"])
-    end
-    if type(top["Execution Time"]) == "number" then
-      lines[#lines + 1] = string.format("Execution Time: %.3f ms", top["Execution Time"])
-    end
-  end
-  return lines
-end
-
 ---Statements that try an index hypothetically (hypopg) and explain the query
 ---with it; they must run in one session.
 ---@param index_sql string   `CREATE INDEX ...`
@@ -526,10 +596,13 @@ end
 ---@field pct number   percent change of the total cost (negative means cheaper)
 ---@field used boolean   a hypothetical index (`<oid>name`) appears in the plan after
 
----Total cost before and after a hypothetical index.
+
+
+---Estimated cost before and after a hypothetical index, and whether the
+---planner used it (hypopg index names start with "<").
 ---@param before_plan table
 ---@param after_plan table
----@return dbgrid.CostDelta
+---@return { before: number, after: number, pct: number, used: boolean }
 function M.cost_delta(before_plan, after_plan)
   local before = M.total_cost(before_plan) or 0
   local after = M.total_cost(after_plan) or 0

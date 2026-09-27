@@ -1,5 +1,7 @@
--- Runs cells: LIMIT injection, write confirmation, index pre-flight, execution,
--- caching and hand-off to the UI.
+-- Runs cells: cell references and parameters, dependencies, LIMIT injection,
+-- write confirmation (with row counts and DDL warnings), dry runs, index
+-- pre-flight, execution, live loops, plan analysis, caching and hand-off to
+-- the UI.
 local util = require("dbgrid.util")
 local config = require("dbgrid.config")
 local cells = require("dbgrid.cells")
@@ -9,6 +11,7 @@ local connections = require("dbgrid.connections")
 local schema = require("dbgrid.schema")
 local explain = require("dbgrid.explain")
 local notebook = require("dbgrid.notebook")
+local expand = require("dbgrid.expand")
 
 local M = {}
 
@@ -60,6 +63,22 @@ function M.with_connection(state, override, cb)
     end
     resolved(conn)
   end)
+end
+
+---Adapter for a connection, or nil after reporting why.
+---@param conn dbgrid.Connection
+---@return dbgrid.Adapter?
+local function adapter_for(conn)
+  local adapter, err = adapters.for_connection(conn)
+  if not adapter then
+    util.error(err or "no adapter")
+    return nil
+  end
+  if vim.fn.executable(adapter.executable) ~= 1 then
+    util.error("'" .. adapter.executable .. "' is not on PATH")
+    return nil
+  end
+  return adapter
 end
 
 ---@param state dbgrid.State
@@ -216,90 +235,86 @@ local function set_runtime(state, cell, status, extra)
   ui_query().render(state)
 end
 
----Fill `:name` parameters of a cell: cell defaults, remembered values, then prompts.
+---Is the cell's cached result current (it ran fine with the SQL it has now)?
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
----@param text string
----@param opts { silent?: boolean }
----@param cb fun(text?: string, values?: table<string,string>)
-local function resolve_params(state, cell, text, opts, cb)
-  if not sqlmod.params then
-    return cb(text, {})
-  end
-  local names = sqlmod.params(text)
-  if #names == 0 then
-    return cb(text, {})
-  end
-  local defaults = {}
-  for _, p in ipairs(cells.params(cell)) do
-    defaults[p.name] = p.default
-  end
-  local remembered = notebook.params(state.nb)
-  local values, missing = {}, {}
-  for _, name in ipairs(names) do
-    local v = defaults[name]
-    if v == nil then
-      v = remembered[name]
-    end
-    if v == nil then
-      missing[#missing + 1] = name
-    else
-      values[name] = v
-    end
-  end
-  local function finish()
-    local out = sqlmod.substitute_params(text, values)
-    cb(out, values)
-  end
-  local function prompt_next()
-    local name = table.remove(missing, 1)
-    if not name then
-      return finish()
-    end
-    if opts.silent then
-      return cb(nil)
-    end
-    vim.ui.input({ prompt = "Value for :" .. name .. ": ", default = remembered[name] or "" }, function(input)
-      if input == nil then
-        util.notify("cancelled (no value for :" .. name .. ")")
-        return cb(nil)
-      end
-      values[name] = input
-      notebook.set_param(state.nb, name, input)
-      prompt_next()
-    end)
-  end
-  prompt_next()
+---@return boolean
+function M.is_fresh(state, cell)
+  local meta = cell.id and state.nb.meta.cells[cell.id]
+  return meta ~= nil and meta.status == "ok" and meta.sql_hash == cells.hash(cell)
 end
 
----Re-prompt every parameter used by a cell (`params` keymap).
+---Cells named by `-- @depends` that have to run before `cell`, transitively
+---and in order, leaving out the ones whose result is still current.
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
-function M.edit_params(state, cell)
-  if not sqlmod.params then
-    return
-  end
-  local names = sqlmod.params(cells.sql_text(cell))
-  if #names == 0 then
-    return util.notify("this cell has no :parameters")
-  end
-  local remembered = notebook.params(state.nb)
-  local i = 0
-  local function nxt()
-    i = i + 1
-    local name = names[i]
-    if not name then
-      return util.notify("parameters updated")
-    end
-    vim.ui.input({ prompt = "Value for :" .. name .. ": ", default = remembered[name] or "" }, function(input)
-      if input == nil then
+---@param opts? { all?: boolean }  include fresh cells too
+---@return dbgrid.Cell[]? deps, string? err
+function M.pending_dependencies(state, cell, opts)
+  local list = cells.parse(state.buf)
+  local order, seen, err = {}, {}, nil
+  local function visit(c, stack)
+    for _, name in ipairs(cells.depends(c)) do
+      if err then
         return
       end
-      notebook.set_param(state.nb, name, input)
-      nxt()
-    end)
+      local dep = cells.find(list, name)
+      if not dep then
+        err = string.format("unknown cell '%s' in -- @depends of %s", name, cells.ref_name(c))
+        return
+      end
+      if dep.id ~= c.id then
+        if stack[dep.id] then
+          err = "dependency cycle through " .. name
+          return
+        end
+        if not seen[dep.id] then
+          seen[dep.id] = true
+          visit(dep, vim.tbl_extend("force", stack, { [dep.id] = true }))
+          if (opts and opts.all) or not M.is_fresh(state, dep) then
+            order[#order + 1] = dep
+          end
+        end
+      end
+    end
   end
-  nxt()
+  visit(cell, { [cell.id or ""] = true })
+  if err then
+    return nil, err
+  end
+  return order
+end
+
+---Every cell of the notebook in an order that respects `-- @depends`
+---(document order otherwise).
+---@param state dbgrid.State
+---@return dbgrid.Cell[] order, string? err
+function M.run_order(state)
+  local list = cells.parse(state.buf)
+  local out, seen, err = {}, {}, nil
+  local function visit(c, stack)
+    if seen[c.id] or err then
+      return
+    end
+    for _, name in ipairs(cells.depends(c)) do
+      local dep = cells.find(list, name)
+      if dep and dep.id ~= c.id then
+        if stack[dep.id] then
+          err = "dependency cycle through " .. name
+          return
+        end
+        visit(dep, vim.tbl_extend("force", stack, { [dep.id] = true }))
+      end
+    end
+    if not seen[c.id] then
+      seen[c.id] = true
+      out[#out + 1] = c
+    end
+  end
+  for _, c in ipairs(list) do
+    visit(c, { [c.id] = true })
+  end
+  return out, err
 end
 
 ---Cells changed between two results (keyed by the new row tables).
@@ -371,11 +386,11 @@ end
 ---@param adapter dbgrid.Adapter
 ---@param run_stmts dbgrid.RunStatement[]
 ---@param extra { warnings: table[], plans: table[], transaction: boolean, dry_run?: boolean, live?: boolean,
----  sql: string, params?: table }
+---  sql: string, params?: table, refs?: string[] }
 local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
   local cfg = config.get()
   local started = util.now()
-  state.running[cell.id] = { started = started, kind = "run", adapter = adapter }
+  state.running[cell.id] = { started = started, kind = "run", conn = conn, adapter = adapter }
   set_runtime(state, cell, "running")
   ui_query().start_spinner(state)
   local job = adapter.run(conn, run_stmts, {
@@ -414,6 +429,7 @@ local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
       truncated = truncated,
       dry_run = extra.dry_run or nil,
       params = extra.params,
+      refs = extra.refs,
     }
     local live = state.live and state.live[fresh.id]
     if extra.live and live then
@@ -455,13 +471,17 @@ local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
       cb(result)
     end
   end)
-  state.running[cell.id].job = job
+  if state.running[cell.id] then
+    state.running[cell.id].job = job
+  end
 end
 
----Run one cell.
+---Run one cell: dependencies first (when their result is stale), then the
+---cell with its references inlined and parameters filled in.
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
----@param opts? { cb?: fun(result: table), silent?: boolean, live?: boolean, dry_run?: boolean }
+---@param opts? { cb?: fun(result: table), silent?: boolean, live?: boolean, dry_run?: boolean, no_deps?: boolean,
+---  values?: table<string,string> }
 function M.run_cell(state, cell, opts)
   opts = opts or {}
   local cfg = config.get()
@@ -474,19 +494,57 @@ function M.run_cell(state, cell, opts)
     end
     return
   end
-  local raw = cells.sql_text(cell)
-  if not sqlmod.has_statements(raw) then
+  if #sqlmod.split(cells.sql_text(cell)) == 0 then
     if cells.prompt(cell) then
       return require("dbgrid.ai").generate(state, cell)
     end
     util.warn("nothing to run in this cell")
     return
   end
+  if not opts.no_deps and not opts.live then
+    local deps, err = M.pending_dependencies(state, cell)
+    if not deps then
+      return util.error(err or "dependencies could not be resolved")
+    end
+    if #deps > 0 then
+      local names = vim.tbl_map(cells.ref_name, deps)
+      util.notify("running " .. table.concat(names, ", ") .. " first")
+      local i = 0
+      local function next_dep()
+        i = i + 1
+        local dep = deps[i]
+        if not dep then
+          local fresh = cells.by_id(state.buf, cell.id) or cell
+          return M.run_cell(state, fresh, vim.tbl_extend("force", opts, { no_deps = true }))
+        end
+        local fresh_dep = cells.by_id(state.buf, dep.id) or dep
+        M.run_cell(state, fresh_dep, {
+          no_deps = true,
+          silent = opts.silent,
+          cb = function(result)
+            if result.ok then
+              next_dep()
+            else
+              util.warn("stopped: dependency " .. cells.ref_name(dep) .. " failed")
+              if opts.cb then
+                opts.cb(result)
+              end
+            end
+          end,
+        })
+      end
+      return next_dep()
+    end
+  end
   local directives = cells.directives(cell)
-  resolve_params(state, cell, raw, { silent = opts.silent or opts.live }, function(text, params)
-    if not text then
+  expand.prepare(state, cell, { values = opts.values, silent = opts.silent or opts.live }, function(exp, err)
+    if not exp then
+      if not opts.live then
+        util.error("cannot run: " .. tostring(err))
+      end
       return
     end
+    local text, params = exp.text, exp.params
     local stmts = sqlmod.split(text)
     if #stmts == 0 then
       util.warn("nothing to run in this cell")
@@ -497,13 +555,8 @@ function M.run_cell(state, cell, opts)
       util.warn("bad @every value '" .. tostring(directives.every) .. "' (use 5s, 2m, 500ms)")
     end
     M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
-      local adapter, err = adapters.for_connection(conn)
+      local adapter = adapter_for(conn)
       if not adapter then
-        util.error(err or "no adapter")
-        return
-      end
-      if vim.fn.executable(adapter.executable) ~= 1 then
-        util.error("'" .. adapter.executable .. "' is not on PATH")
         return
       end
       local dry_run = opts.dry_run or directives.dryrun ~= nil or cfg.query.dry_run
@@ -562,6 +615,7 @@ function M.run_cell(state, cell, opts)
           live = opts.live,
           sql = text,
           params = next(params or {}) and params or nil,
+          refs = exp.cells,
         }
         local function go()
           execute(state, cell, conn, adapter, run_stmts, extra, function(result)
@@ -578,7 +632,7 @@ function M.run_cell(state, cell, opts)
         end
         -- pre-flight EXPLAIN for the index check
         set_runtime(state, cell, "planning")
-        state.running[cell.id] = { started = util.now(), kind = "explain", adapter = adapter }
+        state.running[cell.id] = { started = util.now(), kind = "explain", conn = conn, adapter = adapter }
         ui_query().start_spinner(state)
         local list = vim.tbl_map(function(e)
           return e.stmt
@@ -591,7 +645,8 @@ function M.run_cell(state, cell, opts)
             local plan = plans[k]
             if plan then
               by_index[e.i] = plan
-              for _, w in ipairs(explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows })) do
+              local ws = explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows, sql = e.stmt.sql })
+              for _, w in ipairs(ws) do
                 warnings[#warnings + 1] = w
               end
             end
@@ -631,17 +686,20 @@ function M.run_cell(state, cell, opts)
   end)
 end
 
----Run every cell of the notebook, top to bottom.
+---Run every cell of the notebook, dependencies first, document order otherwise.
 ---@param state dbgrid.State
 function M.run_all(state)
   cells.ensure_ids(state.buf)
-  local list = cells.parse(state.buf)
-  local i = 0
+  local list, err = M.run_order(state)
+  if err then
+    return util.error(err)
+  end
+  local i, ran = 0, 0
   local function next_cell()
     i = i + 1
     local cell = list[i]
     if not cell then
-      util.notify("ran " .. (i - 1) .. " cells")
+      util.notify("ran " .. ran .. " cells")
       return
     end
     local fresh = cells.by_id(state.buf, cell.id)
@@ -649,11 +707,13 @@ function M.run_all(state)
       return next_cell()
     end
     M.run_cell(state, fresh, {
+      no_deps = true,
       cb = function(result)
+        ran = ran + 1
         if result.ok then
           next_cell()
         else
-          util.warn("stopped at cell " .. i .. ": " .. tostring(result.error and result.error.message))
+          util.warn("stopped at " .. cells.ref_name(fresh) .. ": " .. tostring(result.error and result.error.message))
         end
       end,
     })
@@ -783,23 +843,30 @@ end
 -- Explain / analyze
 -- ---------------------------------------------------------------------------
 
----First statement of a cell, or nil with a warning.
+---The first statement of a cell after cell references and parameters were
+---expanded (asks for missing values), or nil after a warning.
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
----@return dbgrid.Statement?, dbgrid.Cell
-local function first_statement(state, cell)
+---@param cb fun(st?: dbgrid.Statement, cell: dbgrid.Cell, exp?: dbgrid.Expansion)
+local function prepared_statement(state, cell, cb)
   cells.ensure_ids(state.buf)
   cell = cells.parse(state.buf)[cell.index] or cell
-  local text = cells.sql_text(cell)
-  if sqlmod.substitute_params then
-    text = sqlmod.substitute_params(text, notebook.params(state.nb))
-  end
-  local stmts = sqlmod.split(text)
-  if #stmts == 0 then
+  if #sqlmod.split(cells.sql_text(cell)) == 0 then
     util.warn("nothing to explain")
-    return nil, cell
+    return cb(nil, cell)
   end
-  return stmts[1], cell
+  expand.prepare(state, cell, {}, function(exp, err)
+    if not exp then
+      util.error("cannot explain: " .. tostring(err))
+      return cb(nil, cell)
+    end
+    local st = sqlmod.split(exp.text)[1]
+    if not st then
+      util.warn("nothing to explain")
+      return cb(nil, cell)
+    end
+    cb(st, cell, exp)
+  end)
 end
 
 ---EXPLAIN (optionally ANALYZE) the first statement of a cell and show the plan.
@@ -807,40 +874,61 @@ end
 ---@param cell dbgrid.Cell
 ---@param analyze boolean
 function M.explain_cell(state, cell, analyze)
-  local st
-  st, cell = first_statement(state, cell)
-  if not st then
-    return
-  end
-  if not sqlmod.is_explainable(st) then
-    util.warn("cannot EXPLAIN a " .. st.kind:upper() .. " statement")
+  cells.ensure_ids(state.buf)
+  cell = cells.parse(state.buf)[cell.index] or cell
+  if #sqlmod.split(cells.sql_text(cell)) == 0 then
+    util.warn("nothing to explain")
     return
   end
   local directives = cells.directives(cell)
-  M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
-    local adapter, err = adapters.for_connection(conn)
-    if not adapter then
-      return util.error(err or "no adapter")
+  expand.prepare(state, cell, {}, function(exp, err)
+    if not exp then
+      return util.error("cannot explain: " .. tostring(err))
     end
-    if analyze and (st.class == "write") and conn.readonly then
-      return util.error("connection is read-only")
+    local stmts = sqlmod.split(exp.text)
+    local st = stmts[1]
+    if not st or not sqlmod.is_explainable(st) then
+      util.warn("cannot EXPLAIN a " .. (st and st.kind:upper() or "empty") .. " statement")
+      return
     end
-    state.running[cell.id] = { started = util.now(), kind = "explain", adapter = adapter }
-    set_runtime(state, cell, "planning")
-    ui_query().start_spinner(state)
-    state.running[cell.id].job = adapter.explain_text(conn, st.sql, analyze, function(lines, e)
-      state.running[cell.id] = nil
-      state.runtime[cell.id] = state.runtime[cell.id] or {}
-      state.runtime[cell.id].status = nil
-      if e then
-        state.runtime[cell.id].plan_text = { "ERROR: " .. e }
-      else
-        state.runtime[cell.id].plan_text = lines
+    M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
+      local adapter = adapter_for(conn)
+      if not adapter then
+        return
       end
-      state.runtime[cell.id].plan_kind = analyze and "EXPLAIN ANALYZE" or "EXPLAIN"
-      state.active_cell = cell.id
-      ui_query().render(state)
-      ui_results().show(state, cell.id, { view = "plan" })
+      if analyze and (st.class == "write") and conn.readonly then
+        return util.error("connection is read-only")
+      end
+      state.running[cell.id] = { started = util.now(), kind = "explain", conn = conn, adapter = adapter }
+      set_runtime(state, cell, "planning")
+      ui_query().start_spinner(state)
+      state.running[cell.id].job = adapter.explain_text(conn, st.sql, analyze, function(lines, e, info)
+        state.running[cell.id] = nil
+        state.runtime[cell.id] = state.runtime[cell.id] or {}
+        state.runtime[cell.id].status = nil
+        if e then
+          state.runtime[cell.id].plan_text = { "ERROR: " .. e }
+          state.runtime[cell.id].plan_info = nil
+        else
+          state.runtime[cell.id].plan_text = lines
+          state.runtime[cell.id].plan_info = info
+        end
+        state.runtime[cell.id].plan_kind = (analyze and adapter.analyze ~= false) and "EXPLAIN ANALYZE" or "EXPLAIN"
+        state.runtime[cell.id].plan_params = exp.params
+        state.active_cell = cell.id
+        ui_query().render(state)
+        ui_results().show(state, cell.id, { view = "plan" })
+        local findings = info and info.findings or {}
+        if #findings > 0 then
+          local warn = 0
+          for _, f in ipairs(findings) do
+            if f.severity == "warn" then
+              warn = warn + 1
+            end
+          end
+          util.notify(string.format("EXPLAIN ANALYZE: %d finding(s), %d worth a look", #findings, warn))
+        end
+      end)
     end)
   end)
 end
@@ -852,139 +940,145 @@ end
 function M.analyze_cell(state, cell, opts)
   opts = opts or {}
   local cfg = config.get()
-  local st
-  st, cell = first_statement(state, cell)
-  if not st then
-    return
-  end
-  if not sqlmod.is_explainable(st) then
-    return util.warn("cannot analyze a " .. st.kind:upper() .. " statement")
-  end
   if state.running[cell.id] then
     return util.warn("cell is busy")
   end
-  local directives = cells.directives(cell)
-  M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
-    if conn.ai == false then
-      return util.error("connection '" .. conn.name .. "' has ai = false")
+  prepared_statement(state, cell, function(st, fresh_cell, exp)
+    cell = fresh_cell
+    if not st then
+      return
     end
-    local adapter, err = adapters.for_connection(conn)
-    if not adapter or not adapter.explain_json then
-      return util.error(err or "the adapter cannot produce JSON plans")
+    if not sqlmod.is_explainable(st) then
+      return util.warn("cannot analyze a " .. st.kind:upper() .. " statement")
     end
-    local analyze = (cfg.ai.analyze.mode or "analyze") == "analyze"
-    if analyze and st.class == "write" and conn.readonly then
-      analyze = false
-    end
-    if analyze and st.class == "write" and not opts.silent then
-      local choice = vim.fn.confirm(
-        "EXPLAIN ANALYZE executes this " .. st.kind:upper() .. " inside a transaction that is rolled back. Continue?",
-        "&Analyze\n&Estimate only\n&Cancel",
-        1,
-        "Question"
-      )
-      if choice == 3 then
-        return
+    local directives = cells.directives(cell)
+    M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
+      if conn.ai == false then
+        return util.error("connection '" .. conn.name .. "' has ai = false")
       end
-      analyze = choice == 1
-    end
-    local ai = require("dbgrid.ai")
-    state.running[cell.id] = { started = util.now(), kind = "analyze", adapter = adapter }
-    set_runtime(state, cell, "analyzing")
-    ui_query().start_spinner(state)
-    local function fail(e)
-      state.running[cell.id] = nil
-      set_runtime(state, cell, nil)
-      util.error("analyze: " .. tostring(e))
-      if opts.cb then
-        opts.cb(nil, e)
+      local adapter, err = adapters.for_connection(conn)
+      if not adapter or not adapter.explain_json then
+        return util.error(err or "the adapter cannot produce JSON plans")
       end
-    end
-    state.running[cell.id].job = adapter.explain_json(conn, st.sql, {
-      analyze = analyze,
-      buffers = true,
-      verbose = false,
-      settings = true,
-      timeout_ms = cfg.query.timeout_ms,
-    }, function(plan, e)
-      if not plan then
-        return fail(e)
+      local analyze = (cfg.ai.analyze.mode or "analyze") == "analyze"
+      if analyze and st.class == "write" and conn.readonly then
+        analyze = false
       end
-      schema.get(conn, function(sch)
-        local rules = cfg.analyze_rules or {}
-        local findings = {}
-        for _, w in ipairs(explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows })) do
-          findings[#findings + 1] = w.message
+      if analyze and st.class == "write" and not opts.silent then
+        local choice = vim.fn.confirm(
+          "EXPLAIN ANALYZE executes this " .. st.kind:upper() .. " inside a transaction that is rolled back. Continue?",
+          "&Analyze\n&Estimate only\n&Cancel",
+          1,
+          "Question"
+        )
+        if choice == 3 then
+          return
         end
-        if explain.analyze_findings then
-          for _, f in ipairs(explain.analyze_findings(plan, rules)) do
-            findings[#findings + 1] = f.message
+        analyze = choice == 1
+      end
+      local ai = require("dbgrid.ai")
+      state.running[cell.id] = { started = util.now(), kind = "analyze", conn = conn, adapter = adapter }
+      set_runtime(state, cell, "analyzing")
+      ui_query().start_spinner(state)
+      local function fail(e)
+        state.running[cell.id] = nil
+        set_runtime(state, cell, nil)
+        util.error("analyze: " .. tostring(e))
+        if opts.cb then
+          opts.cb(nil, e)
+        end
+      end
+      state.running[cell.id].job = adapter.explain_json(conn, st.sql, {
+        analyze = analyze,
+        buffers = true,
+        verbose = false,
+        settings = true,
+        timeout_ms = cfg.query.timeout_ms,
+      }, function(plan, e)
+        if not plan then
+          return fail(e)
+        end
+        schema.get(conn, function(sch)
+          local rules = cfg.analyze_rules or {}
+          local findings = {}
+          for _, w in ipairs(explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows, sql = st.sql })) do
+            findings[#findings + 1] = w.message
           end
-        end
-        local relations = explain.relations and explain.relations(plan) or {}
-        if #relations == 0 then
-          for _, r in ipairs(sqlmod.referenced_tables(st.sql)) do
-            relations[#relations + 1] = { name = r.name }
-          end
-        end
-        local tables = {}
-        for _, r in ipairs(relations) do
-          local t = sch and schema.find_table(sch, r.name, r.schema)
-          if t then
-            tables[#tables + 1] = t
-          end
-        end
-        local function build(stats_rows)
-          local plan_lines = explain.to_lines(plan, { analyze = analyze })
-          local prompt = ai.build_analyze_prompt({
-            sql = st.sql,
-            plan_lines = plan_lines,
-            summary = explain.summary and explain.summary(plan) or nil,
-            findings = findings,
-            tables = tables,
-            stats = stats_rows,
-            version = sch and sch.version or nil,
-            analyzed = analyze,
+          local rule_findings = explain.analyze_findings(plan, {
+            estimate_ratio = rules.estimate_ratio,
+            min_rows = rules.min_rows,
+            schema = sch,
           })
-          state.running[cell.id].job = ai.ask_text(prompt, function(text, aerr)
-            state.running[cell.id] = nil
-            set_runtime(state, cell, nil, { plan_text = nil })
-            if not text then
-              util.error("analyze: " .. tostring(aerr))
-              if opts.cb then
-                opts.cb(nil, aerr)
-              end
-              return
-            end
-            notebook.set_analysis(state.nb, cell.id, text, analyze and "EXPLAIN ANALYZE" or "EXPLAIN")
-            state.runtime[cell.id].plan_text = plan_lines
-            state.runtime[cell.id].plan_kind = analyze and "EXPLAIN ANALYZE" or "EXPLAIN"
-            require("dbgrid.ui.analysis").show(state, {
-              title = "analysis of " .. cells.label(cell, 40),
-              text = text,
-              cell_id = cell.id,
-            })
-            if opts.cb then
-              opts.cb(text)
-            end
-          end, { connection = conn })
-        end
-        if cfg.ai.analyze.include_stats ~= false and #tables > 0 then
-          local names = {}
-          for _, t in ipairs(tables) do
-            names[#names + 1] = util.sql_literal(t.name)
+          for _, f in ipairs(rule_findings) do
+            findings[#findings + 1] = f.message .. (f.suggestion and (" → " .. f.suggestion) or "")
           end
-          local stats_sql = "select relname, n_live_tup, n_dead_tup, seq_scan, idx_scan, last_analyze, last_autoanalyze"
-            .. " from pg_stat_user_tables where relname in ("
-            .. table.concat(names, ", ")
-            .. ")"
-          adapter.run(conn, { { sql = stats_sql, kind = "select", class = "read", line = 1 } }, {}, function(res)
-            local set = res.ok and res.statements[1] and res.statements[1].sets[1]
-            build(set and { columns = set.columns, rows = set.rows } or nil)
-          end)
-        else
-          build(nil)
-        end
+          local relations = explain.relations and explain.relations(plan) or {}
+          if #relations == 0 then
+            for _, r in ipairs(sqlmod.referenced_tables(st.sql)) do
+              relations[#relations + 1] = { name = r.name }
+            end
+          end
+          local tables = {}
+          for _, r in ipairs(relations) do
+            local t = sch and schema.find_table(sch, r.name, r.schema)
+            if t then
+              tables[#tables + 1] = t
+            end
+          end
+          local function build(stats_rows)
+            local plan_lines, plan_marks = explain.to_lines(plan)
+            local prompt = ai.build_analyze_prompt({
+              sql = st.sql,
+              plan_lines = plan_lines,
+              summary = explain.summary and explain.summary(plan) or nil,
+              findings = findings,
+              tables = tables,
+              stats = stats_rows,
+              version = sch and sch.version or nil,
+              analyzed = analyze,
+            })
+            state.running[cell.id].job = ai.ask_text(prompt, function(text, aerr)
+              state.running[cell.id] = nil
+              set_runtime(state, cell, nil, { plan_text = nil })
+              if not text then
+                util.error("analyze: " .. tostring(aerr))
+                if opts.cb then
+                  opts.cb(nil, aerr)
+                end
+                return
+              end
+              notebook.set_analysis(state.nb, cell.id, text, analyze and "EXPLAIN ANALYZE" or "EXPLAIN")
+              state.runtime[cell.id].plan_text = plan_lines
+              state.runtime[cell.id].plan_kind = analyze and "EXPLAIN ANALYZE" or "EXPLAIN"
+              state.runtime[cell.id].plan_info = { plan = plan, marks = plan_marks, findings = rule_findings }
+              state.runtime[cell.id].plan_params = exp and exp.params or nil
+              require("dbgrid.ui.analysis").show(state, {
+                title = "analysis of " .. cells.label(cell, 40),
+                text = text,
+                cell_id = cell.id,
+              })
+              if opts.cb then
+                opts.cb(text)
+              end
+            end, { connection = conn })
+          end
+          if cfg.ai.analyze.include_stats ~= false and #tables > 0 then
+            local names = {}
+            for _, t in ipairs(tables) do
+              names[#names + 1] = util.sql_literal(t.name)
+            end
+            local stats_sql = "select relname, n_live_tup, n_dead_tup, seq_scan, idx_scan, last_analyze, last_autoanalyze"
+              .. " from pg_stat_user_tables where relname in ("
+              .. table.concat(names, ", ")
+              .. ")"
+            adapter.run(conn, { { sql = stats_sql, kind = "select", class = "read", line = 1 } }, {}, function(res)
+              local set = res.ok and res.statements[1] and res.statements[1].sets[1]
+              build(set and { columns = set.columns, rows = set.rows } or nil)
+            end)
+          else
+            build(nil)
+          end
+        end)
       end)
     end)
   end)
@@ -1058,105 +1152,106 @@ end
 ---@param opts? { cb?: fun(delta?: table, err?: string) }
 function M.try_index(state, cell, index_sql, opts)
   opts = opts or {}
-  local st
-  st, cell = first_statement(state, cell)
-  if not st then
-    return
-  end
-  if not sqlmod.is_explainable(st) then
-    return util.warn("cannot explain a " .. st.kind:upper() .. " statement")
-  end
-  local function go(idx)
-    idx = sqlmod.strip_semicolon(util.trim(idx))
-    local directives = cells.directives(cell)
-    M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
-      local adapter, err = adapters.for_connection(conn)
-      if not adapter then
-        return util.error(err or "no adapter")
-      end
-      local script = explain.hypopg_script and explain.hypopg_script(idx, st.sql) or {}
-      local run_stmts = {
-        { sql = "EXPLAIN (FORMAT JSON) " .. st.sql, kind = "explain", class = "read", line = 1 },
-      }
-      for _, sql in ipairs(script) do
-        run_stmts[#run_stmts + 1] = { sql = sql, kind = "select", class = "read", line = 1 }
-      end
-      state.running[cell.id] = { started = util.now(), kind = "explain", adapter = adapter }
-      set_runtime(state, cell, "planning")
-      ui_query().start_spinner(state)
-      state.running[cell.id].job = adapter.run(conn, run_stmts, { timeout_ms = 30000 }, function(res)
-        state.running[cell.id] = nil
-        set_runtime(state, cell, nil)
-        if not res.ok then
-          local msg = res.error and res.error.message or "failed"
-          if msg:find("hypopg", 1, true) then
-            msg = msg .. " — install the extension first: CREATE EXTENSION hypopg;"
-          end
-          util.error("try index: " .. msg)
-          return opts.cb and opts.cb(nil, msg)
+  prepared_statement(state, cell, function(st, fresh_cell)
+    cell = fresh_cell
+    if not st then
+      return
+    end
+    if not sqlmod.is_explainable(st) then
+      return util.warn("cannot explain a " .. st.kind:upper() .. " statement")
+    end
+    local function go(idx)
+      idx = sqlmod.strip_semicolon(util.trim(idx))
+      local directives = cells.directives(cell)
+      M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
+        local adapter, err = adapters.for_connection(conn)
+        if not adapter then
+          return util.error(err or "no adapter")
         end
-        local function plan_of(i)
-          local set = res.statements[i] and res.statements[i].sets[1]
-          local text = set and set.rows[1] and set.rows[1][1]
-          local ok, decoded = pcall(vim.json.decode, type(text) == "string" and text or "")
-          return ok and decoded or nil
-        end
-        local before, after = plan_of(1), plan_of(#run_stmts)
-        if not before or not after then
-          util.error("try index: could not read the plans")
-          return opts.cb and opts.cb(nil, "no plans")
-        end
-        local delta = explain.cost_delta and explain.cost_delta(before, after)
-          or { before = explain.total_cost(before), after = explain.total_cost(after) }
-        local lines = {
-          string.format(" hypothetical: %s", idx),
-          string.format(
-            " estimated cost %s → %s%s%s",
-            tostring(delta.before),
-            tostring(delta.after),
-            delta.pct and string.format(" (%+.0f%%)", delta.pct) or "",
-            delta.used == false and "  · the planner did not use it" or ""
-          ),
-          "",
+        local script = explain.hypopg_script and explain.hypopg_script(idx, st.sql) or {}
+        local run_stmts = {
+          { sql = "EXPLAIN (FORMAT JSON) " .. st.sql, kind = "explain", class = "read", line = 1 },
         }
-        for _, l in ipairs(explain.to_lines(after)) do
-          lines[#lines + 1] = l
+        for _, sql in ipairs(script) do
+          run_stmts[#run_stmts + 1] = { sql = sql, kind = "select", class = "read", line = 1 }
         end
-        state.runtime[cell.id] = state.runtime[cell.id] or {}
-        state.runtime[cell.id].plan_text = lines
-        state.runtime[cell.id].plan_kind = "EXPLAIN with hypothetical index"
-        state.active_cell = cell.id
-        ui_query().render(state)
-        ui_results().show(state, cell.id, { view = "plan" })
-        util.notify(
-          string.format(
-            "cost %s → %s%s",
-            tostring(delta.before),
-            tostring(delta.after),
-            delta.used == false and " (index not used)" or ""
+        state.running[cell.id] = { started = util.now(), kind = "explain", conn = conn, adapter = adapter }
+        set_runtime(state, cell, "planning")
+        ui_query().start_spinner(state)
+        state.running[cell.id].job = adapter.run(conn, run_stmts, { timeout_ms = 30000 }, function(res)
+          state.running[cell.id] = nil
+          set_runtime(state, cell, nil)
+          if not res.ok then
+            local msg = res.error and res.error.message or "failed"
+            if msg:find("hypopg", 1, true) then
+              msg = msg .. " — install the extension first: CREATE EXTENSION hypopg;"
+            end
+            util.error("try index: " .. msg)
+            return opts.cb and opts.cb(nil, msg)
+          end
+          local function plan_of(i)
+            local set = res.statements[i] and res.statements[i].sets[1]
+            local text = set and set.rows[1] and set.rows[1][1]
+            local ok, decoded = pcall(vim.json.decode, type(text) == "string" and text or "")
+            return ok and decoded or nil
+          end
+          local before, after = plan_of(1), plan_of(#run_stmts)
+          if not before or not after then
+            util.error("try index: could not read the plans")
+            return opts.cb and opts.cb(nil, "no plans")
+          end
+          local delta = explain.cost_delta and explain.cost_delta(before, after)
+            or { before = explain.total_cost(before), after = explain.total_cost(after) }
+          local lines = {
+            string.format(" hypothetical: %s", idx),
+            string.format(
+              " estimated cost %s → %s%s%s",
+              tostring(delta.before),
+              tostring(delta.after),
+              delta.pct and string.format(" (%+.0f%%)", delta.pct) or "",
+              delta.used == false and "  · the planner did not use it" or ""
+            ),
+            "",
+          }
+          for _, l in ipairs(explain.to_lines(after)) do
+            lines[#lines + 1] = l
+          end
+          state.runtime[cell.id] = state.runtime[cell.id] or {}
+          state.runtime[cell.id].plan_text = lines
+          state.runtime[cell.id].plan_kind = "EXPLAIN with hypothetical index"
+          state.active_cell = cell.id
+          ui_query().render(state)
+          ui_results().show(state, cell.id, { view = "plan" })
+          util.notify(
+            string.format(
+              "cost %s → %s%s",
+              tostring(delta.before),
+              tostring(delta.after),
+              delta.used == false and " (index not used)" or ""
+            )
           )
-        )
-        if opts.cb then
-          opts.cb(delta)
-        end
+          if opts.cb then
+            opts.cb(delta)
+          end
+        end)
       end)
+    end
+    if index_sql and index_sql ~= "" then
+      return go(index_sql)
+    end
+    local result = notebook.result_of(state.nb, cell.id)
+    local suggestion
+    for _, w in ipairs(result and result.warnings or {}) do
+      if type(w) == "table" and w.suggestion then
+        suggestion = w.suggestion
+        break
+      end
+    end
+    vim.ui.input({ prompt = "Index to try: ", default = suggestion or "CREATE INDEX ON " }, function(input)
+      if input and util.trim(input) ~= "" then
+        go(input)
+      end
     end)
-  end
-  if index_sql and index_sql ~= "" then
-    return go(index_sql)
-  end
-  local result = notebook.result_of(state.nb, cell.id)
-  local suggestion
-  for _, w in ipairs(result and result.warnings or {}) do
-    if type(w) == "table" and w.suggestion then
-      suggestion = w.suggestion
-      break
-    end
-  end
-  vim.ui.input({ prompt = "Index to try: ", default = suggestion or "CREATE INDEX ON " }, function(input)
-    if input and util.trim(input) ~= "" then
-      go(input)
-    end
   end)
 end
 
@@ -1188,7 +1283,7 @@ function M.diff_on(state, cell, conn_name, cb)
     for i, st in ipairs(base.statements) do
       run_stmts[i] = { sql = st.sql, kind = st.kind, class = st.class, line = st.line or 1 }
     end
-    state.running[cell.id] = { started = util.now(), kind = "run", adapter = adapter }
+    state.running[cell.id] = { started = util.now(), kind = "run", conn = conn, adapter = adapter }
     set_runtime(state, cell, "running")
     ui_query().start_spinner(state)
     state.running[cell.id].job = adapter.run(conn, run_stmts, {}, function(res)
@@ -1219,7 +1314,7 @@ function M.cancel(state, cell)
       if r.job then
         local a = r.adapter or adapters.get("postgres")
         if a and a.cancel then
-          a.cancel(r.job)
+          a.cancel(r.job, r.conn)
         elseif r.job.kill then
           pcall(r.job.kill, r.job, 15)
         end

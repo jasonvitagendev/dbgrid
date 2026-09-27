@@ -80,6 +80,15 @@ function M.discovered(root)
       end
     end
   end
+  -- Rails: config/database.yml
+  if not cfg.rails or cfg.rails.enabled ~= false then
+    for _, c in ipairs(require("dbgrid.rails").connections(root, cfg.rails and cfg.rails.environments)) do
+      if not seen[c.url] then
+        seen[c.url] = true
+        out[#out + 1] = c
+      end
+    end
+  end
   return out
 end
 
@@ -250,7 +259,8 @@ function M.add_interactive(cb)
     if not name or name == "" then
       return cb and cb(nil)
     end
-    vim.ui.input({ prompt = "URL (postgres://user:pass@host:5432/db or $DATABASE_URL): " }, function(url)
+    local url_prompt = "URL (postgres://user:pass@host:5432/db, sqlite:path/to.db or $DATABASE_URL): "
+    vim.ui.input({ prompt = url_prompt }, function(url)
       if not url or url == "" then
         return cb and cb(nil)
       end
