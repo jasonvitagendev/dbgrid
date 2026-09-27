@@ -386,9 +386,12 @@ markdown with SQL, results and analyses.
 The entry appears as `prod/writer` and `prod/reader` (readers are
 read-only; plain RDS gets one reader per replica). On the first run the
 endpoints are resolved with the aws CLI and cached (`aws.endpoint_ttl_seconds`),
-an SSM port forward to the bastion is started and kept for the session,
-the password comes from Secrets Manager (or `auth = "iam"`) and goes to psql
-through the environment. The database is `aws.database`, else the secret's
+an SSM port forward to the bastion is started and kept for the session
+(before every run it is probed with a PostgreSQL handshake and replaced
+when the session behind it has died; a run that still cannot reach the
+server rebuilds the tunnel and retries once), the password comes from
+Secrets Manager (or `auth = "iam"`) and goes to psql through the
+environment. The database is `aws.database`, else the secret's
 `dbname` (or `db`), else the cluster's initial database; otherwise you are
 asked once and the answer is saved on the connection. The URL keeps the real host with `hostaddr=127.0.0.1`
 so `ssl = "verify-full"` with `sslrootcert` and ~/.pgpass work. Expired

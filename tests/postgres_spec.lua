@@ -69,6 +69,25 @@ end
 
 local conn = { name = "test", url = url }
 
+H.describe("postgres.connection_failed", function()
+  local function res(message, ran)
+    return { error = message and { message = message } or nil, statements = { { ran = ran } } }
+  end
+  H.it("recognises libpq connection errors before any statement ran", function()
+    H.eq(
+      pg.connection_failed(res('connection to server at "127.0.0.1", port 15122 failed: timeout expired', false)),
+      true
+    )
+    H.eq(pg.connection_failed(res("could not connect to server: Connection refused", false)), true)
+    H.eq(pg.connection_failed(res("server closed the connection unexpectedly", false)), true)
+  end)
+  H.it("leaves other failures alone", function()
+    H.eq(pg.connection_failed(res('relation "x" does not exist', false)), false)
+    H.eq(pg.connection_failed(res("server closed the connection unexpectedly", true)), false)
+    H.eq(pg.connection_failed(res(nil, true)), false)
+  end)
+end)
+
 H.describe("postgres integration", function()
   H.it("runs statements and returns rows, tags and timing", function()
     local result

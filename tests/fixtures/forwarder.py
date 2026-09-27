@@ -3,6 +3,8 @@
 
   forwarder.py LOCAL_PORT              accept connections on 127.0.0.1:LOCAL_PORT and close them
   forwarder.py LOCAL_PORT TARGET_PORT  forward every connection to 127.0.0.1:TARGET_PORT
+  forwarder.py LOCAL_PORT --answer     fake server: reply "N" to whatever a client sends first
+  forwarder.py LOCAL_PORT --stale      dead session: accept, read, never reply (like an idle SSM plugin)
 
 Runs until it is killed (SIGTERM), like a real port-forwarding session.
 """
@@ -44,12 +46,26 @@ def forward(client, target_port):
     upstream.close()
 
 
+def answer(client, reply):
+    try:
+        client.settimeout(30)
+        if client.recv(64) and reply is not None:
+            client.sendall(reply)
+        if reply is None:
+            client.recv(64)  # keep the connection open until the client gives up
+    except OSError:
+        pass
+    finally:
+        client.close()
+
+
 def main():
     if len(sys.argv) < 2:
         sys.stderr.write(__doc__)
         sys.exit(2)
     local_port = int(sys.argv[1])
-    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    mode = sys.argv[2] if len(sys.argv) > 2 else None
+    target_port = int(mode) if mode and mode.isdigit() else None
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", local_port))
@@ -58,10 +74,14 @@ def main():
     sys.stderr.flush()
     while True:
         client, _ = server.accept()
-        if target_port is None:
+        if mode == "--answer":
+            threading.Thread(target=answer, args=(client, b"N"), daemon=True).start()
+        elif mode == "--stale":
+            threading.Thread(target=answer, args=(client, None), daemon=True).start()
+        elif target_port is None:
             client.close()
-            continue
-        threading.Thread(target=forward, args=(client, target_port), daemon=True).start()
+        else:
+            threading.Thread(target=forward, args=(client, target_port), daemon=True).start()
 
 
 if __name__ == "__main__":

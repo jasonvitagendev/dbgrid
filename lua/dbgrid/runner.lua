@@ -381,6 +381,8 @@ local function log_history(state, cell, conn, result, sql)
   })
 end
 
+local execute_done
+
 ---Execute the prepared statements.
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
@@ -405,76 +407,99 @@ local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
     if not vim.api.nvim_buf_is_valid(state.buf) then
       return
     end
-    local fresh = cells.by_id(state.buf, cell.id) or cell
-    local truncated = false
-    for i, st in ipairs(res.statements) do
-      st.plan = extra.plans[i]
-      for _, set in ipairs(st.sets) do
-        if st.limit_applied and (set.row_count or #set.rows) >= st.limit_applied then
-          truncated = true
+    if not extra.retried and conn.tunnel_key and adapter.connection_failed and adapter.connection_failed(res) then
+      -- the tunnel took the connection but nothing came back (a dead SSM session
+      -- keeps its local port open): rebuild it and run the cell once more
+      require("dbgrid.tunnel").kill(conn.tunnel_key)
+      connections.forget(conn.name)
+      util.warn("tunnel to " .. conn.name .. " was stale; reconnecting")
+      local declared = connections.get(conn.name) or conn
+      declared._resolved = nil
+      local again = vim.tbl_extend("force", extra, { retried = true })
+      return connections.resolve(declared, function(eff, err)
+        if eff then
+          return execute(state, cell, eff, adapter, run_stmts, again, cb)
         end
-      end
+        res.error.message = res.error.message .. " (reconnect failed: " .. tostring(err) .. ")"
+        execute_done(state, cell, conn, run_stmts, again, res, cb)
+      end)
     end
-    local previous = notebook.result_of(state.nb, fresh.id)
-    local result = {
-      ok = res.ok,
-      statements = res.statements,
-      notices = res.notices,
-      error = res.error,
-      elapsed_ms = res.elapsed_ms,
-      server_ms = res.server_ms,
-      cancelled = res.cancelled,
-      ran_at = util.epoch(),
-      connection = conn.name,
-      warnings = extra.warnings,
-      sql_hash = cells.hash(fresh),
-      truncated = truncated,
-      dry_run = extra.dry_run or nil,
-      params = extra.params,
-      refs = extra.refs,
-    }
-    local live = state.live and state.live[fresh.id]
-    if extra.live and live then
-      -- live tick: keep the previous result for the change highlight, stay off the disk
-      live.changed, live.changed_count = changed_cells(previous, result)
-      live.ticks = (live.ticks or 0) + 1
-      live.last_tick = util.epoch()
-      local hist = live.history
-      local first = result.statements[1] and result.statements[1].sets[1]
-      hist[#hist + 1] = { ts = result.ran_at, rows = first and first.rows or {}, columns = first and first.columns }
-      while #hist > (cfg.live.history or 60) do
-        table.remove(hist, 1)
-      end
-      notebook.set_result_memory(state.nb, fresh, result)
-    else
-      if previous and previous ~= vim.NIL then
-        state.previous = state.previous or {}
-        state.previous[fresh.id] = previous
-      end
-      notebook.set_result(state.nb, fresh, result)
-      log_history(state, fresh, conn, result, extra.sql)
-    end
-    state.runtime[fresh.id] = { status = res.ok and "ok" or "error" }
-    M.clear_diagnostics(state, fresh)
-    if not res.ok and res.error then
-      set_error_diagnostic(state, fresh, res.error)
-    end
-    if not extra.live then
-      state.active_cell = fresh.id
-    end
-    ui_query().render(state)
-    if not extra.live or state.view.cell_id == fresh.id then
-      ui_results().show(state, fresh.id)
-    end
-    if not res.ok and live then
-      M.stop_live(state, fresh.id, "error")
-    end
-    if cb then
-      cb(result)
-    end
+    execute_done(state, cell, conn, run_stmts, extra, res, cb)
   end)
   if state.running[cell.id] then
     state.running[cell.id].job = job
+  end
+end
+
+---Store, render and report the result of a run.
+function execute_done(state, cell, conn, run_stmts, extra, res, cb)
+  local cfg = config.get()
+  local fresh = cells.by_id(state.buf, cell.id) or cell
+  local truncated = false
+  for i, st in ipairs(res.statements) do
+    st.plan = extra.plans[i]
+    for _, set in ipairs(st.sets) do
+      if st.limit_applied and (set.row_count or #set.rows) >= st.limit_applied then
+        truncated = true
+      end
+    end
+  end
+  local previous = notebook.result_of(state.nb, fresh.id)
+  local result = {
+    ok = res.ok,
+    statements = res.statements,
+    notices = res.notices,
+    error = res.error,
+    elapsed_ms = res.elapsed_ms,
+    server_ms = res.server_ms,
+    cancelled = res.cancelled,
+    ran_at = util.epoch(),
+    connection = conn.name,
+    warnings = extra.warnings,
+    sql_hash = cells.hash(fresh),
+    truncated = truncated,
+    dry_run = extra.dry_run or nil,
+    params = extra.params,
+    refs = extra.refs,
+  }
+  local live = state.live and state.live[fresh.id]
+  if extra.live and live then
+    -- live tick: keep the previous result for the change highlight, stay off the disk
+    live.changed, live.changed_count = changed_cells(previous, result)
+    live.ticks = (live.ticks or 0) + 1
+    live.last_tick = util.epoch()
+    local hist = live.history
+    local first = result.statements[1] and result.statements[1].sets[1]
+    hist[#hist + 1] = { ts = result.ran_at, rows = first and first.rows or {}, columns = first and first.columns }
+    while #hist > (cfg.live.history or 60) do
+      table.remove(hist, 1)
+    end
+    notebook.set_result_memory(state.nb, fresh, result)
+  else
+    if previous and previous ~= vim.NIL then
+      state.previous = state.previous or {}
+      state.previous[fresh.id] = previous
+    end
+    notebook.set_result(state.nb, fresh, result)
+    log_history(state, fresh, conn, result, extra.sql)
+  end
+  state.runtime[fresh.id] = { status = res.ok and "ok" or "error" }
+  M.clear_diagnostics(state, fresh)
+  if not res.ok and res.error then
+    set_error_diagnostic(state, fresh, res.error)
+  end
+  if not extra.live then
+    state.active_cell = fresh.id
+  end
+  ui_query().render(state)
+  if not extra.live or state.view.cell_id == fresh.id then
+    ui_results().show(state, fresh.id)
+  end
+  if not res.ok and live then
+    M.stop_live(state, fresh.id, "error")
+  end
+  if cb then
+    cb(result)
   end
 end
 

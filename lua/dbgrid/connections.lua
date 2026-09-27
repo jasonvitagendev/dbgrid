@@ -631,6 +631,9 @@ local function tunnel_spec(conn)
     t.remote = (host or "localhost") .. ":" .. (port or "5432")
   end
   t.key = t.key or (t.kind .. "|" .. conn.name .. "|" .. (t.remote or table.concat(t.cmd or {}, " ")))
+  if t.handshake == nil and adapters.for_connection(conn) == adapters.get("postgres") then
+    t.handshake = "postgres"
+  end
   return t
 end
 
@@ -697,14 +700,20 @@ function M.resolve(conn, cb)
   if cached then
     if cached.local_port then
       -- a tunnel may have died (SSM idle timeout): probe before reuse
-      require("dbgrid.tunnel").probe(cached.local_port, config.get().aws.probe_ms or 500, function(ok)
+      local tunnel = require("dbgrid.tunnel")
+      local function reuse(ok)
         if ok then
           return cb(cached)
         end
         resolved[key] = nil
         inflight[key] = { cb }
         start()
-      end)
+      end
+      if cached.tunnel_key then
+        tunnel.check(cached.tunnel_key, reuse)
+      else
+        tunnel.probe(cached.local_port, config.get().aws.probe_ms or 500, reuse)
+      end
       return
     end
     return cb(cached)

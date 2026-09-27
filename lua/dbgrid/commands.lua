@@ -205,11 +205,12 @@ M.subcommands = {
       for _, t in ipairs(list) do
         items[#items + 1] = {
           text = string.format(
-            "%s  localhost:%d  pid %s  %s",
+            "%s  localhost:%d  pid %s  %s  %s",
             t.key,
             t.port or 0,
             tostring(t.pid),
-            t.ok and "up" or "dead"
+            t.ok and "up" or "dead",
+            util.ago(t.started)
           ),
           data = t,
         }

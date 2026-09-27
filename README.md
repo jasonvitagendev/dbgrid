@@ -256,8 +256,12 @@ On the first run the plugin calls `describe-db-clusters` (or
 document to a local port, reads the secret and passes the password to psql
 through the environment only. The URL psql gets keeps the real host name with
 `hostaddr=127.0.0.1&port=<local>`, so `sslmode=verify-full` and `~/.pgpass`
-keep working. Before every run the local port is probed; a dead tunnel (SSM
-idle timeout is 20 minutes by default) is restarted. Tunnels die with Neovim.
+keep working. Before every run the tunnel is probed with a PostgreSQL
+handshake, so a dead SSM session (idle timeout is 20 minutes by default),
+which still accepts connections on its local port but forwards nothing, is
+replaced before psql runs. Should psql still fail to reach the server, the
+tunnel is rebuilt and the cell runs once more. Tunnels die with Neovim;
+`aws tunnels` lists them with their age.
 
 The bastion is an instance id, the `Name` tag of an instance
 (`bastion = "bastion-prod"`) or `"auto"`. A name or `auto` is looked up among
@@ -804,7 +808,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   live = { min_interval_ms = 1000, history = 60, max_cells = 4 },
   templates = { dir = nil },
   history = { enabled = true, max_entries = 2000 },
-  aws = { cli = "aws", endpoint_ttl_seconds = 86400, tunnel_ready_ms = 15000, probe_ms = 500,
+  aws = { cli = "aws", endpoint_ttl_seconds = 86400, tunnel_ready_ms = 15000, probe_ms = 500, handshake_ms = 3000,
           login_cmd = { "aws", "sso", "login", "--profile", "{profile}" }, ssl = "require",
           bastion_names = { "bastion", "jump" } },
   results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },

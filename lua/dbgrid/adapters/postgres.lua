@@ -790,6 +790,29 @@ function M.run(conn, statements, opts, cb)
   end)
 end
 
+---Did the run fail before reaching the server? True for libpq's connection
+---errors when no statement produced output, so the run can be repeated safely.
+---@param res table   result handed to M.run's callback
+---@return boolean
+function M.connection_failed(res)
+  local msg = res.error and res.error.message or ""
+  if
+    not (
+      msg:find("^connection to server")
+      or msg:find("^could not connect to server")
+      or msg:find("^server closed the connection unexpectedly")
+    )
+  then
+    return false
+  end
+  for _, st in ipairs(res.statements or {}) do
+    if st.ran then
+      return false
+    end
+  end
+  return true
+end
+
 ---EXPLAIN (FORMAT JSON) for every statement; failures yield nil plans.
 ---@param conn dbgrid.Connection
 ---@param statements dbgrid.RunStatement[]

@@ -8,6 +8,8 @@ Environment:
   DBGRID_TEST_URL                the port of this URL becomes the cluster port (default 5433)
 
 `ssm start-session` really forwards: it execs forwarder.py localPortNumber -> portNumber.
+Without a database on portNumber (no DBGRID_TEST_URL) the session answers the
+PostgreSQL handshake itself, so the tunnel probe sees a live server.
 """
 import json
 import os
@@ -298,7 +300,8 @@ def main():
             fail("InvalidParameters: localPortNumber and portNumber are required", 255)
         sys.stderr.write("Starting session with SessionId: fake-%s\n" % local_port)
         sys.stderr.flush()
-        os.execvp("python3", ["python3", os.path.join(HERE, "forwarder.py"), local_port, remote_port])
+        target = remote_port if os.environ.get("DBGRID_TEST_URL") else "--answer"
+        os.execvp("python3", ["python3", os.path.join(HERE, "forwarder.py"), local_port, target])
     else:
         fail("usage: aws [options] <command> <subcommand> [parameters]\naws: error: argument command: "
              "Invalid choice %s %s" % (svc, cmd), 252)

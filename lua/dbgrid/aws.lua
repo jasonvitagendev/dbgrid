@@ -1197,6 +1197,7 @@ function M.resolve(conn, cb)
           document = a.document,
           parameters = a.parameters,
           cli = cli_exe(a),
+          handshake = "postgres",
         }, function(port, terr)
           if not port then
             -- a jumpbox found by name may have been replaced: look it up again next time

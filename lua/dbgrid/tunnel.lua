@@ -14,6 +14,7 @@ local M = {}
 ---@field kind "ssm"|"ssh"|"cmd"
 ---@field local_port? integer   fixed local port; nil = stable_port(key) if free, else a free port
 ---@field ready_ms? integer     how long to wait for the port after spawn (default aws.tunnel_ready_ms or 15000)
+---@field handshake? "postgres"  protocol spoken at the far end: probes wait for the server's reply, not just the TCP accept
 ---@field env? table<string,string>
 ---@field profile? string       ssm
 ---@field region? string        ssm
@@ -40,6 +41,14 @@ local M = {}
 
 local STDERR_LINES = 20
 local POLL_MS = 200
+
+-- First packet of a probe per protocol. A forwarder whose session has died
+-- (SSM idle timeout) still accepts TCP connections but never answers, so a
+-- plain connect cannot tell it from a live tunnel; a reply from the server can.
+-- postgres: an 8-byte GSSENCRequest (protocol 1234.5680). Every server answers
+-- one byte ('N', or 'G' with GSSAPI) and, unlike an abandoned SSLRequest,
+-- logs nothing when the client hangs up after 'N'.
+local HANDSHAKE = { postgres = string.char(0, 0, 0, 8, 4, 210, 22, 48) }
 
 ---@type table<string, dbgrid.Tunnel>
 local tunnels = {}
@@ -136,11 +145,13 @@ function M.free_port()
   return name.port
 end
 
----TCP connect to 127.0.0.1:port; never blocks. cb(true) when the connection is accepted.
+---TCP connect to 127.0.0.1:port; never blocks. cb(true) when the connection is
+---accepted, or, with a handshake, when the server behind the port answers it.
 ---@param port integer
 ---@param timeout_ms integer
 ---@param cb fun(ok: boolean)
-function M.probe(port, timeout_ms, cb)
+---@param handshake? "postgres"
+function M.probe(port, timeout_ms, cb, handshake)
   local sock = uv.new_tcp()
   local timer = uv.new_timer()
   local done = false
@@ -163,16 +174,57 @@ function M.probe(port, timeout_ms, cb)
   if not sock or not timer then
     return finish(false)
   end
+  local payload = handshake and HANDSHAKE[handshake]
   timer:start(timeout_ms, 0, function()
     finish(false)
   end)
   local ok, req = pcall(sock.connect, sock, "127.0.0.1", port, function(cerr)
-    finish(cerr == nil)
+    if cerr or not payload then
+      return finish(cerr == nil)
+    end
+    sock:read_start(function(rerr, data)
+      finish(rerr == nil and data ~= nil) -- EOF or an error: nothing answers behind the port
+    end)
+    sock:write(payload, function(werr)
+      if werr then
+        finish(false)
+      end
+    end)
   end)
   if not ok or req == nil then
     -- connect failed synchronously (bad port, no socket): no callback will come
     finish(false)
   end
+end
+
+---Probe timeout for a tunnel: a handshake crosses the tunnel and back, a plain connect stays local.
+---@param handshake? string
+---@return integer
+local function probe_timeout(handshake)
+  local cfg = aws_cfg()
+  if handshake then
+    return cfg.handshake_ms or 3000
+  end
+  return cfg.probe_ms or 500
+end
+
+---@param t dbgrid.Tunnel
+---@param cb fun(ok: boolean)
+local function probe_tunnel(t, cb)
+  M.probe(t.port, probe_timeout(t.spec.handshake), cb, t.spec.handshake)
+end
+
+---Does the tunnel with this key still forward? cb(false) for an unknown, dead or still-starting one.
+---@param key string
+---@param cb fun(ok: boolean)
+function M.check(key, cb)
+  local t = tunnels[key]
+  if not t or not running(t) or t.starting then
+    return vim.schedule(function()
+      cb(false)
+    end)
+  end
+  probe_tunnel(t, cb)
 end
 
 ---Command line for a spec on a given local port.
@@ -270,13 +322,12 @@ local function start(spec, cbs)
   t.job = job
   t.pid = job.pid
   local ready_ms = spec.ready_ms or aws_cfg().tunnel_ready_ms or 15000
-  local probe_ms = aws_cfg().probe_ms or 500
   local deadline = util.now() + ready_ms / 1000
   local function poll()
     if not t.starting then
       return -- exited (settled by on_exit) or killed
     end
-    M.probe(port, probe_ms, function(open)
+    probe_tunnel(t, function(open)
       if not t.starting then
         return
       end
@@ -310,7 +361,7 @@ function M.ensure(spec, cb)
   end
   if t and running(t) then
     t.starting = { cb }
-    M.probe(t.port, aws_cfg().probe_ms or 500, function(open)
+    probe_tunnel(t, function(open)
       if open then
         return settle(t, t.port)
       end

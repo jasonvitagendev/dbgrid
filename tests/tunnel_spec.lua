@@ -5,11 +5,11 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 local forwarder = root .. "/tests/fixtures/forwarder.py"
 
 ---Run tunnel.probe synchronously.
-local function probe(port, timeout_ms)
+local function probe(port, timeout_ms, handshake)
   local result
   tunnel.probe(port, timeout_ms or 500, function(ok)
     result = ok
-  end)
+  end, handshake)
   H.truthy(
     H.wait(5000, function()
       return result ~= nil
@@ -213,6 +213,62 @@ H.describe("tunnel lifecycle", function()
       "process not terminated after timeout"
     )
     tunnel.kill("test|sleep")
+  end)
+
+  H.it("handshake probe needs a reply from behind the port", function()
+    local live = { key = "test|answer", kind = "cmd", cmd = { "python3", forwarder, "{port}", "--answer" } }
+    local port, err = ensure(vim.tbl_extend("force", live, { handshake = "postgres", ready_ms = 10000 }))
+    H.eq(err, nil)
+    H.eq(probe(port, 2000, "postgres"), true)
+    -- a listener that swallows the request looks fine to a plain connect only
+    local stale = { key = "test|stale", kind = "cmd", cmd = { "python3", forwarder, "{port}", "--stale" } }
+    local sport = ensure(stale)
+    H.eq(probe(sport, 500), true)
+    H.eq(probe(sport, 500, "postgres"), false)
+    -- and so does one that hangs up (the plain listener closes every connection)
+    local closing = ensure({ key = "test|closing", kind = "cmd", cmd = { "python3", forwarder, "{port}" } })
+    H.eq(probe(closing, 500, "postgres"), false)
+    tunnel.kill_all()
+  end)
+
+  H.it("check probes a known tunnel with its handshake and replaces a stale one", function()
+    local checked
+    tunnel.check("test|unknown", function(ok)
+      checked = ok
+    end)
+    H.truthy(H.wait(2000, function()
+      return checked ~= nil
+    end))
+    H.eq(checked, false)
+    -- a stale forwarder with a handshake never becomes ready: ensure gives up and terminates it
+    local port, err = ensure({
+      key = "test|stale-hs",
+      kind = "cmd",
+      cmd = { "python3", forwarder, "{port}", "--stale" },
+      handshake = "postgres",
+      ready_ms = 1500,
+    })
+    H.eq(port, nil)
+    H.matches(err, "did not open localhost:%d+ within 1500 ms")
+    tunnel.kill_all()
+    -- a live one passes check
+    port, err = ensure({
+      key = "test|live-hs",
+      kind = "cmd",
+      cmd = { "python3", forwarder, "{port}", "--answer" },
+      handshake = "postgres",
+      ready_ms = 10000,
+    })
+    H.eq(err, nil)
+    checked = nil
+    tunnel.check("test|live-hs", function(ok)
+      checked = ok
+    end)
+    H.truthy(H.wait(5000, function()
+      return checked ~= nil
+    end))
+    H.eq(checked, true)
+    tunnel.kill_all()
   end)
 
   H.it("respects a fixed local_port", function()

@@ -147,8 +147,10 @@ M.defaults = {
     endpoint_ttl_seconds = 86400,
     -- How long to wait for the local port after spawning a tunnel.
     tunnel_ready_ms = 15000,
-    -- Timeout of the pre-run tunnel probe.
+    -- Timeout of the pre-run tunnel probe: a plain connect to the local port, or,
+    -- for PostgreSQL, the round trip of a handshake to the server behind the tunnel.
     probe_ms = 500,
+    handshake_ms = 3000,
     -- Command that refreshes credentials; "{profile}" is substituted. A company CLI goes here.
     login_cmd = { "aws", "sso", "login", "--profile", "{profile}" },
     -- Default sslmode through the tunnel ("require" | "verify-full", the latter needs sslrootcert).
