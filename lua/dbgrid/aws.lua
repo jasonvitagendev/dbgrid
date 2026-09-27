@@ -1404,8 +1404,17 @@ function M.pick_bastion(aws_cfg, hints, cb)
   end
   M.bastions(aws_cfg, function(list, err)
     if not list or #list == 0 then
+      -- say why the old prompt appears: the lookup failed, or nothing is registered with SSM there
       if err then
         util.warn("dbgrid: could not list SSM instances (" .. err .. ")")
+      else
+        util.warn(
+          string.format(
+            "dbgrid: no SSM-managed instances for profile %s in %s; enter the bastion instance id",
+            profile_of(aws_cfg),
+            aws_cfg.region or "the default region"
+          )
+        )
       end
       return manual()
     end
