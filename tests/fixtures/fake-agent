@@ -1,0 +1,42 @@
+#!/bin/sh
+# A stand-in for the claude/kimi/codex CLI used by the tests: reads the prompt
+# on stdin and answers with canned markdown (or SQL when asked for SQL only).
+prompt=$(cat)
+if printf '%s' "$prompt" | grep -q "Reply with SQL only"; then
+  echo "select id, email from users where id <= 2 order by id;"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "^## Tool"; then
+  # investigation mode: prove the helper works by using it
+  out=$(dbgrid-query 'select count(*) as n from users' 2>&1)
+  echo "## What is slow"
+  echo "helper said: $out"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "^## Error"; then
+  cat <<'MD'
+## Cause
+The column does not exist.
+
+## Fix
+```sql
+select id, email from users;
+```
+MD
+  exit 0
+fi
+cat <<'MD'
+## What is slow
+The sequential scan on users.
+
+## Why
+No index on balance.
+
+## Fix
+```sql
+CREATE INDEX CONCURRENTLY users_balance_idx ON users (balance);
+```
+
+## Verify
+Re-run EXPLAIN ANALYZE and check for an Index Scan.
+MD

@@ -14,7 +14,7 @@ local function has_snacks()
 end
 
 ---@param items dbgrid.PickItem[]
----@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem)> }
+---@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem)>, hint?: string }
 function M.pick(items, opts)
   if #items == 0 then
     opts.on_select(nil)
@@ -38,14 +38,16 @@ function M.pick(items, opts)
         actions[name] = function(picker, item)
           picker:close()
           if item and item.item then
-            fn(item.item)
+            vim.schedule(function()
+              fn(item.item)
+            end)
           end
         end
         keys[key] = { name, mode = { "n", "i" } }
       end
       Snacks.picker.pick({
         source = "dbgrid",
-        title = opts.prompt,
+        title = opts.hint and (opts.prompt .. "  " .. opts.hint) or opts.prompt,
         items = sitems,
         format = "text",
         preview = opts.preview ~= false and "preview" or false,
@@ -54,7 +56,10 @@ function M.pick(items, opts)
         win = { input = { keys = keys } },
         confirm = function(picker, item)
           picker:close()
-          opts.on_select(item and item.item or nil)
+          -- close() queues a stopinsert; defer so a follow-up input starts in insert mode
+          vim.schedule(function()
+            opts.on_select(item and item.item or nil)
+          end)
         end,
       })
     end)
@@ -141,17 +146,39 @@ function M.tag(cb)
   })
 end
 
----Pick a connection (or add one).
+---Pick a connection (or add one). With snacks, <C-e> edits and <C-x> removes
+---the saved connection under the cursor and the picker reopens; without it,
+---`:Dbgrid connections edit|remove` do the same.
 ---@param cb fun(conn?: dbgrid.Connection)
-function M.connection(cb)
+---@param opts? { prompt?: string, exclude?: string, saved_only?: boolean, allow_new?: boolean }
+function M.connection(cb, opts)
+  opts = opts or {}
   local connections = require("dbgrid.connections")
   local items = {}
   for _, c in ipairs(connections.all()) do
-    items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url) } }
+    local saved = c.source == "saved" or c.source == "project"
+    if c.name ~= opts.exclude and (saved or not opts.saved_only) then
+      items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url or "") } }
+    end
   end
-  items[#items + 1] = { text = "+ add connection", data = "new", preview = { "Save a new connection url." } }
+  if opts.saved_only and #items == 0 then
+    util.warn("no saved connections yet: add one with :Dbgrid connections")
+    return cb(nil)
+  end
+  if opts.allow_new ~= false then
+    items[#items + 1] = { text = "+ add connection", data = "new", preview = { "Save a new connection url." } }
+    items[#items + 1] = {
+      text = "+ add AWS RDS / Aurora connection",
+      data = "aws",
+      preview = { "Profile, cluster, bastion, secret." },
+    }
+  end
+  local function reopen()
+    M.connection(cb, opts)
+  end
   M.pick(items, {
-    prompt = "Connections",
+    prompt = opts.prompt or "Connections",
+    hint = "(<C-e> edit, <C-x> remove)",
     preview = false,
     on_select = function(item)
       if not item then
@@ -160,8 +187,23 @@ function M.connection(cb)
       if item.data == "new" then
         return connections.add_interactive(cb)
       end
+      if item.data == "aws" then
+        return require("dbgrid.aws").add_interactive(cb)
+      end
       cb(item.data)
     end,
+    actions = {
+      ["<C-e>"] = function(item)
+        if type(item.data) == "table" then
+          connections.edit_interactive(item.data, reopen)
+        end
+      end,
+      ["<C-x>"] = function(item)
+        if type(item.data) == "table" then
+          connections.remove_interactive(item.data, reopen)
+        end
+      end,
+    },
   })
 end
 

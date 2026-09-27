@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Fake `aws` CLI for the dbgrid test-suite. Prints canned JSON shaped like the real CLI v2.
+
+Environment:
+  DBGRID_FAKE_AWS_LOG            append one line per invocation (the argv) to this file
+  DBGRID_FAKE_AWS_DENY           comma-separated "<service> <command>" pairs that fail with AccessDeniedException
+  DBGRID_FAKE_AWS_EXPIRED_UNTIL  until this file exists every call fails like an expired SSO token
+  DBGRID_TEST_URL                the port of this URL becomes the cluster port (default 5433)
+
+`ssm start-session` really forwards: it execs forwarder.py localPortNumber -> portNumber.
+"""
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ACCOUNT = "123456789012"
+REGION = "ap-southeast-1"
+
+
+def db_port():
+    url = os.environ.get("DBGRID_TEST_URL", "")
+    m = re.search(r"@[^/:]+:(\d+)", url)
+    return int(m.group(1)) if m else 5433
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, indent=4) + "\n")
+
+
+def fail(msg, code=254):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def parse(argv):
+    """Positional words and --key value options (a flag without a value becomes True)."""
+    words, opts = [], {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            if "=" in a:
+                k, v = a[2:].split("=", 1)
+                opts[k] = v
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                opts[a[2:]] = argv[i + 1]
+                i += 1
+            else:
+                opts[a[2:]] = True
+        else:
+            words.append(a)
+        i += 1
+    return words, opts
+
+
+SECRET_ARN = "arn:aws:secretsmanager:%s:%s:secret:rds!cluster-3f2c1a6e-app-prod-AbCdEf" % (REGION, ACCOUNT)
+
+
+def cluster(cid):
+    port = db_port()
+    return {
+        "DBClusterIdentifier": cid,
+        "DBClusterArn": "arn:aws:rds:%s:%s:cluster:%s" % (REGION, ACCOUNT, cid),
+        "Status": "available",
+        "Engine": "aurora-postgresql",
+        "EngineVersion": "16.4",
+        "Endpoint": "db.internal",
+        "ReaderEndpoint": "db-ro.internal",
+        "Port": port,
+        "MasterUsername": "postgres",
+        "DatabaseName": "dbgrid_test",
+        "MultiAZ": True,
+        "DBClusterMembers": [
+            {"DBInstanceIdentifier": cid + "-1", "IsClusterWriter": True, "PromotionTier": 1},
+            {"DBInstanceIdentifier": cid + "-2", "IsClusterWriter": False, "PromotionTier": 1},
+        ],
+        "MasterUserSecret": {"SecretArn": SECRET_ARN, "SecretStatus": "active", "KmsKeyId": "arn:aws:kms:x"},
+        "StorageEncrypted": True,
+        "DeletionProtection": True,
+    }
+
+
+def instance(iid, cluster_id=None, replicas=None, source=None):
+    port = db_port()
+    d = {
+        "DBInstanceIdentifier": iid,
+        "DBInstanceArn": "arn:aws:rds:%s:%s:db:%s" % (REGION, ACCOUNT, iid),
+        "DBInstanceClass": "db.r6g.large",
+        "Engine": "aurora-postgresql" if cluster_id else "postgres",
+        "DBInstanceStatus": "available",
+        "EngineVersion": "16.4",
+        "Endpoint": {"Address": iid + ".abc123.%s.rds.amazonaws.com" % REGION, "Port": port, "HostedZoneId": "Z1"},
+        "ReadReplicaDBInstanceIdentifiers": replicas or [],
+        "PendingModifiedValues": {},
+        "DBSubnetGroup": {"DBSubnetGroupName": "app-private", "VpcId": "vpc-0app", "SubnetGroupStatus": "Complete"},
+        "PubliclyAccessible": False,
+    }
+    if cluster_id:
+        d["DBClusterIdentifier"] = cluster_id
+    if source:
+        d["ReadReplicaSourceDBInstanceIdentifier"] = source
+    if not cluster_id and not source:
+        d["MasterUserSecret"] = {"SecretArn": SECRET_ARN, "SecretStatus": "active"}
+    return d
+
+
+INSTANCES = [
+    instance("app-prod-1", cluster_id="app-prod"),
+    instance("app-prod-2", cluster_id="app-prod"),
+    instance("app-solo", replicas=["app-solo-r1", "app-solo-r2"]),
+    instance("app-solo-r1", source="app-solo"),
+    instance("app-solo-r2", source="app-solo"),
+]
+
+
+def main():
+    argv = sys.argv[1:]
+    log = os.environ.get("DBGRID_FAKE_AWS_LOG")
+    if log:
+        with open(log, "a") as fh:
+            fh.write(" ".join(argv) + "\n")
+    if argv == ["--version"]:
+        sys.stdout.write("aws-cli/2.17.0 Python/3.11.9 Linux/6.1.0 exe/x86_64\n")
+        return
+    gate = os.environ.get("DBGRID_FAKE_AWS_EXPIRED_UNTIL")
+    if gate and not os.path.exists(gate):
+        fail("Error when retrieving token from sso: Token has expired and refresh failed", 255)
+    words, opts = parse(argv)
+    if len(words) < 2:
+        fail("usage: aws [options] <command> <subcommand> [parameters]", 252)
+    svc, cmd = words[0], words[1]
+    deny = [d.strip() for d in os.environ.get("DBGRID_FAKE_AWS_DENY", "").split(",") if d.strip()]
+    if "%s %s" % (svc, cmd) in deny:
+        op = "".join(part.capitalize() for part in cmd.split("-"))
+        fail("An error occurred (AccessDeniedException) when calling the %s operation: User: "
+             "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Db_abc/jason is not authorized to perform: %s:%s"
+             % (op, ACCOUNT, svc, op))
+
+    if svc == "configure" and cmd == "list-profiles":
+        sys.stdout.write("default\nprod\nstaging\n")
+    elif svc == "configure" and cmd == "get":
+        sys.stdout.write(REGION + "\n")
+    elif svc == "sts" and cmd == "get-caller-identity":
+        out({
+            "UserId": "AROAEXAMPLE:jason",
+            "Account": ACCOUNT,
+            "Arn": "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Admin_abc/jason" % ACCOUNT,
+        })
+    elif svc == "rds" and cmd == "describe-db-clusters":
+        cid = opts.get("db-cluster-identifier")
+        if cid == "app-nodb":
+            # created without an initial database; its managed secret has username/password only
+            c = cluster("app-nodb")
+            del c["DatabaseName"]
+            c["MasterUserSecret"]["SecretArn"] = SECRET_ARN.replace("app-prod", "app-nodb")
+            out({"DBClusters": [c]})
+            return
+        if cid and cid != "app-prod":
+            fail("An error occurred (DBClusterNotFoundFault) when calling the DescribeDBClusters operation: "
+                 "DBCluster %s not found." % cid)
+        out({"DBClusters": [cluster("app-prod")]})
+    elif svc == "rds" and cmd == "describe-db-instances":
+        iid = opts.get("db-instance-identifier")
+        if iid:
+            found = [d for d in INSTANCES if d["DBInstanceIdentifier"] == iid]
+            if not found:
+                fail("An error occurred (DBInstanceNotFound) when calling the DescribeDBInstances operation: "
+                     "DBInstance %s not found." % iid)
+            out({"DBInstances": found})
+        else:
+            out({"DBInstances": INSTANCES})
+    elif svc == "rds" and cmd == "describe-pending-maintenance-actions":
+        out({"PendingMaintenanceActions": []})
+    elif svc == "rds" and cmd == "generate-db-auth-token":
+        sys.stdout.write("%s:5432/?Action=connect&DBUser=%s&X-Amz-Signature=deadbeef\n"
+                         % (opts.get("hostname", "h"), opts.get("username", "u")))
+    elif svc == "rds" and cmd == "describe-events":
+        out({
+            "Events": [
+                {
+                    "SourceIdentifier": "app-prod",
+                    "SourceType": "db-cluster",
+                    "Message": "Started cross AZ failover to DB instance: app-prod-2",
+                    "EventCategories": ["failover"],
+                    "Date": "2026-09-26T01:02:03.456000+00:00",
+                    "SourceArn": "arn:aws:rds:%s:%s:cluster:app-prod" % (REGION, ACCOUNT),
+                },
+                {
+                    "SourceIdentifier": "app-prod",
+                    "SourceType": "db-cluster",
+                    "Message": "Completed failover to DB instance: app-prod-2",
+                    "EventCategories": ["failover"],
+                    "Date": "2026-09-26T01:02:33.000000+00:00",
+                    "SourceArn": "arn:aws:rds:%s:%s:cluster:app-prod" % (REGION, ACCOUNT),
+                },
+            ]
+        })
+    elif svc == "rds" and cmd == "describe-blue-green-deployments":
+        out({
+            "BlueGreenDeployments": [
+                {
+                    "BlueGreenDeploymentIdentifier": "bgd-abcdef0123456789",
+                    "BlueGreenDeploymentName": "app-prod-upgrade",
+                    "Source": "arn:aws:rds:%s:%s:cluster:app-prod" % (REGION, ACCOUNT),
+                    "Target": "arn:aws:rds:%s:%s:cluster:app-prod-green-x1y2z3" % (REGION, ACCOUNT),
+                    "SwitchoverDetails": [
+                        {
+                            "SourceMember": "arn:aws:rds:%s:%s:cluster:app-prod" % (REGION, ACCOUNT),
+                            "TargetMember": "arn:aws:rds:%s:%s:cluster:app-prod-green-x1y2z3" % (REGION, ACCOUNT),
+                            "Status": "AVAILABLE",
+                        },
+                        {
+                            "SourceMember": "arn:aws:rds:%s:%s:db:app-prod-1" % (REGION, ACCOUNT),
+                            "TargetMember": "arn:aws:rds:%s:%s:db:app-prod-1-green-a1b2c3" % (REGION, ACCOUNT),
+                            "Status": "AVAILABLE",
+                        },
+                    ],
+                    "Tasks": [{"Name": "CREATING_READ_REPLICA_OF_SOURCE", "Status": "COMPLETED"}],
+                    "Status": "AVAILABLE",
+                    "CreateTime": "2026-09-25T10:00:00+00:00",
+                }
+            ]
+        })
+    elif svc == "cloudwatch" and cmd == "get-metric-data":
+        queries = json.loads(opts.get("metric-data-queries", "[]"))
+        results = []
+        for q in queries:
+            name = q["MetricStat"]["Metric"]["MetricName"]
+            values = {
+                "CPUUtilization": [12.5, 11.0, 14.75],
+                "DatabaseConnections": [42, 40, 45],
+                "FreeableMemory": [8589934592, 8600000000, 8500000000],
+                "VolumeBytesUsed": [107374182400, 107374182400, 107370000000],
+                "FreeStorageSpace": [53687091200, 53687091200, 53680000000],
+                "AuroraReplicaLag": [20.0, 18.4, 25.0],
+                "ReplicaLag": [1, 1, 2],
+            }.get(name, [])
+            results.append({
+                "Id": q["Id"],
+                "Label": q.get("Label", name),
+                "Timestamps": ["2026-09-27T00:0%d:00+00:00" % (4 - i) for i in range(len(values))],
+                "Values": values,
+                "StatusCode": "Complete",
+            })
+        out({"MetricDataResults": results, "Messages": []})
+    elif svc == "secretsmanager" and cmd == "get-secret-value":
+        sid = opts.get("secret-id", SECRET_ARN)
+        secret = {"username": "postgres", "password": "x", "engine": "postgres", "host": "db.internal",
+                  "port": db_port(), "dbname": "dbgrid_test", "dbClusterIdentifier": "app-prod"}
+        if "nodb" in sid:
+            # an RDS-managed master secret: username and password only
+            secret = {"username": "postgres", "password": "x"}
+        if "link" in sid:
+            # a hand-written secret for a database behind a PrivateLink endpoint
+            secret = {"port": str(db_port()), "hostWrite": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
+                      "hostRead": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
+                      "password": "pw", "db": "jobs", "username": "je_next_user"}
+        out({
+            "ARN": sid if sid.startswith("arn:") else SECRET_ARN,
+            "Name": "rds!cluster-3f2c1a6e-app-prod",
+            "VersionId": "6b1d0a3c-1111-2222-3333-444455556666",
+            "SecretString": json.dumps(secret),
+            "VersionStages": ["AWSCURRENT"],
+            "CreatedDate": "2026-09-01T00:00:00+00:00",
+        })
+    elif svc == "ssm" and cmd == "describe-instance-information":
+        out({
+            "InstanceInformationList": [
+                {"InstanceId": "i-0bastion", "PingStatus": "Online", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.0.1.10", "ComputerName": "ip-10-0-1-10",
+                 "ResourceType": "EC2Instance"},
+                {"InstanceId": "i-0web", "PingStatus": "Online", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.0.2.20", "ComputerName": "ip-10-0-2-20",
+                 "ResourceType": "EC2Instance"},
+                {"InstanceId": "i-0oldjump", "PingStatus": "ConnectionLost", "PlatformType": "Linux",
+                 "PlatformName": "Amazon Linux", "IPAddress": "10.9.9.9", "ComputerName": "ip-10-9-9-9",
+                 "ResourceType": "EC2Instance"},
+            ]
+        })
+    elif svc == "ec2" and cmd == "describe-instances":
+        def ec2(iid, name, vpc, ip):
+            return {"InstanceId": iid, "State": {"Code": 16, "Name": "running"}, "VpcId": vpc,
+                    "PrivateIpAddress": ip, "Tags": [{"Key": "Name", "Value": name}, {"Key": "env", "Value": "prod"}]}
+        out({
+            "Reservations": [
+                {"ReservationId": "r-1", "Instances": [ec2("i-0bastion", "bastion-prod", "vpc-0app", "10.0.1.10")]},
+                {"ReservationId": "r-2", "Instances": [ec2("i-0web", "web-1", "vpc-0app", "10.0.2.20"),
+                                                        ec2("i-0oldjump", "jumpbox-legacy", "vpc-0old", "10.9.9.9")]},
+            ]
+        })
+    elif svc == "ssm" and cmd == "start-session":
+        params = dict(kv.split("=", 1) for kv in opts.get("parameters", "").split(",") if "=" in kv)
+        local_port = params.get("localPortNumber")
+        remote_port = params.get("portNumber")
+        if not local_port or not remote_port:
+            fail("InvalidParameters: localPortNumber and portNumber are required", 255)
+        sys.stderr.write("Starting session with SessionId: fake-%s\n" % local_port)
+        sys.stderr.flush()
+        os.execvp("python3", ["python3", os.path.join(HERE, "forwarder.py"), local_port, remote_port])
+    else:
+        fail("usage: aws [options] <command> <subcommand> [parameters]\naws: error: argument command: "
+             "Invalid choice %s %s" % (svc, cmd), 252)
+
+
+if __name__ == "__main__":
+    main()

@@ -49,7 +49,16 @@ end
 function M.adopt(buf, nb)
   local s = state.attach(buf, nb)
   s.last_used = util.now()
-  require("dbgrid.ui.query").attach(s)
+  local query = require("dbgrid.ui.query")
+  query.attach(s)
+  -- already on screen (restored session, :e): BufWinEnter fired before we
+  -- were listening, so open the results pane here
+  local win = vim.fn.bufwinid(buf)
+  if win ~= -1 and vim.api.nvim_win_get_config(win).relative == "" then
+    s.query_win = win
+    s.tab = vim.api.nvim_win_get_tabpage(win)
+    query.on_cursor(s, true)
+  end
   return s
 end
 
@@ -57,7 +66,11 @@ end
 ---@param s dbgrid.State
 function M.ensure_results(s)
   if s.results_win and vim.api.nvim_win_is_valid(s.results_win) then
-    return
+    if vim.api.nvim_win_get_buf(s.results_win) == s.results_buf then
+      return
+    end
+    -- another buffer kept the window (see reclaim_results); the results get a new one
+    s.results_win = nil
   end
   if not s.query_win or not vim.api.nvim_win_is_valid(s.query_win) then
     local w = vim.fn.bufwinid(s.buf)
@@ -104,6 +117,29 @@ function M.ensure_results(s)
   require("dbgrid.ui.results").attach(s)
 end
 
+---Another buffer landed in the results window (a bufferline click, :bnext,
+---<C-o>): put the results back and open that buffer in the query window, as
+---if it had been picked from there.
+---@param s dbgrid.State
+---@param other integer
+function M.reclaim_results(s, other)
+  local win = s.results_win
+  if not win or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= other then
+    return
+  end
+  local qwin = s.query_win
+  if not qwin or not vim.api.nvim_win_is_valid(qwin) or qwin == win then
+    -- nowhere to send it: it keeps the window, ensure_results opens a new one
+    s.results_win = nil
+    return
+  end
+  vim.api.nvim_win_set_buf(win, s.results_buf)
+  if other ~= s.buf and vim.api.nvim_buf_is_valid(other) then
+    vim.api.nvim_win_set_buf(qwin, other)
+  end
+  vim.api.nvim_set_current_win(qwin)
+end
+
 ---@param s dbgrid.State
 function M.focus(s)
   if s.tab and vim.api.nvim_tabpage_is_valid(s.tab) then
@@ -119,7 +155,7 @@ function M.focus(s)
   M.ensure_results(s)
   s.last_used = util.now()
   -- back to the grid of the cell under the cursor; plan/record views are transient
-  s.view = { truncate = s.view and s.view.truncate }
+  s.view = { truncate = s.view and s.view.truncate, mode = s.view and s.view.mode == "schema" and "schema" or nil }
   require("dbgrid.ui.query").on_cursor(s, true)
 end
 
@@ -224,6 +260,15 @@ function M.winbar_query(buf)
   parts[#parts + 1] = "%#DbgridWinbarTitle# " .. esc(s.nb.meta.title) .. " "
   local n = #require("dbgrid.cells").parse(buf)
   parts[#parts + 1] = "%#DbgridWinbarDim#" .. n .. (n == 1 and " cell" or " cells")
+  local agent = require("dbgrid.ai").agent_name(s)
+  parts[#parts + 1] = " %#DbgridWinbarDim#│%#DbgridWinbarAgent# " .. esc(icons.agent) .. " " .. esc(agent) .. " "
+  local live = 0
+  for _ in pairs(s.live or {}) do
+    live = live + 1
+  end
+  if live > 0 then
+    parts[#parts + 1] = " %#DbgridWinbarLive#" .. esc(icons.live) .. " " .. live .. " live"
+  end
   return table.concat(parts)
 end
 

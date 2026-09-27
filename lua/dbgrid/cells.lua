@@ -218,11 +218,116 @@ function M.directives(cell)
   return out
 end
 
----Stable hash of the executable text (whitespace-insensitive).
+---Stable hash of what a run depends on: the SQL (whitespace, comment and
+---keyword-case insensitive, so formatting never marks a cell as edited) plus
+---the directive lines that change how it runs.
 ---@param cell dbgrid.Cell
 function M.hash(cell)
-  local norm = M.body_text(cell):gsub("%s+", " ")
-  return util.hash(util.trim(norm))
+  local parts = { sql.normalize(M.body_text(cell)) }
+  for _, l in ipairs(cell.lines) do
+    local k, v = l:match(M.DIRECTIVE)
+    if k then
+      parts[#parts + 1] = "@" .. k:lower() .. " " .. v
+    end
+  end
+  return util.hash(table.concat(parts, "\n"))
+end
+
+---`-- @param name = value` declarations, in order. An empty value declares a
+---parameter that is asked for when the cell runs.
+---@param cell dbgrid.Cell
+---@return { name: string, value: string }[]
+function M.params(cell)
+  local out = {}
+  for _, l in ipairs(cell.lines) do
+    local k, v = l:match(M.DIRECTIVE)
+    if k and k:lower() == "param" then
+      local name, value = v:match("^([%w_]+)%s*=?%s*(.-)%s*$")
+      if name then
+        out[#out + 1] = { name = name, value = value or "" }
+      end
+    end
+  end
+  return out
+end
+
+---Parse an `@every` interval ("5s", "2m", "500ms", "1h") into milliseconds.
+---@param value string|boolean|nil
+---@return integer? ms
+function M.interval_ms(value)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local n, unit = value:match("^%s*(%d+%.?%d*)%s*(%a*)%s*$")
+  if not n then
+    return nil
+  end
+  local mult = ({ [""] = 1000, s = 1000, sec = 1000, ms = 1, m = 60000, min = 60000, h = 3600000 })[unit:lower()]
+  if not mult then
+    return nil
+  end
+  return math.floor(tonumber(n) * mult)
+end
+
+---Names listed by `-- @depends a, b` lines.
+---@param cell dbgrid.Cell
+---@return string[]
+function M.depends(cell)
+  local out = {}
+  for _, l in ipairs(cell.lines) do
+    local k, v = l:match(M.DIRECTIVE)
+    if k and k:lower() == "depends" then
+      for name in v:gmatch("[^,%s]+") do
+        out[#out + 1] = name
+      end
+    end
+  end
+  return out
+end
+
+---Resolve a cell reference: an id, `q<index>`, a title (case-insensitive) or
+---the slug of a title (`overdue-invoices` for "Overdue invoices").
+---@param list dbgrid.Cell[]
+---@param ref string
+---@return dbgrid.Cell?
+function M.find(list, ref)
+  if not ref or ref == "" then
+    return nil
+  end
+  local want = ref:lower()
+  for _, c in ipairs(list) do
+    if c.id and c.id:lower() == want then
+      return c
+    end
+  end
+  local idx = want:match("^q(%d+)$")
+  if idx and list[tonumber(idx)] then
+    return list[tonumber(idx)]
+  end
+  for _, c in ipairs(list) do
+    if c.title ~= "" and c.title:lower() == want then
+      return c
+    end
+  end
+  for _, c in ipairs(list) do
+    if c.title ~= "" and util.slug(c.title) == util.slug(ref) then
+      return c
+    end
+  end
+  return nil
+end
+
+---Name other cells can use to reference this one (`{{name}}`, `-- @depends name`).
+---@param cell dbgrid.Cell
+---@return string
+function M.ref_name(cell)
+  if cell.title and cell.title ~= "" then
+    local slug = util.slug(cell.title)
+    if slug ~= "untitled" then
+      return slug
+    end
+  end
+  return cell.id or ("q" .. cell.index)
 end
 
 ---Short label: title, else the first non-comment line, else "cell".

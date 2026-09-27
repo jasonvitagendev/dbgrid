@@ -228,6 +228,7 @@ H.describe("notebook ui", function()
     H.matches(table.concat(flines, "\n"), "%*%*Q:%*%* is this query ok%?.*\n%-%-%-\n.*%*%*Q:%*%* which index%?")
     review.close(s)
     cfg.ai.agent = "claude"
+    cfg.ai.agents.fake = nil
     vim.api.nvim_set_current_win(s.query_win)
   end)
 
@@ -306,6 +307,240 @@ H.describe("notebook ui", function()
     H.truthy(kinds.table and kinds.column and kinds.keyword)
   end)
 
+  H.it("substitutes parameters and remembers prompted values", function()
+    set_cells(s, {
+      "-- %% [pp1] params",
+      "-- @param min = 7000",
+      "select id, email from users where balance > :min and id < {{max}} order by id",
+    })
+    local orig = vim.ui.input
+    local asked = 0
+    vim.ui.input = function(_, cb)
+      asked = asked + 1
+      cb("4700")
+    end
+    local r = run_and_wait(s, 1)
+    vim.ui.input = orig
+    H.eq(r.ok, true, vim.inspect(r.error))
+    H.eq(asked, 1)
+    H.eq(r.params, { min = "7000", max = "4700" })
+    H.eq(nb.meta.params.max, "4700")
+    local text = table.concat(results_lines(s), "\n")
+    H.matches(text, "with :max = 4700, :min = 7000")
+    H.matches(text, "user4668@example%.com")
+    H.falsy(text:find("user4700@", 1, true))
+    -- the remembered value is reused without asking
+    asked = 0
+    vim.ui.input = function(_, cb)
+      asked = asked + 1
+      cb("1")
+    end
+    r = run_and_wait(s, 1)
+    vim.ui.input = orig
+    H.eq(asked, 0)
+    H.eq(r.params.max, "4700")
+    -- completion knows the parameters and the cells
+    local items = require("dbgrid.completion").items(s.buf, 3, 61)
+    local kinds = {}
+    for _, it in ipairs(items) do
+      kinds[it.label] = it.kind_name
+    end
+    H.eq(kinds.min, "parameter")
+    H.eq(kinds.max, "parameter")
+    H.eq(kinds.params, nil, "a cell does not reference itself")
+  end)
+
+  H.it("inlines referenced cells and runs dependencies first", function()
+    set_cells(s, {
+      "-- %% [r1] rich users",
+      "select id, email from users where balance > 7000",
+      "",
+      "-- %% [r2] count rich",
+      "select count(*) as n from {{rich-users}} r where r.id > 0",
+      "",
+      "-- %% [r3] setup",
+      "update users set note = 'seen' where id = 1",
+      "",
+      "-- %% [r4] after setup",
+      "-- @depends setup",
+      "select note from users where id = 1",
+    })
+    local r = run_and_wait(s, 2)
+    H.eq(r.ok, true, vim.inspect(r.error))
+    H.eq(r.statements[1].sets[1].rows[1][1], "334")
+    H.eq(r.refs, { "r1" })
+    H.matches(table.concat(results_lines(s), "\n"), "inlines rich%-users")
+    H.eq(nb.meta.cells.r1, nil, "an inlined cell is not run on its own")
+    local items = require("dbgrid.completion").items(s.buf, 5, 28)
+    local labels = vim.tbl_map(function(i)
+      return i.label
+    end, items)
+    H.truthy(vim.tbl_contains(labels, "rich-users"))
+    H.truthy(vim.tbl_contains(labels, "setup"))
+    H.falsy(vim.tbl_contains(labels, "count-rich"))
+    -- dependencies: r3 has not run, so running r4 runs it first
+    r = run_and_wait(s, 4)
+    H.eq(r.ok, true, vim.inspect(r.error))
+    H.eq(r.statements[1].sets[1].rows[1][1], "seen")
+    H.eq(nb.meta.cells.r3.status, "ok")
+    local ran_at = nb.meta.cells.r3.ran_at
+    -- a fresh dependency is not run again
+    local deps = runner.pending_dependencies(s, cells.parse(s.buf)[4])
+    H.eq(deps, {})
+    local order = runner.run_order(s)
+    H.eq(
+      vim.tbl_map(function(c)
+        return c.id
+      end, order),
+      { "r1", "r2", "r3", "r4" }
+    )
+    H.eq(nb.meta.cells.r3.ran_at, ran_at)
+    -- a cycle is reported, not run
+    set_cells(s, { "-- %% [x1] a", "-- @depends b", "select 1", "-- %% [x2] b", "-- @depends a", "select 2" })
+    local _, err = runner.pending_dependencies(s, cells.parse(s.buf)[1])
+    H.matches(err, "cycle")
+  end)
+
+  H.it("explain analyze reports findings in the plan view", function()
+    set_cells(s, { "-- %% [ea1] filtered", "select * from users where balance > 7000" })
+    runner.explain_cell(s, cells.parse(s.buf)[1], true)
+    H.truthy(H.wait(15000, function()
+      return s.runtime.ea1 and s.runtime.ea1.plan_text ~= nil
+    end))
+    local rt = s.runtime.ea1
+    H.eq(rt.plan_kind, "EXPLAIN ANALYZE")
+    H.truthy(rt.plan_info and rt.plan_info.plan)
+    H.matches(table.concat(rt.plan_text, "\n"), "actual time=")
+    H.matches(table.concat(rt.plan_text, "\n"), "Execution Time:")
+    local findings = rt.plan_info.findings
+    H.truthy(#findings >= 1, "expected a filter finding")
+    H.matches(findings[1].message, "Seq Scan on users reads 5,000 rows to keep 334")
+    H.eq(findings[1].suggestion, "CREATE INDEX ON users (balance);")
+    local text = table.concat(results_lines(s), "\n")
+    H.matches(text, "EXPLAIN ANALYZE")
+    H.matches(text, "reads 5,000 rows")
+    H.matches(text, "→ CREATE INDEX ON users %(balance%);")
+    H.eq(s.view.mode, "plan")
+  end)
+
+  H.it("shows the schema as a foldable document with indexes", function()
+    set_cells(s, { "-- %% [sv1]", "select * from users u" })
+    query.on_cursor(s, true)
+    local results = require("dbgrid.ui.results")
+    results.toggle_schema(s)
+    H.eq(s.view.mode, "schema")
+    local rl = results_lines(s)
+    local text = table.concat(rl, "\n")
+    H.matches(text, "▤ users  ~5,000 rows · 6 cols · 3 indexes")
+    H.matches(text, "⌗ users_created_at_idx  %(created_at%)")
+    H.matches(text, "⌗ users_pkey  %(id%)  PRIMARY KEY")
+    H.matches(text, "plan_id%s+integer  → plans%(id%)")
+    H.matches(text, "▤ invoices")
+    H.matches(text, "People with an account")
+    H.eq(vim.wo[s.results_win].foldmethod, "expr")
+    local users_lnum, plans_lnum
+    for i, l in ipairs(rl) do
+      if l:match("^▤ users ") then
+        users_lnum = i
+      elseif l:match("^▤ plans ") then
+        plans_lnum = i
+      end
+    end
+    H.truthy(users_lnum and plans_lnum)
+    vim.api.nvim_win_call(s.results_win, function()
+      H.eq(vim.fn.foldclosed(users_lnum), -1, "the table used by the cell starts unfolded")
+      H.eq(vim.fn.foldclosed(plans_lnum), plans_lnum, "other tables start folded")
+    end)
+    H.eq(vim.api.nvim_win_get_cursor(s.results_win)[1], users_lnum)
+    -- moving to another cell keeps the document
+    vim.api.nvim_win_set_cursor(s.query_win, { 1, 0 })
+    query.on_cursor(s, true)
+    H.eq(s.view.mode, "schema")
+    -- <CR> toggles a fold, K describes, Tab jumps between tables
+    vim.api.nvim_win_set_cursor(s.results_win, { plans_lnum, 0 })
+    results.inspect(s, "<CR>")
+    vim.api.nvim_win_call(s.results_win, function()
+      H.eq(vim.fn.foldclosed(plans_lnum), -1)
+    end)
+    results.move_column(s, 1)
+    H.truthy(vim.api.nvim_win_get_cursor(s.results_win)[1] > plans_lnum)
+    results.yank_cell(s)
+    H.matches(vim.fn.getreg('"'), "^%a+$")
+    H.matches(layout.winbar_results(s.buf), "schema")
+    results.toggle_schema(s)
+    H.eq(s.view.mode, "grid")
+    H.eq(vim.wo[s.results_win].foldmethod, "manual")
+  end)
+
+  H.it("cancels a running query, client side and server side", function()
+    set_cells(s, { "-- %% [cx1] slow", "select pg_sleep(20)" })
+    local done
+    runner.run_cell(s, cells.parse(s.buf)[1], {
+      cb = function(r)
+        done = r
+      end,
+    })
+    H.truthy(H.wait(5000, function()
+      return s.running.cx1 and s.running.cx1.kind == "run" and s.running.cx1.job ~= nil
+    end))
+    H.truthy(s.running.cx1.job.appname:match("^dbgrid%.nvim:%w+$"))
+    local started = require("dbgrid.util").now()
+    runner.cancel(s, cells.parse(s.buf)[1])
+    H.truthy(
+      H.wait(10000, function()
+        return done ~= nil
+      end),
+      "cancel timed out"
+    )
+    H.eq(done.ok, false)
+    H.matches(done.error.message, "cancel")
+    H.truthy(require("dbgrid.util").now() - started < 8)
+    -- the server-side path on its own
+    local pg = require("dbgrid.adapters.postgres")
+    local conn = require("dbgrid.connections").get("test")
+    local result
+    local job = pg.run(
+      conn,
+      { { sql = "select pg_sleep(20)", kind = "select", class = "read", line = 1 } },
+      {},
+      function(r)
+        result = r
+      end
+    )
+    vim.wait(500)
+    local ok, msg
+    pg.server_cancel(conn, job.appname, function(o, m)
+      ok, msg = o, m
+    end)
+    H.truthy(
+      H.wait(10000, function()
+        return result ~= nil
+      end),
+      "server cancel timed out"
+    )
+    H.eq(ok, true)
+    H.matches(msg, "^1 backend")
+    H.matches(result.error.message, "canceling statement")
+  end)
+
+  H.it("switches the coding agent per notebook and per cell", function()
+    local ai = require("dbgrid.ai")
+    H.eq(ai.agent_name(s), "claude")
+    H.eq(ai.set_agent(s, "nope"), false)
+    H.eq(ai.set_agent(s, "kimi"), true)
+    H.eq(ai.agent_name(s), "kimi")
+    H.eq(notebook.load(nb.name).meta.agent, "kimi")
+    H.matches(layout.winbar_query(s.buf), "kimi")
+    set_cells(s, { "-- %% [ag1]", "-- @agent codex", "-- ? things" })
+    H.eq(ai.agent_name(s, cells.parse(s.buf)[1]), "codex")
+    ai.set_agent(s, nil)
+    H.eq(ai.agent_name(s), "claude")
+    local names = vim.tbl_map(function(a)
+      return a.name
+    end, ai.agents())
+    H.eq(names, { "claude", "codex", "kimi" })
+  end)
+
   if os.getenv("DBGRID_TEST_AI") then
     H.it("generates SQL from a prompt with the real agent and runs it", function()
       set_cells(s, { "-- %% [ai1] generated", "-- ? number of users per plan, with the plan name, most users first" })
@@ -328,6 +563,53 @@ H.describe("notebook ui", function()
       H.eq(s.runtime.ai1.status, "ok")
     end)
   end
+
+  H.it("hides the results pane while another file is shown and restores it", function()
+    vim.api.nvim_set_current_win(s.query_win)
+    local other = vim.fn.tempname() .. ".txt"
+    vim.cmd("edit " .. vim.fn.fnameescape(other))
+    H.truthy(
+      H.wait(1000, function()
+        return s.results_win == nil
+      end),
+      "results pane still open"
+    )
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 1)
+    vim.cmd("buffer " .. s.buf)
+    H.truthy(s.results_win and vim.api.nvim_win_is_valid(s.results_win))
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 2)
+    H.eq(vim.api.nvim_get_current_win(), s.query_win)
+  end)
+
+  H.it("keeps the results pane while the notebook is still visible in a split", function()
+    vim.api.nvim_set_current_win(s.query_win)
+    vim.cmd("split")
+    vim.cmd("enew")
+    vim.wait(50)
+    H.truthy(s.results_win and vim.api.nvim_win_is_valid(s.results_win))
+    vim.cmd("close")
+    vim.api.nvim_set_current_win(s.query_win)
+  end)
+
+  H.it("opens the results pane for a notebook opened by hand", function()
+    -- `nvim -l` skips plugin/, which holds the BufReadPost hook under test
+    vim.cmd("runtime plugin/dbgrid.lua")
+    local nb2 = notebook.create("ui adopt", { connection = "test" })
+    vim.cmd("tabnew")
+    vim.cmd("edit " .. vim.fn.fnameescape(nb2.path))
+    local s2
+    H.truthy(
+      H.wait(1000, function()
+        s2 = require("dbgrid.state").get(vim.api.nvim_get_current_buf())
+        return s2 ~= nil and s2.results_win ~= nil
+      end),
+      "notebook not attached"
+    )
+    H.eq(#vim.api.nvim_tabpage_list_wins(0), 2)
+    H.eq(vim.api.nvim_get_current_win(), s2.query_win)
+    layout.close(s2)
+    vim.api.nvim_set_current_win(s.query_win)
+  end)
 
   H.it("closes the layout", function()
     local tabs = #vim.api.nvim_list_tabpages()

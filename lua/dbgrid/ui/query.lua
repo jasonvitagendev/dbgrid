@@ -11,13 +11,19 @@ M.ns = vim.api.nvim_create_namespace("dbgrid.cells")
 M.ns_active = vim.api.nvim_create_namespace("dbgrid.active")
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-local RUNNING_LABEL = { run = "running", explain = "planning", ai = "generating", review = "asking" }
+local RUNNING_LABEL = {
+  run = "running",
+  explain = "planning",
+  analyze = "asking the agent",
+  ai = "generating",
+  review = "asking",
+}
 
 ---What a running job is doing, for status lines.
 ---@param running { kind?: string }
 ---@return string
 function M.running_label(running)
-  return RUNNING_LABEL[running.kind] or "running"
+  return RUNNING_LABEL[running.kind] or running.kind or "running"
 end
 
 ---Map keys (string or list) to a function, buffer-locally.
@@ -77,14 +83,31 @@ function M.status_chunks(s, cell)
   local function add(text, hl)
     chunks[#chunks + 1] = { text, hl }
   end
-  if running then
+  local live = s.live and s.live[cell.id]
+  if running and not (live and running.kind == "run") then
     local frame = SPINNER[(s.spinner_frame or 0) % #SPINNER + 1]
     local secs = util.now() - (running.started or util.now())
     add(string.format(" %s %s %.1fs ", frame, M.running_label(running), secs), "DbgridStatusRunning")
     return chunks
   end
+  if live then
+    add(
+      string.format(
+        " %s live every %s · %d ticks%s ",
+        icons.live,
+        util.fmt_ms(live.interval),
+        live.ticks or 0,
+        (live.changed_count or 0) > 0 and (" · " .. icons.changed .. " " .. live.changed_count) or ""
+      ),
+      "DbgridLive"
+    )
+  end
   if rt.status == "generating" then
     add(" " .. icons.generated .. " generating… ", "DbgridStatusRunning")
+    return chunks
+  end
+  if rt.status == "analyzing" and not running then
+    add(" " .. icons.generated .. " analyzing… ", "DbgridStatusRunning")
     return chunks
   end
   if rt.status == "generated" then
@@ -109,6 +132,9 @@ function M.status_chunks(s, cell)
     end
     if meta.warnings and #meta.warnings > 0 then
       add(icons.warn .. " seq scan ", "DbgridStatusWarn")
+    end
+    if meta.dry_run then
+      add("dry run ", "DbgridStatusWarn")
     end
     if stale then
       add(icons.stale .. " edited ", "DbgridStatusStale")
@@ -256,6 +282,12 @@ function M.on_change(s)
     vim.b[s.buf].dbgrid_cells_cache = nil
   end
   M.render(s)
+  for id in pairs(s.live or {}) do
+    local c = cells.by_id(s.buf, id)
+    if c then
+      require("dbgrid.runner").on_cell_edited(s, c)
+    end
+  end
   local cell = M.current_cell(s)
   if cell and cell.id then
     local meta = s.nb.meta.cells[cell.id]
@@ -414,6 +446,77 @@ function M.refresh_schema(s)
       end
     end)
   end)
+end
+
+---Edit the notebook's parameter values.
+---@param s dbgrid.State
+function M.edit_params(s)
+  local expand = require("dbgrid.expand")
+  local list = expand.notebook_params(s)
+  local items = {}
+  for _, p in ipairs(list) do
+    items[#items + 1] = {
+      text = string.format(
+        ":%s = %s%s   (%s)",
+        p.name,
+        p.value or "?",
+        p.source == "cell" and " [-- @param]" or "",
+        #p.cells > 0 and table.concat(p.cells, ", ") or "unused"
+      ),
+      data = p,
+      preview = { p.value or "no value yet" },
+    }
+  end
+  items[#items + 1] = { text = "+ set another parameter", data = "new", preview = { "" } }
+  local function set_value(name, default)
+    vim.ui.input(
+      { prompt = "Value for :" .. name .. " (a SQL literal, e.g. 'text', 42): ", default = default or "" },
+      function(v)
+        if v == nil then
+          return
+        end
+        v = util.trim(v)
+        notebook.set_param(s.nb, name, v ~= "" and v or nil)
+        util.notify(v ~= "" and (":" .. name .. " = " .. v) or ("forgot :" .. name))
+      end
+    )
+  end
+  require("dbgrid.ui.picker").pick(items, {
+    prompt = "Parameters",
+    preview = false,
+    on_select = function(item)
+      if not item then
+        return
+      end
+      if item.data == "new" then
+        vim.ui.input({ prompt = "Parameter name: " }, function(name)
+          if name and name:match("^[%w_]+$") then
+            set_value(name)
+          end
+        end)
+        return
+      end
+      if item.data.source == "cell" then
+        util.notify(":" .. item.data.name .. " is set by a -- @param line; that value wins over the one entered here")
+      end
+      set_value(item.data.name, item.data.value)
+    end,
+  })
+end
+
+---Format the SQL of the current cell.
+---@param s dbgrid.State
+function M.format_cell(s)
+  local cell = M.current_cell(s)
+  if not cell then
+    return
+  end
+  local changed, err = require("dbgrid.format").cell(s, cell, { notify = true })
+  if changed then
+    util.notify("formatted " .. cells.ref_name(cell))
+  elseif not err then
+    util.notify("already formatted")
+  end
 end
 
 ---@param s dbgrid.State
@@ -659,6 +762,27 @@ function M.attach(s)
       require("dbgrid.ai").review(s, cell)
     end
   end, "ask the agent about the query and its result")
+  map(buf, "n", k.analyze, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.analyze_cell(s, cell)
+    end
+  end, "analyze the plan with the agent")
+  map(buf, "n", k.explain_error, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.explain_error(s, cell)
+    end
+  end, "explain the last error with the agent")
+  map(buf, "n", k.try_index, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.try_index(s, cell)
+    end
+  end, "try the suggested index (hypopg)")
+  map(buf, "n", k.history, function()
+    require("dbgrid.commands").subcommands.history({})
+  end, "query history")
   map(buf, "n", k.tags, function()
     M.edit_tags(s)
   end, "edit notebook tags")
@@ -671,6 +795,24 @@ function M.attach(s)
   map(buf, "n", k.tables, function()
     M.browse_tables(s)
   end, "browse tables")
+  map(buf, "n", k.schema_view, function()
+    local results = require("dbgrid.ui.results")
+    if s.view.mode == "schema" then
+      results.toggle_schema(s)
+    else
+      results.toggle_schema(s)
+      layout.focus_results(s)
+    end
+  end, "browse the schema (foldable, searchable)")
+  map(buf, "n", k.format, function()
+    M.format_cell(s)
+  end, "format the cell's SQL")
+  map(buf, "n", k.params, function()
+    M.edit_params(s)
+  end, "edit parameters")
+  map(buf, "n", k.agent, function()
+    require("dbgrid.ai").pick_agent(s)
+  end, "pick the coding agent")
   map(buf, "n", k.describe, function()
     M.describe_under_cursor(s)
   end, "describe table/column under cursor")
@@ -724,6 +866,11 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       cells.ensure_ids(buf)
+      if config.get().format.on_save then
+        local view = vim.fn.winsaveview()
+        require("dbgrid.format").buffer(s, { notify = false })
+        pcall(vim.fn.winrestview, view)
+      end
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {
@@ -751,7 +898,13 @@ function M.attach(s)
     buffer = buf,
     callback = function()
       local w = vim.api.nvim_get_current_win()
-      if vim.api.nvim_win_get_buf(w) == buf then
+      -- floats are picker previews and the like, not a query pane; the
+      -- results window only shows it until reclaim_results puts the results back
+      if
+        vim.api.nvim_win_get_buf(w) == buf
+        and vim.api.nvim_win_get_config(w).relative == ""
+        and w ~= s.results_win
+      then
         s.query_win = w
         s.tab = vim.api.nvim_get_current_tabpage()
         if vim.wo[w].conceallevel < 1 then
@@ -759,8 +912,29 @@ function M.attach(s)
         end
         vim.wo[w].concealcursor = "nc"
         M.refresh_winbar(s)
-        M.render(s)
+        -- back from another file: bring back the pane BufWinLeave took away
+        M.on_cursor(s, true)
       end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      -- the buffer is still in the window here; check once it's been swapped out
+      vim.schedule(function()
+        if not s.results_win or not vim.api.nvim_win_is_valid(s.results_win) then
+          return
+        end
+        local tab = vim.api.nvim_win_get_tabpage(s.results_win)
+        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+          if vim.api.nvim_win_get_buf(w) == buf then
+            return -- still shown in another window of the tab
+          end
+        end
+        -- fails (and the pane stays) when it's the last window left
+        pcall(vim.api.nvim_win_close, s.results_win, true)
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("VimResized", {
@@ -774,6 +948,7 @@ function M.attach(s)
     group = group,
     buffer = buf,
     callback = function()
+      require("dbgrid.runner").stop_all_live(s, "closed")
       if s.spinner_timer then
         s.spinner_timer:stop()
         s.spinner_timer:close()
@@ -781,6 +956,9 @@ function M.attach(s)
       end
       if s.results_win and vim.api.nvim_win_is_valid(s.results_win) then
         pcall(vim.api.nvim_win_close, s.results_win, true)
+      end
+      if s.analysis_win and vim.api.nvim_win_is_valid(s.analysis_win) then
+        pcall(vim.api.nvim_win_close, s.analysis_win, true)
       end
       state_mod.detach(buf)
     end,
