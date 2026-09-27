@@ -535,3 +535,35 @@ H.describe("completion", function()
     H.truthy(#items > 0) -- keywords still come without a schema
   end)
 end)
+
+H.describe("notebook delete", function()
+  H.it("deletes several notebooks after one confirmation", function()
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data" } })
+    local before = #notebook.list()
+    local a = notebook.create("Bulk A")
+    local b = notebook.create("Bulk B")
+    local c = notebook.create("Bulk C")
+    local prompts = {}
+    local orig_confirm = vim.fn.confirm
+    vim.fn.confirm = function(msg)
+      prompts[#prompts + 1] = msg
+      return 2
+    end
+    require("dbgrid").delete({ a, b })
+    H.eq(#notebook.list(), before + 3, "cancelled: nothing deleted")
+    vim.fn.confirm = function(msg)
+      prompts[#prompts + 1] = msg
+      return 1
+    end
+    require("dbgrid").delete({ a, b })
+    require("dbgrid").delete(c)
+    vim.fn.confirm = orig_confirm
+    H.eq(#prompts, 3, "one prompt per call")
+    H.matches(prompts[1], "^Delete 2 notebooks")
+    H.matches(prompts[1], "\n  Bulk A\n  Bulk B$")
+    H.matches(prompts[3], "^Delete notebook 'Bulk C'")
+    H.eq(#notebook.list(), before)
+    H.eq(notebook.load("bulk-a"), nil)
+    H.eq(notebook.load("bulk-c"), nil)
+  end)
+end)

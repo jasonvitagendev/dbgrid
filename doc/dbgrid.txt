@@ -102,6 +102,8 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 4. COMMANDS                                                  *dbgrid-commands*
 
 :Dbgrid                        pick a notebook (or create one)       *:Dbgrid*
+                               (<C-x> deletes the one under the cursor, or
+                               every notebook marked with <Tab>)
 :Dbgrid open [name]            open a notebook
 :Dbgrid new [title]            create a notebook
 :Dbgrid last                   jump to the most recent notebook

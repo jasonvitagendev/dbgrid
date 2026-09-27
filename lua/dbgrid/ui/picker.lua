@@ -14,7 +14,8 @@ local function has_snacks()
 end
 
 ---@param items dbgrid.PickItem[]
----@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem)>, hint?: string }
+---Actions get the item under the cursor and every marked item (<Tab> in snacks; the cursor item alone when nothing is marked).
+---@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem, items: dbgrid.PickItem[])>, hint?: string }
 function M.pick(items, opts)
   if #items == 0 then
     opts.on_select(nil)
@@ -35,11 +36,17 @@ function M.pick(items, opts)
       local actions = {}
       for key, fn in pairs(opts.actions or {}) do
         local name = "dbgrid_" .. key:gsub("[^%w]", "_")
-        actions[name] = function(picker, item)
+        actions[name] = function(picker)
+          local picked = {}
+          for _, it in ipairs(picker:selected({ fallback = true })) do
+            if it.item then
+              picked[#picked + 1] = it.item
+            end
+          end
           picker:close()
-          if item and item.item then
+          if #picked > 0 then
             vim.schedule(function()
-              fn(item.item)
+              fn(picked[1], picked)
             end)
           end
         end
@@ -53,7 +60,8 @@ function M.pick(items, opts)
         preview = opts.preview ~= false and "preview" or false,
         layout = opts.preview ~= false and nil or { preset = "select" },
         actions = actions,
-        win = { input = { keys = keys } },
+        -- the list window gets its own maps, so the keys work after a click or <c-w> move too
+        win = { input = { keys = keys }, list = { keys = keys } },
         confirm = function(picker, item)
           picker:close()
           -- close() queues a stopinsert; defer so a follow-up input starts in insert mode
@@ -77,9 +85,11 @@ function M.pick(items, opts)
   end)
 end
 
----Pick a notebook of the project (optionally filtered by tag).
+---Pick a notebook of the project (optionally filtered by tag). With snacks,
+---<C-x> deletes the notebook under the cursor, or every one marked with <Tab>;
+---the callback then gets action "delete" and the list of notebooks.
 ---@param opts { tag?: string, prompt?: string, allow_new?: boolean }
----@param cb fun(nb?: dbgrid.Notebook, action?: string)
+---@param cb fun(nb?: dbgrid.Notebook, action?: string, nbs?: dbgrid.Notebook[])
 function M.notebook(opts, cb)
   opts = opts or {}
   local notebook = require("dbgrid.notebook")
@@ -97,6 +107,7 @@ function M.notebook(opts, cb)
   local prompt = opts.prompt or ("Notebooks" .. (opts.tag and (" #" .. opts.tag) or ""))
   M.pick(items, {
     prompt = prompt,
+    hint = "(<C-x> delete, <Tab> mark)",
     on_select = function(item)
       if not item then
         return cb(nil)
@@ -107,9 +118,15 @@ function M.notebook(opts, cb)
       cb(item.data)
     end,
     actions = {
-      ["<C-x>"] = function(item)
-        if type(item.data) == "table" then
-          cb(item.data, "delete")
+      ["<C-x>"] = function(_, picked)
+        local nbs = {}
+        for _, it in ipairs(picked) do
+          if type(it.data) == "table" then
+            nbs[#nbs + 1] = it.data
+          end
+        end
+        if #nbs > 0 then
+          cb(nbs[1], "delete", nbs)
         end
       end,
     },

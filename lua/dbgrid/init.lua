@@ -48,11 +48,11 @@ function M.open(name)
     end
     return layout.open(nb)
   end
-  require("dbgrid.ui.picker").notebook({}, function(nb, action)
+  require("dbgrid.ui.picker").notebook({}, function(nb, action, nbs)
     if action == "new" then
       return M.new()
     elseif action == "delete" and nb then
-      return M.delete(nb)
+      return M.delete(nbs or nb)
     elseif nb then
       layout.open(nb)
     end
@@ -88,9 +88,9 @@ end
 ---Browse notebooks by tag.
 function M.tags()
   ensure_setup()
-  require("dbgrid.ui.picker").tag(function(nb, action)
+  require("dbgrid.ui.picker").tag(function(nb, action, nbs)
     if action == "delete" and nb then
-      return M.delete(nb)
+      return M.delete(nbs or nb)
     elseif nb then
       require("dbgrid.ui.layout").open(nb)
     end
@@ -121,25 +121,45 @@ function M.close()
   end
 end
 
----@param nb dbgrid.Notebook
-function M.delete(nb)
-  local choice = vim.fn.confirm(
-    "Delete notebook '" .. nb.meta.title .. "' and its cached results?",
-    "&Delete\n&Cancel",
-    2,
-    "Warning"
-  )
-  if choice ~= 1 then
+---Delete one notebook or a list of them after a single confirmation.
+---@param nbs dbgrid.Notebook|dbgrid.Notebook[]
+function M.delete(nbs)
+  if nbs.meta then
+    nbs = { nbs }
+  end
+  if #nbs == 0 then
     return
   end
-  for buf, s in pairs(require("dbgrid.state").by_buf) do
-    if s.nb.path == nb.path then
-      require("dbgrid.ui.layout").close(s)
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  local msg
+  if #nbs == 1 then
+    msg = "Delete notebook '" .. nbs[1].meta.title .. "' and its cached results?"
+  else
+    local lines = { ("Delete %d notebooks and their cached results?"):format(#nbs) }
+    for i, nb in ipairs(nbs) do
+      if i > 8 then
+        lines[#lines + 1] = ("  ... and %d more"):format(#nbs - 8)
+        break
+      end
+      lines[#lines + 1] = "  " .. nb.meta.title
     end
+    msg = table.concat(lines, "\n")
   end
-  require("dbgrid.notebook").delete(nb)
-  require("dbgrid.util").notify("deleted " .. nb.meta.title)
+  if vim.fn.confirm(msg, "&Delete\n&Cancel", 2, "Warning") ~= 1 then
+    return
+  end
+  local notebook = require("dbgrid.notebook")
+  for _, nb in ipairs(nbs) do
+    for buf, s in pairs(require("dbgrid.state").by_buf) do
+      if s.nb.path == nb.path then
+        require("dbgrid.ui.layout").close(s)
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+    end
+    notebook.delete(nb)
+  end
+  require("dbgrid.util").notify(
+    #nbs == 1 and ("deleted " .. nbs[1].meta.title) or ("deleted %d notebooks"):format(#nbs)
+  )
 end
 
 ---Attach a `.sql` buffer that lives in a dbgrid store.

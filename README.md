@@ -478,7 +478,9 @@ do everywhere.
 
 ## Commands
 
-`:Dbgrid` alone opens the notebook picker. Subcommands (with completion):
+`:Dbgrid` alone opens the notebook picker; there `<C-x>` deletes the notebook
+under the cursor, or every notebook marked with `<Tab>` (snacks.picker), after
+one confirmation. Subcommands (with completion):
 
 | command | |
 |---|---|
