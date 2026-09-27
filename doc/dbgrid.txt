@@ -371,7 +371,8 @@ read-only; plain RDS gets one reader per replica). On the first run the
 endpoints are resolved with the aws CLI and cached (`aws.endpoint_ttl_seconds`),
 an SSM port forward to the bastion is started and kept for the session,
 the password comes from Secrets Manager (or `auth = "iam"`) and goes to psql
-through the environment. The URL keeps the real host with `hostaddr=127.0.0.1`
+through the environment. The database is `aws.database`, else the secret's
+`dbname`, else the cluster's initial database, else `postgres`. The URL keeps the real host with `hostaddr=127.0.0.1`
 so `ssl = "verify-full"` with `sslrootcert` and ~/.pgpass work. Expired
 credentials run `aws.login_cmd` (`{profile}` substituted) in a terminal
 split and retry. Without `bastion` the connection is direct; `aws.document`

@@ -228,7 +228,7 @@ the session; `:Dbgrid aws refresh` or a failed run drops it.
     secret  = "prod/db",              -- Secrets Manager id or ARN; optional when RDS manages the master password
     login_cmd = { "company-aws-login", "--profile", "{profile}" },  -- default: aws sso login
     -- auth = "iam", user = "app",    -- IAM database authentication instead of a secret
-    -- database = "app",              -- only when the secret does not carry dbname
+    -- database = "app",              -- default: the secret's dbname, else the cluster's initial database, else postgres
   },
   index_check = "confirm",
 }
@@ -238,6 +238,10 @@ One entry becomes two in the picker, `prod/writer` and `prod/reader` (one per
 replica on plain RDS: `prod/reader`, `prod/reader-2`, …). Readers are
 read-only. `-- @conn prod/reader` works per cell, and `prod` alone means the
 writer.
+
+RDS-managed master secrets hold only a username and a password, so the
+database comes from `aws.database`, else the secret's `dbname`, else the
+cluster's initial database (`DatabaseName`), else `postgres`.
 
 On the first run the plugin calls `describe-db-clusters` (or
 `describe-db-instances`) and caches the endpoints for a day, starts
@@ -266,7 +270,8 @@ retries. Without `bastion` the plugin connects directly. `aws.document` and
 
 Commands: `:Dbgrid aws add` (interactive: profile, region, cluster, bastion,
 secret; the bastion is chosen from the SSM-managed instances, and one clear
-online jumpbox in the database's VPC is taken without asking), `aws login`,
+online jumpbox in the database's VPC is taken without asking; the database is
+asked for only when the secret names none), `aws login`,
 `aws refresh` (drop the endpoint cache), `aws tunnels` (list / kill), `aws status` (instance status, engine version, pending
 maintenance, five CloudWatch metrics over the last five minutes), `aws events`
 (last day of RDS events), `aws bluegreen` (blue/green deployments and their

@@ -867,6 +867,86 @@ H.describe("aws bastions", function()
     })
     H.eq(draft.aws.bastion, "i-0bastion")
     H.eq(draft.aws.secret, "prod/db", "the secret prompt is prefilled")
+    H.eq(draft.aws.database, nil, "an empty database answer keeps the fallbacks")
+  end)
+end)
+
+H.describe("aws database name", function()
+  H.it("falls back to the cluster's initial database, then postgres, when the secret has none", function()
+    local info = aws.parse_cluster(CLUSTER_JSON)
+    H.eq(info.database, nil)
+    local fake_info, err = sync(function(cb)
+      aws.endpoints({ profile = "prod", region = "ap-southeast-1", cluster = "app-prod" }, cb)
+    end)
+    H.eq(err, nil)
+    H.eq(fake_info.database, "dbgrid_test", "DatabaseName of the cluster")
+    H.eq(aws.parse_instance({ DBInstances = { { DBInstanceIdentifier = "x", DBName = "app" } } }).database, "app")
+    local nodb = { profile = "prod", region = "ap-southeast-1", cluster = "nodb-1", secret = "prod/nodb" }
+    local creds, cerr = sync(function(cb)
+      aws.credentials(nodb, { writer = { host = "h1", port = 5432 }, database = "initial" }, cb)
+    end)
+    H.eq(cerr, nil)
+    H.eq(creds.dbname, "initial")
+    creds = sync(function(cb)
+      aws.credentials(nodb, { writer = { host = "h2", port = 5432 } }, cb)
+    end)
+    H.eq(creds.dbname, "postgres", "the maintenance database is the last resort")
+    nodb.database = "app"
+    creds = sync(function(cb)
+      aws.credentials(nodb, { writer = { host = "h3", port = 5432 }, database = "initial" }, cb)
+    end)
+    H.eq(creds.dbname, "app", "an explicit database wins")
+    -- a secret that carries dbname keeps it
+    local full = { profile = "prod", region = "ap-southeast-1", cluster = "full-1", secret = "prod/db" }
+    creds = sync(function(cb)
+      aws.credentials(full, { writer = { host = "h4", port = 5432 }, database = "initial" }, cb)
+    end)
+    H.eq(creds.dbname, "dbgrid_test")
+  end)
+
+  H.it("add asks for the database only when the secret names none", function()
+    local input_prompts = {}
+    local orig_select, orig_input = vim.ui.select, vim.ui.input
+    vim.ui.select = function(items, opts, on_choice)
+      local pick = items[1]
+      for _, item in ipairs(items) do
+        if item == "prod" or (type(item) == "table" and item.id == "app-prod") then
+          pick = item
+        end
+      end
+      vim.schedule(function()
+        on_choice(pick, 1)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      input_prompts[#input_prompts + 1] = { prompt = opts.prompt, default = opts.default }
+      local answer = opts.default
+      if opts.prompt:find("^Secrets Manager") then
+        answer = "prod/nodb"
+      elseif opts.prompt:find("^Connection name") then
+        answer = "app-prod-nodb"
+      end
+      vim.schedule(function()
+        on_confirm(answer or "")
+      end)
+    end
+    local conn = sync(function(cb)
+      aws.add_interactive(cb)
+    end)
+    vim.ui.select, vim.ui.input = orig_select, orig_input
+    H.truthy(conn, "no connection returned")
+    H.eq(conn.aws.secret, "prod/nodb")
+    H.eq(conn.aws.database, "dbgrid_test", "prefilled with the cluster's initial database")
+    local db_prompt
+    for _, p in ipairs(input_prompts) do
+      if p.prompt:find("^Database") then
+        db_prompt = p
+      end
+    end
+    H.truthy(db_prompt, "the database was asked for")
+    H.matches(db_prompt.prompt, "the secret names none")
+    H.eq(db_prompt.default, "dbgrid_test")
+    H.eq(#input_prompts, 4)
   end)
 end)
 

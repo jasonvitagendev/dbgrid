@@ -235,6 +235,9 @@ def main():
         sid = opts.get("secret-id", SECRET_ARN)
         secret = {"username": "postgres", "password": "x", "engine": "postgres", "host": "db.internal",
                   "port": db_port(), "dbname": "dbgrid_test", "dbClusterIdentifier": "app-prod"}
+        if "nodb" in sid:
+            # an RDS-managed master secret: username and password only
+            secret = {"username": "postgres", "password": "x"}
         out({
             "ARN": sid if sid.startswith("arn:") else SECRET_ARN,
             "Name": "rds!cluster-3f2c1a6e-app-prod",

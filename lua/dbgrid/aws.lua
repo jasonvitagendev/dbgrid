@@ -17,7 +17,7 @@ local M = {}
 ---@field secret? string                 Secrets Manager id/ARN (default: the RDS managed master secret)
 ---@field auth? "secret"|"iam"
 ---@field user? string                   database user for iam auth
----@field database? string               database name (default: from the secret)
+---@field database? string               database name (default: the secret's dbname, the cluster's initial database, postgres)
 ---@field document? string               SSM document for the port forward
 ---@field parameters? table<string,string>
 ---@field login_cmd? string|string[]     overrides config.aws.login_cmd
@@ -127,6 +127,7 @@ function M.parse_cluster(json)
     reader = nz(c.ReaderEndpoint) and { host = c.ReaderEndpoint, port = port } or nil,
     members = {},
     secret_arn = nz(c.MasterUserSecret) and nz(c.MasterUserSecret.SecretArn) or nil,
+    database = nz(c.DatabaseName),
   }
   for _, m in ipairs(nz(c.DBClusterMembers) or {}) do
     info.members[#info.members + 1] = { id = nz(m.DBInstanceIdentifier), writer = nz(m.IsClusterWriter) == true }
@@ -160,6 +161,7 @@ function M.parse_instance(json)
     secret_arn = nz(i.MasterUserSecret) and nz(i.MasterUserSecret.SecretArn) or nil,
     vpc = nz(i.DBSubnetGroup) and nz(i.DBSubnetGroup.VpcId) or nil,
     public = nz(i.PubliclyAccessible) == true,
+    database = nz(i.DBName),
   }
   for _, r in ipairs(nz(i.ReadReplicaDBInstanceIdentifiers) or {}) do
     info.replicas[#info.replicas + 1] = r
@@ -990,9 +992,15 @@ function M.credentials(aws_cfg, info, cb, endpoint)
     if not secret then
       return cb(nil, err)
     end
-    local dbname = aws_cfg.database or secret.dbname
+    -- RDS-managed master secrets carry only username/password: fall back to the
+    -- cluster's initial database, then to the maintenance database
+    local dbname = aws_cfg.database or secret.dbname or info.database
     if not dbname then
-      return cb(nil, "the secret has no dbname; set `database` in the aws block of the connection")
+      dbname = "postgres"
+      util.notify(
+        "dbgrid: the secret names no database and the cluster has no initial one; connecting to postgres"
+          .. " (set `database` in the aws block, or :Dbgrid connections edit)"
+      )
     end
     local creds = { username = secret.username, password = secret.password, dbname = dbname }
     creds_cache[key] = creds
@@ -1485,8 +1493,35 @@ function M.edit_interactive(conn, cb)
     a.bastion = bastion
     ask("Secrets Manager secret (id or ARN; empty = the RDS managed secret): ", a.secret, function(secret)
       a.secret = secret
-      cb(true)
+      local prompt = "Database (empty = the secret's dbname, else the cluster's initial database, else postgres): "
+      ask(prompt, a.database, function(database)
+        a.database = database
+        cb(true)
+      end)
     end)
+  end)
+end
+
+---Settle the database of a new aws connection: nothing to store when the
+---secret carries a dbname; otherwise ask, prefilled with the cluster's initial
+---database (or postgres).
+---@param aws_cfg dbgrid.AwsConfig
+---@param info? table   parse_cluster / parse_instance result
+---@param next_step fun(database?: string)
+local function pick_database_name(aws_cfg, info, next_step)
+  local secret_id = aws_cfg.secret or (info and info.secret_arn) or nil
+  local function prompt(reason)
+    ask("Database (" .. reason .. "): ", (info and info.database) or "postgres", next_step)
+  end
+  if not secret_id then
+    return prompt("no secret to read it from")
+  end
+  M.cli(aws_cfg, { "secretsmanager", "get-secret-value", "--secret-id", secret_id }, function(res)
+    local secret = res.ok and M.parse_secret(res.json or res.stdout) or nil
+    if secret and secret.dbname then
+      return next_step(nil)
+    end
+    prompt(secret and "the secret names none" or "the secret could not be read")
   end)
 end
 
@@ -1607,20 +1642,23 @@ function M.add_interactive(cb)
               util.warn("dbgrid: no secret given; set aws.secret (or aws.auth = \"iam\") before connecting")
             end
             aws_cfg.auth = "secret"
-            ask("Connection name: ", item.id, function(name)
-              if not name then
-                return cancel()
-              end
-              local conn = {
-                name = name,
-                url = "aws://" .. profile .. "/" .. item.id,
-                adapter = "postgres",
-                aws = aws_cfg,
-                ssl = cfg().ssl or "require",
-              }
-              require("dbgrid.connections").save(conn, "global")
-              util.notify("dbgrid: saved aws connection " .. name)
-              cb(conn)
+            pick_database_name(aws_cfg, info, function(database)
+              aws_cfg.database = database
+              ask("Connection name: ", item.id, function(name)
+                if not name then
+                  return cancel()
+                end
+                local conn = {
+                  name = name,
+                  url = "aws://" .. profile .. "/" .. item.id,
+                  adapter = "postgres",
+                  aws = aws_cfg,
+                  ssl = cfg().ssl or "require",
+                }
+                require("dbgrid.connections").save(conn, "global")
+                util.notify("dbgrid: saved aws connection " .. name)
+                cb(conn)
+              end)
             end)
           end)
         end)
