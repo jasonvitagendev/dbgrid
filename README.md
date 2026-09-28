@@ -284,7 +284,9 @@ retries. Without `bastion` the plugin connects directly. `aws.document` and
 Commands: `:Dbgrid aws add` (interactive: profile, region, cluster, bastion,
 secret; the bastion is chosen from the SSM-managed instances, and one clear
 online jumpbox in the database's VPC is taken without asking; the database is
-asked for only when the secret names none), `aws login`,
+asked for only when the secret names none; when the region has no database
+the other regions are searched and the hits are offered with their region,
+and a listing the role may not make is reported rather than shown as empty), `aws login`,
 `aws refresh` (drop the endpoint cache), `aws tunnels` (list / kill), `aws status` (instance status, engine version, pending
 maintenance, five CloudWatch metrics over the last five minutes), `aws events`
 (last day of RDS events), `aws bluegreen` (blue/green deployments and their

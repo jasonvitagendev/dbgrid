@@ -717,6 +717,103 @@ H.describe("aws add_interactive", function()
     local saved = util.read_json(tmp .. "/data/connections.json")
     H.eq(saved.connections[#saved.connections].name, "app-prod")
   end)
+  H.it("reports a failing listing instead of an empty list", function()
+    local orig_select, orig_input, orig_notify = vim.ui.select, vim.ui.input, util.notify
+    local offered, notes = {}, {}
+    util.notify = function(msg, level)
+      notes[#notes + 1] = { msg = msg, level = level }
+    end
+    vim.ui.select = function(items, opts, on_choice)
+      local pick = items[1]
+      if opts.prompt == "RDS cluster / instance" then
+        offered = vim.tbl_map(opts.format_item, items)
+        pick = nil
+      end
+      vim.schedule(function()
+        on_choice(pick, pick and 1 or nil)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      vim.schedule(function()
+        on_confirm(opts.default or "")
+      end)
+    end
+    vim.env.DBGRID_FAKE_AWS_DENY = "rds describe-db-clusters"
+    local conn = sync(function(cb)
+      aws.add_interactive(cb)
+    end)
+    vim.env.DBGRID_FAKE_AWS_DENY = ""
+    vim.ui.select, vim.ui.input, util.notify = orig_select, orig_input, orig_notify
+    H.eq(conn, nil)
+    -- the instances the role may list are still offered, and the denial is said
+    H.eq(offered[1], "instance app-solo  available")
+    local warned
+    for _, n in ipairs(notes) do
+      if n.msg:find("listing clusters failed", 1, true) then
+        warned = n
+      end
+    end
+    H.truthy(warned, "no warning about the denied listing")
+    H.eq(warned.level, vim.log.levels.WARN)
+    H.matches(warned.msg, "AccessDeniedException")
+    for _, n in ipairs(notes) do
+      H.truthy(not n.msg:find("looking in the other regions", 1, true), "a failed listing must not trigger the scan")
+    end
+  end)
+
+  H.it("looks in the other regions when the chosen one is empty", function()
+    local orig_select, orig_input, orig_notify = vim.ui.select, vim.ui.input, util.notify
+    local offered, notes, prompts = {}, {}, {}
+    util.notify = function(msg, level)
+      notes[#notes + 1] = { msg = msg, level = level }
+    end
+    vim.ui.select = function(items, opts, on_choice)
+      prompts[#prompts + 1] = opts.prompt
+      local pick = items[1]
+      if opts.prompt == "RDS cluster / instance" then
+        offered = vim.tbl_map(opts.format_item, items)
+        for _, item in ipairs(items) do
+          if item.id == "app-solo" then
+            pick = item
+          end
+        end
+      end
+      vim.schedule(function()
+        on_choice(pick, 1)
+      end)
+    end
+    vim.ui.input = function(opts, on_confirm)
+      local answer = opts.default
+      if opts.prompt:find("SSM target") then
+        answer = "i-0bastion"
+      elseif opts.prompt:find("secret") then
+        answer = "prod/solo"
+      end
+      vim.schedule(function()
+        on_confirm(answer or "")
+      end)
+    end
+    vim.env.DBGRID_FAKE_AWS_DB_REGION = "us-west-1"
+    local conn = sync(function(cb)
+      aws.add_interactive(cb)
+    end)
+    vim.env.DBGRID_FAKE_AWS_DB_REGION = nil
+    vim.ui.select, vim.ui.input, util.notify = orig_select, orig_input, orig_notify
+    -- the region prompt defaulted to ap-southeast-1 (empty); the scan found us-west-1 and says so per item
+    H.truthy(conn, "no connection returned")
+    H.eq(conn.aws.region, "us-west-1")
+    H.eq(conn.aws.instance, "app-solo")
+    H.eq(offered[1], "us-west-1  cluster app-prod  available")
+    H.matches(table.concat(offered, "\n"), "us%-west%-1  instance app%-solo  available")
+    H.eq(offered[#offered], "other: reach the database by host name (PrivateLink endpoint, another account)")
+    local looked
+    for _, n in ipairs(notes) do
+      if n.msg:find("in ap-southeast-1; looking in the other regions", 1, true) then
+        looked = true
+      end
+    end
+    H.truthy(looked, "the scan was not announced")
+  end)
 end)
 
 H.describe("aws bastions", function()

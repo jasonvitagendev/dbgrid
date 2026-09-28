@@ -5,6 +5,7 @@ Environment:
   DBGRID_FAKE_AWS_LOG            append one line per invocation (the argv) to this file
   DBGRID_FAKE_AWS_DENY           comma-separated "<service> <command>" pairs that fail with AccessDeniedException
   DBGRID_FAKE_AWS_EXPIRED_UNTIL  until this file exists every call fails like an expired SSO token
+  DBGRID_FAKE_AWS_DB_REGION      the databases exist only in this region: describe-db-* list nothing elsewhere
   DBGRID_TEST_URL                the port of this URL becomes the cluster port (default 5433)
 
 `ssm start-session` really forwards: it execs forwarder.py localPortNumber -> portNumber.
@@ -117,6 +118,12 @@ INSTANCES = [
 ]
 
 
+def elsewhere(opts):
+    """Is the call aimed at a region other than the one the databases live in?"""
+    home = os.environ.get("DBGRID_FAKE_AWS_DB_REGION")
+    return bool(home) and opts.get("region", REGION) != home
+
+
 def main():
     argv = sys.argv[1:]
     log = os.environ.get("DBGRID_FAKE_AWS_LOG")
@@ -150,6 +157,10 @@ def main():
             "Account": ACCOUNT,
             "Arn": "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Admin_abc/jason" % ACCOUNT,
         })
+    elif svc == "ec2" and cmd == "describe-regions":
+        out(["ap-southeast-1", "eu-west-1", "us-west-1"])
+    elif svc == "rds" and cmd in ("describe-db-clusters", "describe-db-instances") and elsewhere(opts):
+        out({"DBClusters": []} if cmd == "describe-db-clusters" else {"DBInstances": []})
     elif svc == "rds" and cmd == "describe-db-clusters":
         cid = opts.get("db-cluster-identifier")
         if cid == "app-nodb":

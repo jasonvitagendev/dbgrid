@@ -37,6 +37,26 @@ local M = {}
 ---@field token_expires? integer         epoch seconds (iam auth)
 
 local DEFAULT_LOGIN = { "aws", "sso", "login", "--profile", "{profile}" }
+---Regions scanned for databases when `ec2 describe-regions` is denied (the ones enabled by default).
+M.DEFAULT_REGIONS = {
+  "us-east-1",
+  "us-east-2",
+  "us-west-1",
+  "us-west-2",
+  "ap-south-1",
+  "ap-northeast-1",
+  "ap-northeast-2",
+  "ap-northeast-3",
+  "ap-southeast-1",
+  "ap-southeast-2",
+  "ca-central-1",
+  "eu-central-1",
+  "eu-west-1",
+  "eu-west-2",
+  "eu-west-3",
+  "eu-north-1",
+  "sa-east-1",
+}
 local IAM_TOKEN_TTL = 14 * 60
 local CLI_TIMEOUT_MS = 60000
 
@@ -1697,19 +1717,30 @@ function M.add_interactive(cb)
       ask("AWS region: ", default ~= "" and default or nil, next_step)
     end, { text = true, no_login = true })
   end
-  local function pick_database(aws_cfg, next_step)
-    local clusters, instances, placement = {}, {}, {}
+  ---The clusters and standalone instances of a region as picker items, plus
+  ---the describe calls that failed (nil when both worked).
+  ---@param aws_cfg dbgrid.AwsConfig
+  ---@param cb fun(items: table[], failed?: { what: string, res: dbgrid.AwsCliResult }[])
+  ---@param opts? { no_login?: boolean }
+  local function list_databases(aws_cfg, cb, opts)
+    local clusters, instances, placement, failed = {}, {}, {}, {}
     parallel({
       function(done)
         M.cli(aws_cfg, { "rds", "describe-db-clusters" }, function(res)
+          if not res.ok then
+            failed[#failed + 1] = { what = "listing clusters", res = res }
+          end
           for _, c in ipairs(res.json and nz(res.json.DBClusters) or {}) do
             clusters[#clusters + 1] = c
           end
           done()
-        end)
+        end, opts)
       end,
       function(done)
         M.cli(aws_cfg, { "rds", "describe-db-instances" }, function(res)
+          if not res.ok then
+            failed[#failed + 1] = { what = "listing instances", res = res }
+          end
           for _, i in ipairs(res.json and nz(res.json.DBInstances) or {}) do
             local cid = nz(i.DBClusterIdentifier)
             if cid then
@@ -1722,27 +1753,68 @@ function M.add_interactive(cb)
             end
           end
           done()
-        end)
+        end, opts)
       end,
     }, function()
       local items = {}
       for _, c in ipairs(clusters) do
         local where = placement[c.DBClusterIdentifier] or {}
-        items[#items + 1] =
-          { kind = "cluster", id = c.DBClusterIdentifier, raw = c, vpc = where.vpc, public = where.public }
+        items[#items + 1] = {
+          kind = "cluster",
+          id = c.DBClusterIdentifier,
+          raw = c,
+          region = aws_cfg.region,
+          vpc = where.vpc,
+          public = where.public,
+        }
       end
       for _, i in ipairs(instances) do
         items[#items + 1] = {
           kind = "instance",
           id = i.DBInstanceIdentifier,
           raw = i,
+          region = aws_cfg.region,
           vpc = nz(i.DBSubnetGroup) and nz(i.DBSubnetGroup.VpcId) or nil,
           public = nz(i.PubliclyAccessible) == true,
         }
       end
-      if #items == 0 then
-        util.warn("dbgrid: no RDS clusters or instances visible to profile " .. profile_of(aws_cfg))
+      cb(items, #failed > 0 and failed or nil)
+    end)
+  end
+  ---The region is empty: look through the account's other regions (a database
+  ---created in a region other than the profile's default is easy to miss).
+  ---Regions a service control policy denies are skipped silently.
+  ---@param aws_cfg dbgrid.AwsConfig
+  ---@param cb fun(items: table[])
+  local function scan_regions(aws_cfg, cb)
+    M.cli(aws_cfg, { "ec2", "describe-regions", "--query", "Regions[].RegionName" }, function(res)
+      local regions = {}
+      for _, r in ipairs(res.ok and res.json or M.DEFAULT_REGIONS) do
+        if r ~= aws_cfg.region then
+          regions[#regions + 1] = r
+        end
       end
+      local found = {}
+      local fns = {}
+      for _, r in ipairs(regions) do
+        fns[#fns + 1] = function(done)
+          local there = vim.tbl_extend("force", aws_cfg, { region = r })
+          list_databases(there, function(items)
+            vim.list_extend(found, items)
+            done()
+          end, { no_login = true })
+        end
+      end
+      parallel(fns, function()
+        table.sort(found, function(a, b)
+          return a.region < b.region or (a.region == b.region and a.id < b.id)
+        end)
+        cb(found)
+      end)
+    end)
+  end
+  local function pick_database(aws_cfg, next_step)
+    local function offer(items, elsewhere)
       items[#items + 1] = { kind = "host", id = "by host", raw = {} }
       vim.ui.select(items, {
         prompt = "RDS cluster / instance",
@@ -1751,9 +1823,26 @@ function M.add_interactive(cb)
             return "other: reach the database by host name (PrivateLink endpoint, another account)"
           end
           local status = nz(item.raw.Status) or nz(item.raw.DBInstanceStatus) or ""
-          return item.kind .. " " .. item.id .. "  " .. status
+          local where = elsewhere and (item.region .. "  ") or ""
+          return where .. item.kind .. " " .. item.id .. "  " .. status
         end,
       }, next_step)
+    end
+    list_databases(aws_cfg, function(items, failed)
+      for _, f in ipairs(failed or {}) do
+        util.warn("dbgrid: " .. cli_error(aws_cfg, f.what, f.res))
+      end
+      if #items > 0 or failed then
+        return offer(items)
+      end
+      local where = "profile " .. profile_of(aws_cfg) .. " in " .. (aws_cfg.region or "the default region")
+      util.notify("dbgrid: no RDS clusters or instances visible to " .. where .. "; looking in the other regions")
+      scan_regions(aws_cfg, function(found)
+        if #found == 0 then
+          util.warn("dbgrid: no RDS clusters or instances visible to " .. where .. " or any other region")
+        end
+        offer(found, true)
+      end)
     end)
   end
   ---Finish a connection: bastion, database (when the secret names none) and name, then save.
@@ -1830,6 +1919,7 @@ function M.add_interactive(cb)
         if item.kind == "host" then
           return add_by_host(aws_cfg)
         end
+        aws_cfg.region = item.region or aws_cfg.region
         aws_cfg[item.kind] = item.id
         local info = item.kind == "cluster" and M.parse_cluster({ DBClusters = { item.raw } })
           or M.parse_instance({ DBInstances = { item.raw } })
