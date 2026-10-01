@@ -91,26 +91,6 @@ function M.pick_agent(s, cb)
   })
 end
 
----The error of a run as the agent should read it.
----@param e dbgrid.RunError
----@return string
-local function error_text(e)
-  local err = { "ERROR: " .. tostring(e.message) }
-  if e.line then
-    err[#err + 1] = "at line " .. e.line .. (e.col and (", column " .. e.col) or "") .. " of the statement"
-  end
-  if e.detail then
-    err[#err + 1] = "DETAIL: " .. e.detail
-  end
-  if e.hint then
-    err[#err + 1] = "HINT: " .. e.hint
-  end
-  if e.context then
-    err[#err + 1] = "CONTEXT: " .. e.context
-  end
-  return table.concat(err, "\n")
-end
-
 ---Build the text handed to the agent.
 ---@param opts { prompt: string, existing_sql?: string, error?: dbgrid.RunError, schema?: dbgrid.SchemaData, context_sql?: string[], dialect?: string, instructions?: string, max_tables?: integer, framework?: string, params?: string[] }
 ---@return string
@@ -144,7 +124,7 @@ function M.build_prompt(opts)
         return t
       end
       parts[#parts + 1] = "## Last error (the existing SQL failed with this; the new SQL must not)\n"
-        .. redact(error_text(opts.error))
+        .. redact(table.concat(util.error_lines(opts.error), "\n"))
     end
   end
   if opts.schema then
@@ -487,52 +467,10 @@ function M.build_error_prompt(opts)
   end
   parts[#parts + 1] = "## Statement\n```sql\n" .. redact(opts.sql) .. "\n```"
   local e = opts.error
-  parts[#parts + 1] = "## Error\n" .. redact(error_text(e))
+  parts[#parts + 1] = "## Error\n" .. redact(table.concat(util.error_lines(e), "\n"))
   local tables = opts.tables or {}
   if #tables == 0 and opts.schema then
     tables = require("dbgrid.schema").relevant_tables(opts.schema, opts.sql .. " " .. tostring(e.message), opts.sql, 10)
-  end
-  if #tables > 0 then
-    parts[#parts + 1] = "## Tables\n" .. describe_tables(tables)
-  end
-  return table.concat(parts, "\n\n") .. "\n"
-end
-
----Prompt for "fix this statement": the answer is the corrected SQL only.
----@param opts { sql: string, error: dbgrid.RunError, tables?: dbgrid.SchemaTable[], version?: string,
----  schema?: dbgrid.SchemaData, params?: string[] }
----@return string
-function M.build_fix_prompt(opts)
-  local cfg = config.get().ai
-  local redact = cfg.redact_literals and M.redact or function(t)
-    return t
-  end
-  local parts = {}
-  parts[#parts + 1] = string.format(
-    "You fix a failing %s statement inside a SQL notebook.\n"
-      .. "Reply with SQL only: no prose, no markdown fences, no explanation. End the statement with a semicolon.\n"
-      .. "Keep the intent and shape of the statement; change only what the error needs. "
-      .. "Only use tables and columns from the schema below. If the error is about data or permissions rather"
-      .. " than the SQL, return the statement unchanged with a `-- note:` comment line saying what to check.",
-    opts.version and opts.version:match("^PostgreSQL [%d%.]+") or cfg.dialect or "PostgreSQL"
-  )
-  if (cfg.instructions or "") ~= "" then
-    parts[#parts + 1] = cfg.instructions
-  end
-  if opts.params and #opts.params > 0 then
-    parts[#parts + 1] = "Parameters available as `:name` placeholders (keep them as placeholders, do not invent values): :"
-      .. table.concat(opts.params, ", :")
-  end
-  parts[#parts + 1] = "## Statement\n" .. redact(opts.sql)
-  parts[#parts + 1] = "## Error\n" .. redact(error_text(opts.error))
-  local tables = opts.tables or {}
-  if #tables == 0 and opts.schema then
-    tables = require("dbgrid.schema").relevant_tables(
-      opts.schema,
-      opts.sql .. " " .. tostring(opts.error.message),
-      opts.sql,
-      10
-    )
   end
   if #tables > 0 then
     parts[#parts + 1] = "## Tables\n" .. describe_tables(tables)

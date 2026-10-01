@@ -389,4 +389,24 @@ function M.refresh_keymap_hints(buf)
   end
 end
 
+---A run error as lines: message, position, detail, hint, context.
+---@param e dbgrid.RunError
+---@return string[]
+function M.error_lines(e)
+  local out = { "ERROR: " .. tostring(e.message) }
+  if e.line then
+    out[#out + 1] = "at line " .. e.line .. (e.col and (", column " .. e.col) or "") .. " of the statement"
+  end
+  if e.detail then
+    out[#out + 1] = "DETAIL: " .. e.detail
+  end
+  if e.hint then
+    out[#out + 1] = "HINT: " .. e.hint
+  end
+  if e.context then
+    out[#out + 1] = "CONTEXT: " .. e.context
+  end
+  return out
+end
+
 return M

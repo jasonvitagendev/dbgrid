@@ -437,12 +437,12 @@ local function render_placeholder(s, cell, ctx)
     { key(k.generate), "generate SQL from a `-- ? prompt` line" },
     { key(k.next_cell) .. "  " .. key(k.prev_cell), "next · previous cell" },
     { key(k.new_cell) .. "  " .. key(k.new_cell_below), "new cell at the end · below this one" },
+    { key(k.clone_cell) .. "  " .. key(k.last_error), "clone the cell · show its last error" },
     { key(k.tags) .. "  " .. key(k.connection), "tags · connection" },
     { key(k.tables) .. "  " .. key(k.describe), "browse tables · describe the identifier under the cursor" },
     { key(k.schema_view) .. "  " .. key(k.params), "schema document (foldable) · parameters" },
     { key(k.format) .. "  " .. key(k.agent), "format the cell · pick the coding agent" },
     { key(k.analyze) .. "  " .. key(k.explain_error), "analyze the plan · explain the error (agent)" },
-    { key(k.fix_error), "clone the cell, the agent fixes the error in the copy" },
     { key(k.focus_results), "jump to this pane" },
   }
   for _, r in ipairs(rows) do

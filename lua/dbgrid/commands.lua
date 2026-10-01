@@ -63,6 +63,18 @@ M.subcommands = {
       require("dbgrid.runner").analyze_cell(s, cell)
     end
   end,
+  ["clone-cell"] = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.query").clone_cell(s)
+    end
+  end,
+  ["last-error"] = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.query").show_error(s)
+    end
+  end,
   ["explain-error"] = function()
     local s = current_or_warn()
     if not s then
@@ -71,16 +83,6 @@ M.subcommands = {
     local cell = current_cell(s)
     if cell then
       require("dbgrid.runner").explain_error(s, cell)
-    end
-  end,
-  ["fix-error"] = function()
-    local s = current_or_warn()
-    if not s then
-      return
-    end
-    local cell = current_cell(s)
-    if cell then
-      require("dbgrid.runner").fix_error(s, cell)
     end
   end,
   ["try-index"] = function(args)

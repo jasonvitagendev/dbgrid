@@ -390,6 +390,71 @@ function M.yank_cell(s)
   util.notify("yanked cell (" .. #cell.lines .. " lines)")
 end
 
+---Duplicate the cell below itself (same title, body and directives) and
+---move to the copy.
+---@param s dbgrid.State
+---@return dbgrid.Cell? copy
+function M.clone_cell(s)
+  local cell = M.current_cell(s)
+  if not cell then
+    return
+  end
+  cells.ensure_ids(s.buf)
+  cell = cells.parse(s.buf)[cell.index] or cell
+  local copy = cells.clone(s.buf, cell)
+  M.render(s)
+  M.goto_cell(s, copy.index)
+  M.on_cursor(s, true)
+  util.notify("cloned cell as q" .. copy.index)
+  return copy
+end
+
+---Lines of a cell's last error, as shown by `show_error`.
+---@param result dbgrid.RunResult
+---@return string[]
+function M.error_lines(result)
+  local e = result.error
+  local lines = util.error_lines(e)
+  if e.stmt_index and #(result.statements or {}) > 1 then
+    lines[#lines + 1] = "in statement " .. e.stmt_index .. " of " .. #result.statements
+  end
+  return lines
+end
+
+---Show the cell's last error in a float: message, position, detail, hint
+---and context. `y` yanks it, `q` closes.
+---@param s dbgrid.State
+---@return integer? win
+function M.show_error(s)
+  local cell = M.current_cell(s)
+  if not cell or not cell.id then
+    return
+  end
+  local result = notebook.result_of(s.nb, cell.id)
+  if not result or not result.error then
+    return util.notify("this cell has no error")
+  end
+  local lines = M.error_lines(result)
+  local _, win = vim.lsp.util.open_floating_preview(lines, "", {
+    border = "rounded",
+    focusable = true,
+    focus = true,
+    title = " " .. config.get().icons.error .. " " .. cells.label(cell, 40) .. " · " .. util.ago(result.ran_at) .. " ",
+    title_pos = "left",
+  })
+  local buf = vim.api.nvim_win_get_buf(win)
+  local text = table.concat(lines, "\n")
+  vim.keymap.set("n", "y", function()
+    vim.fn.setreg('"', text)
+    pcall(vim.fn.setreg, "+", text)
+    util.notify("yanked error")
+  end, { buffer = buf, nowait = true, silent = true, desc = "dbgrid: yank the error" })
+  vim.keymap.set("n", "q", function()
+    pcall(vim.api.nvim_win_close, win, true)
+  end, { buffer = buf, nowait = true, silent = true, desc = "dbgrid: close" })
+  return win
+end
+
 ---@param s dbgrid.State
 function M.rename_cell(s)
   local cell = M.current_cell(s)
@@ -750,6 +815,12 @@ function M.attach(s)
   map(buf, "n", k.rename_cell, function()
     M.rename_cell(s)
   end, "rename cell")
+  map(buf, "n", k.clone_cell, function()
+    M.clone_cell(s)
+  end, "clone the cell below itself")
+  map(buf, "n", k.last_error, function()
+    M.show_error(s)
+  end, "show the last error")
   map(buf, "n", k.generate, function()
     local cell = M.current_cell(s)
     if cell then
@@ -774,12 +845,6 @@ function M.attach(s)
       runner.explain_error(s, cell)
     end
   end, "explain the last error with the agent")
-  map(buf, "n", k.fix_error, function()
-    local cell = M.current_cell(s)
-    if cell then
-      runner.fix_error(s, cell)
-    end
-  end, "clone the cell and let the agent fix the last error in the copy")
   map(buf, "n", k.try_index, function()
     local cell = M.current_cell(s)
     if cell then
