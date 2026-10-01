@@ -492,7 +492,11 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
     state.active_cell = fresh.id
   end
   ui_query().render(state)
-  if not extra.live or state.view.cell_id == fresh.id then
+  if not extra.live then
+    -- a run the user asked for replaces whatever the pane shows, the schema
+    -- document included; a live tick only refreshes a result already shown
+    ui_results().show(state, fresh.id, { ran = true })
+  elseif state.view.cell_id == fresh.id then
     ui_results().show(state, fresh.id)
   end
   if not res.ok and live then

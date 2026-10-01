@@ -442,7 +442,8 @@ connection, cached on disk and refreshed after `schema.ttl_seconds` or `\s`.
 `\b`  shows the schema document in the results pane: one fold per table
       with columns, indexes and foreign keys. Tables used by the current
       cell start open, the rest closed; `/` searches, `\f` filters by
-      table name; the document stays while moving between cells.
+      table name; the document stays while moving between cells and
+      gives way to the result when a cell is run.
 
 Completion: blink.cmp provider `{ name = "dbgrid", module =
 "dbgrid.completion.blink" }`; nvim-cmp `require("cmp").register_source(

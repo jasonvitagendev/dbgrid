@@ -777,7 +777,7 @@ Three ways to look at it, from quick to thorough:
   current cell refers to start unfolded, the rest folded, so a big database
   reads like a tree; `/` searches through everything (folds open on a match),
   `\f` narrows the list by table name. The document stays while you move
-  between cells; `\b` again brings the grid back.
+  between cells; running a cell brings its result back, and so does `\b`.
 
 This is deliberately not a tree widget: a flat, foldable document is
 searchable with the keys you already have, shows a whole table at once, and

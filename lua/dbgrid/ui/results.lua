@@ -1168,9 +1168,12 @@ function M.yank_plan(s)
 end
 
 ---Show a cell's result in the results pane.
+---
+---The schema document is not tied to a cell, so moving between cells keeps
+---it; a fresh result (`opts.ran`) or an explicit view replaces it.
 ---@param s dbgrid.State
 ---@param cell_id string
----@param opts? { view?: "grid"|"record"|"plan"|"diff"|"schema" }
+---@param opts? { view?: "grid"|"record"|"plan"|"diff"|"schema", ran?: boolean }
 function M.show(s, cell_id, opts)
   opts = opts or {}
   require("dbgrid.ui.layout").ensure_results(s)
@@ -1178,11 +1181,14 @@ function M.show(s, cell_id, opts)
     return
   end
   local same = s.view.cell_id == cell_id
-  if s.view.mode == "schema" and not opts.view then
-    -- the schema document is not tied to a cell: keep it, remember the cell
-    s.view.cell_id = cell_id
-    M.refresh_winbar(s)
-    return
+  if s.view.mode == "schema" then
+    if not opts.view and not opts.ran then
+      s.view.cell_id = cell_id
+      M.refresh_winbar(s)
+      return
+    end
+    s.view.mode = "grid"
+    s.view.schema_key = nil
   end
   local mode = opts.view or (same and s.view.mode) or "grid"
   if not same then
