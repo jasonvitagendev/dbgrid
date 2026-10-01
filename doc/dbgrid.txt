@@ -140,6 +140,8 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid templates              pick a template (`templates list` prints them)
 :Dbgrid analyze                agent analysis of the cell's plan
 :Dbgrid explain-error          agent explanation of the cell's last error
+:Dbgrid fix-error              clone the cell, the agent fixes the error in
+                               the copy
 :Dbgrid try-index [sql]        hypothetical index (hypopg), cost before/after
 :Dbgrid params [name value]    re-prompt / set parameters; `params clear`
 :Dbgrid live [interval|stop]   start or stop the live loop of the cell
@@ -167,6 +169,7 @@ Query pane ~
   \p          edit parameters        \g          generate SQL from prompt
   \a          pick the agent         \A          analyze plan (agent)
   \!          explain error (agent)  \i          try suggested index
+  \f          clone cell, agent fixes the error in the copy
   \?          ask about the query and its result (|dbgrid-review|)
   \H          query history          \t          edit tags
   \c          pick connection        \s  \S      refresh schema / pick table
@@ -327,7 +330,11 @@ opens in a markdown window: `i` inserts its sql blocks as cells below the
 analyzed cell, `y` yanks, `q` closes. It is kept with the result and shown in
 the plan view (`\p`), which also renders actual times and buffers.
 
-`\!` explains the cell's last error the same way. `\i` needs the hypopg
+`\!` explains the cell's last error the same way. `\f` clones the cell
+below itself and asks the agent for the corrected SQL (statement, error and
+the tables involved); it lands in the copy, marked generated, so the
+original is kept and the fix is reviewed before it runs. `\g` on a cell
+whose last run failed also hands the agent that error. `\i` needs the hypopg
 extension: the suggested index is created hypothetically in the same
 session, the statement is re-explained and the cost before and after shown.
 

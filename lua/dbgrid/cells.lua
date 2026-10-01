@@ -394,6 +394,26 @@ function M.insert(buf, where, cell, title)
   end
 end
 
+---Clone a cell right below itself: a fresh marker, the same body.
+---@param buf integer
+---@param cell dbgrid.Cell
+---@param title? string title of the copy (defaults to the original's)
+---@return dbgrid.Cell copy
+function M.clone(buf, cell, title)
+  local id, lnum = M.insert(buf, "below", cell, title or cell.title)
+  -- insert() leaves one empty body line under the marker: replace it with the body
+  local body = vim.deepcopy(cell.lines)
+  while #body > 1 and body[#body] == "" do
+    body[#body] = nil
+  end
+  if #body == 0 then
+    body = { "" }
+  end
+  vim.api.nvim_buf_set_lines(buf, lnum, lnum + 1, false, body)
+  vim.b[buf].dbgrid_cells_cache = nil
+  return assert(M.by_id(buf, id))
+end
+
 ---Delete a cell (marker and body).
 ---@param buf integer
 ---@param cell dbgrid.Cell

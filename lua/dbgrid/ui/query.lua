@@ -774,6 +774,12 @@ function M.attach(s)
       runner.explain_error(s, cell)
     end
   end, "explain the last error with the agent")
+  map(buf, "n", k.fix_error, function()
+    local cell = M.current_cell(s)
+    if cell then
+      runner.fix_error(s, cell)
+    end
+  end, "clone the cell and let the agent fix the last error in the copy")
   map(buf, "n", k.try_index, function()
     local cell = M.current_cell(s)
     if cell then

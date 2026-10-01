@@ -442,6 +442,7 @@ local function render_placeholder(s, cell, ctx)
     { key(k.schema_view) .. "  " .. key(k.params), "schema document (foldable) · parameters" },
     { key(k.format) .. "  " .. key(k.agent), "format the cell · pick the coding agent" },
     { key(k.analyze) .. "  " .. key(k.explain_error), "analyze the plan · explain the error (agent)" },
+    { key(k.fix_error), "clone the cell, the agent fixes the error in the copy" },
     { key(k.focus_results), "jump to this pane" },
   }
   for _, r in ipairs(rows) do

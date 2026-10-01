@@ -73,6 +73,16 @@ M.subcommands = {
       require("dbgrid.runner").explain_error(s, cell)
     end
   end,
+  ["fix-error"] = function()
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell = current_cell(s)
+    if cell then
+      require("dbgrid.runner").fix_error(s, cell)
+    end
+  end,
   ["try-index"] = function(args)
     local s = current_or_warn()
     if not s then

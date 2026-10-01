@@ -351,6 +351,49 @@ H.describe("running features", function()
     })
     H.matches(e, '## Error\nERROR: column "nope" does not exist')
     H.matches(e, "HINT: maybe email")
+    local f = ai.build_fix_prompt({
+      sql = "select nope from users",
+      error = { message = 'column "nope" does not exist', line = 1, col = 8 },
+      params = { "since" },
+    })
+    H.matches(f, "Reply with SQL only")
+    H.matches(f, "## Statement\nselect nope from users")
+    H.matches(f, "## Error\nERROR: column \"nope\" does not exist\nat line 1, column 8")
+    H.matches(f, "placeholders.*:since")
+    local g = ai.build_prompt({
+      prompt = "only active ones",
+      existing_sql = "select nope from users",
+      error = { message = 'column "nope" does not exist' },
+    })
+    H.matches(g, "## Last error.-\nERROR: column \"nope\" does not exist")
+    H.falsy(ai.build_prompt({ prompt = "x", error = { message = "y" } }):find("Last error", 1, true))
+  end)
+
+  H.it("clones a failing cell and lets the agent fix the copy", function()
+    set_cells(s, { "-- %% [fx1] broken", "-- @nolimit", "select nope from users" })
+    local r = run_and_wait(s, 1)
+    H.eq(r.ok, false)
+    local copy, err
+    runner.fix_error(s, cells.parse(s.buf)[1], {
+      cb = function(c, e)
+        copy, err = c, e
+      end,
+    })
+    H.truthy(H.wait(30000, function()
+      return copy ~= nil or err ~= nil
+    end))
+    H.eq(err, nil)
+    local list = cells.parse(s.buf)
+    H.eq(#list, 2)
+    H.eq(list[1].id, "fx1")
+    H.eq((cells.body_text(list[1]):gsub("%s+$", "")), "-- @nolimit\nselect nope from users", "the original is untouched")
+    H.eq(list[2].id, copy.id)
+    H.eq(list[2].title, "fix of broken")
+    H.matches(cells.body_text(list[2]), "^%-%- @nolimit\nselect id, email from users where id <= 2 order by id;")
+    H.eq(s.runtime[copy.id].status, "generated")
+    H.eq(s.active_cell, copy.id)
+    H.eq(notebook.result_of(nb, "fx1").error ~= nil, true, "the original keeps its error")
+    runner.fix_error(s, list[2])
   end)
 
   H.it("explains the last error with the agent", function()

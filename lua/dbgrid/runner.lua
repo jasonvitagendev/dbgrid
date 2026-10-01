@@ -1176,6 +1176,92 @@ function M.explain_error(state, cell, opts)
   end)
 end
 
+---Clone a cell that failed and have the agent write the corrected SQL into
+---the copy, from the statement, its last error and the tables involved. The
+---original stays as it was; the copy is marked generated, to review and run.
+---@param state dbgrid.State
+---@param cell dbgrid.Cell
+---@param opts? { cb?: fun(copy?: dbgrid.Cell, err?: string) }
+function M.fix_error(state, cell, opts)
+  opts = opts or {}
+  cells.ensure_ids(state.buf)
+  cell = cells.parse(state.buf)[cell.index] or cell
+  local result = notebook.result_of(state.nb, cell.id)
+  if not result or not result.error then
+    return util.notify("this cell has no error to fix")
+  end
+  if state.running[cell.id] then
+    return util.warn("cell is busy")
+  end
+  local directives = cells.directives(cell)
+  M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
+    if conn.ai == false then
+      return util.error("connection '" .. conn.name .. "' has ai = false")
+    end
+    local ai = require("dbgrid.ai")
+    local label = cell.title ~= "" and cell.title or ("q" .. cell.index)
+    local copy = cells.clone(state.buf, cell, "fix of " .. label)
+    state.running[copy.id] = { started = util.now(), kind = "ai" }
+    set_runtime(state, copy, "generating")
+    ui_query().goto_cell(state, copy.index)
+    ui_query().start_spinner(state)
+    schema.get(conn, function(sch)
+      local text = cells.sql_text(cell)
+      local tables = {}
+      for _, r in ipairs(sqlmod.referenced_tables(text)) do
+        local t = sch and schema.find_table(sch, r.name)
+        if t then
+          tables[#tables + 1] = t
+        end
+      end
+      local params = {}
+      for _, p in ipairs(require("dbgrid.expand").notebook_params(state)) do
+        params[#params + 1] = p.name
+      end
+      local prompt = ai.build_fix_prompt({
+        sql = text,
+        error = result.error,
+        tables = tables,
+        version = sch and sch.version or nil,
+        schema = sch,
+        params = params,
+      })
+      local agent_name = ai.agent_name(state, cell)
+      util.notify("asking " .. agent_name .. " for a fix…")
+      local started = util.now()
+      local job = ai.ask(prompt, function(sql, err)
+        state.running[copy.id] = nil
+        if not vim.api.nvim_buf_is_valid(state.buf) then
+          return
+        end
+        local fresh = cells.by_id(state.buf, copy.id)
+        if not fresh then
+          return
+        end
+        if not sql then
+          set_runtime(state, fresh, nil)
+          ui_results().render(state)
+          util.error("fix: " .. tostring(err))
+          return opts.cb and opts.cb(nil, err)
+        end
+        local updated = ai.write_sql(state.buf, fresh, sql)
+        state.runtime[updated.id] = { status = "generated", generated_hash = cells.hash(updated) }
+        ui_query().render(state)
+        ui_results().render(state)
+        util.notify(string.format("fix written in %s — review, then run", util.fmt_ms((util.now() - started) * 1000)))
+        if opts.cb then
+          opts.cb(updated)
+        end
+      end, agent_name)
+      if job then
+        state.running[copy.id].job = job
+      else
+        state.running[copy.id] = nil
+      end
+    end)
+  end)
+end
+
 ---Test the suggested index hypothetically (hypopg) and compare plan costs.
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell

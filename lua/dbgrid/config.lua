@@ -265,6 +265,7 @@ M.defaults = {
       agent = "<localleader>a",
       analyze = "<localleader>A",
       explain_error = "<localleader>!",
+      fix_error = "<localleader>f",
       try_index = "<localleader>i",
       history = "<localleader>H",
       focus_results = "<localleader><Tab>",

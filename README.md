@@ -73,8 +73,10 @@ the cache, so moving between cells never re-runs anything.
 - **Plan analysis.** `\A` runs `EXPLAIN ANALYZE` (rolled back), applies a few
   rules (estimates off, sorts spilling to disk, the hot node) and asks the
   agent what is slow, why, and for the fix as SQL you can insert as a cell.
-  `\!` explains the last error the same way. `\i` tries the suggested index
-  hypothetically with hypopg and shows the cost before and after.
+  `\!` explains the last error the same way, and `\f` clones the failing
+  cell and has the agent write the corrected SQL into the copy, so the
+  original stays put. `\i` tries the suggested index hypothetically with
+  hypopg and shows the cost before and after.
 - **Ask about a result.** `\a` in the results pane (`\?` on a cell) sends the
   cell's SQL together with what came back (rows, error, notices, the plan
   when there is one) to the agent with your question — "which of these is
@@ -440,6 +442,7 @@ Query pane:
 | `\a` | pick the coding agent for this notebook |
 | `\A` | analyze the plan with the agent (`EXPLAIN ANALYZE`, rolled back) |
 | `\!` | explain the last error with the agent |
+| `\f` | clone the cell; the agent fixes the last error in the copy |
 | `\?` | ask the agent about the cell's query and its result |
 | `\i` | try the suggested index hypothetically (hypopg) |
 | `\H` | query history |
@@ -489,7 +492,7 @@ one confirmation. Subcommands (with completion):
 | `open [name]` | open a notebook (picker when no name) |
 | `new [title]` | create one |
 | `new --template <name> [title]` | create one from a template (`templates` picks) |
-| `analyze` / `explain-error` / `try-index [sql]` | agent analysis of the plan / of the error; hypothetical index |
+| `analyze` / `explain-error` / `fix-error` / `try-index [sql]` | agent analysis of the plan / of the error; fix in a cloned cell; hypothetical index |
 | `params [name value | clear]` | edit, set or forget parameter values |
 | `live [interval | stop]` | start / stop the live loop of the cell |
 | `diff [connection]` | diff against the previous run, or run the cell on another connection and diff |
