@@ -50,6 +50,9 @@ M.defaults = {
     size = 0.5,
     -- Open every notebook in its own tabpage (like an octo review).
     tab = true,
+    -- Line numbers in the results pane: true (absolute) or "relative"
+    -- (current line keeps its absolute number, as with vim.wo.number + relativenumber).
+    number = false, ---@type boolean|"relative"
   },
 
   query = {

@@ -58,6 +58,27 @@ H.describe("notebook ui", function()
     H.eq(vim.b[s.buf].dbgrid, nb.name)
     H.matches(table.concat(results_lines(s), "\n"), "not been run")
     H.matches(layout.winbar_query(s.buf), "test")
+    H.eq(vim.wo[s.results_win].number, false)
+    H.eq(vim.wo[s.results_win].relativenumber, false)
+  end)
+
+  H.it("shows line numbers in the results pane when configured", function()
+    local cfg = require("dbgrid.config").get().layout
+    cfg.number = "relative"
+    local nb2 = notebook.create("ui numbers", { connection = "test" })
+    local s2 = layout.open(nb2)
+    H.eq(vim.wo[s2.results_win].number, true)
+    H.eq(vim.wo[s2.results_win].relativenumber, true)
+    -- absolute only, applied when the results window is (re)created
+    cfg.number = true
+    vim.api.nvim_win_close(s2.results_win, true)
+    s2.results_win = nil
+    layout.ensure_results(s2)
+    H.eq(vim.wo[s2.results_win].number, true)
+    H.eq(vim.wo[s2.results_win].relativenumber, false)
+    cfg.number = false
+    layout.close(s2)
+    vim.api.nvim_set_current_win(s.query_win)
   end)
 
   H.it("runs a cell, renders the grid and caches the result", function()

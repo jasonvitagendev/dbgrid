@@ -103,8 +103,8 @@ function M.ensure_results(s)
   s.results_win = win
   local wo = vim.wo[win]
   wo.wrap = false
-  wo.number = false
-  wo.relativenumber = false
+  wo.number = cfg.number == true or cfg.number == "relative"
+  wo.relativenumber = cfg.number == "relative"
   wo.signcolumn = "no"
   wo.foldcolumn = "0"
   wo.cursorline = true

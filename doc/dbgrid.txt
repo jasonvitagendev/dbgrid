@@ -44,7 +44,7 @@ Requires Neovim 0.10+ and `psql` (PostgreSQL) or `sqlite3` (SQLite) on PATH.
       { name = "prod", url = "$PROD_URL", readonly = true, index_check = "confirm" },
       { name = "fizzy", url = "sqlite:storage/development.sqlite3" },
     },
-    layout = { results = "left", size = 0.5, tab = true },
+    layout = { results = "left", size = 0.5, tab = true, number = false },
     query = { limit = 500, confirm_writes = true, server_cancel = true },
     format = { on_save = false, formatter = "auto" },
     index_check = { mode = "warn", min_rows = 10000 },

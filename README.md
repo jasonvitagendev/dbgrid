@@ -482,6 +482,9 @@ Results pane:
 | `\<Tab>` | focus the query pane |
 | `q` | close the notebook |
 
+`layout.number = true` (or `"relative"`) shows line numbers in the results
+pane, so counts like `10j` are easy to aim.
+
 In the schema document `<CR>` folds and unfolds a table, `K` describes it,
 `\k` shows its foreign-key relations,
 `<Tab>` / `<S-Tab>` jump between tables, `\f` filters tables by name, `\yc`
@@ -845,7 +848,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   env_vars = { "DATABASE_URL", "DB_URL", "POSTGRES_URL", "PG_URL" },
   rails = { enabled = true, environments = { "development", "test" } },
   storage = { mode = "auto", project_dir = ".dbgrid", data_dir = vim.fn.stdpath("data") .. "/dbgrid", cache_rows = 500 },
-  layout = { results = "left", size = 0.5, tab = true },   -- results: "left" | "right" | "bottom"
+  layout = { results = "left", size = 0.5, tab = true, number = false },   -- results: "left" | "right" | "bottom"; number: true | "relative"
   query = { limit = 500, confirm_writes = true, preview_writes = true, dry_run = false, ddl_warnings = true,
             transaction_per_cell = true, timeout_ms = nil, session = false,
             server_cancel = true, cancel_grace_ms = 1500 },
