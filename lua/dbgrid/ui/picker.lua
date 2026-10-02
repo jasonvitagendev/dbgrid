@@ -14,7 +14,8 @@ local function has_snacks()
 end
 
 ---@param items dbgrid.PickItem[]
----@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem)> }
+---Actions get the item under the cursor and every marked item (<Tab> in snacks; the cursor item alone when nothing is marked).
+---@param opts { prompt: string, on_select: fun(item?: dbgrid.PickItem), preview?: boolean, actions?: table<string, fun(item: dbgrid.PickItem, items: dbgrid.PickItem[])>, hint?: string }
 function M.pick(items, opts)
   if #items == 0 then
     opts.on_select(nil)
@@ -35,26 +36,38 @@ function M.pick(items, opts)
       local actions = {}
       for key, fn in pairs(opts.actions or {}) do
         local name = "dbgrid_" .. key:gsub("[^%w]", "_")
-        actions[name] = function(picker, item)
+        actions[name] = function(picker)
+          local picked = {}
+          for _, it in ipairs(picker:selected({ fallback = true })) do
+            if it.item then
+              picked[#picked + 1] = it.item
+            end
+          end
           picker:close()
-          if item and item.item then
-            fn(item.item)
+          if #picked > 0 then
+            vim.schedule(function()
+              fn(picked[1], picked)
+            end)
           end
         end
         keys[key] = { name, mode = { "n", "i" } }
       end
       Snacks.picker.pick({
         source = "dbgrid",
-        title = opts.prompt,
+        title = opts.hint and (opts.prompt .. "  " .. opts.hint) or opts.prompt,
         items = sitems,
         format = "text",
         preview = opts.preview ~= false and "preview" or false,
         layout = opts.preview ~= false and nil or { preset = "select" },
         actions = actions,
-        win = { input = { keys = keys } },
+        -- the list window gets its own maps, so the keys work after a click or <c-w> move too
+        win = { input = { keys = keys }, list = { keys = keys } },
         confirm = function(picker, item)
           picker:close()
-          opts.on_select(item and item.item or nil)
+          -- close() queues a stopinsert; defer so a follow-up input starts in insert mode
+          vim.schedule(function()
+            opts.on_select(item and item.item or nil)
+          end)
         end,
       })
     end)
@@ -72,9 +85,11 @@ function M.pick(items, opts)
   end)
 end
 
----Pick a notebook of the project (optionally filtered by tag).
+---Pick a notebook of the project (optionally filtered by tag). With snacks,
+---<C-x> deletes the notebook under the cursor, or every one marked with <Tab>;
+---the callback then gets action "delete" and the list of notebooks.
 ---@param opts { tag?: string, prompt?: string, allow_new?: boolean }
----@param cb fun(nb?: dbgrid.Notebook, action?: string)
+---@param cb fun(nb?: dbgrid.Notebook, action?: string, nbs?: dbgrid.Notebook[])
 function M.notebook(opts, cb)
   opts = opts or {}
   local notebook = require("dbgrid.notebook")
@@ -92,6 +107,7 @@ function M.notebook(opts, cb)
   local prompt = opts.prompt or ("Notebooks" .. (opts.tag and (" #" .. opts.tag) or ""))
   M.pick(items, {
     prompt = prompt,
+    hint = "(<C-x> delete, <Tab> mark)",
     on_select = function(item)
       if not item then
         return cb(nil)
@@ -102,9 +118,15 @@ function M.notebook(opts, cb)
       cb(item.data)
     end,
     actions = {
-      ["<C-x>"] = function(item)
-        if type(item.data) == "table" then
-          cb(item.data, "delete")
+      ["<C-x>"] = function(_, picked)
+        local nbs = {}
+        for _, it in ipairs(picked) do
+          if type(it.data) == "table" then
+            nbs[#nbs + 1] = it.data
+          end
+        end
+        if #nbs > 0 then
+          cb(nbs[1], "delete", nbs)
         end
       end,
     },
@@ -141,17 +163,39 @@ function M.tag(cb)
   })
 end
 
----Pick a connection (or add one).
+---Pick a connection (or add one). With snacks, <C-e> edits and <C-x> removes
+---the saved connection under the cursor and the picker reopens; without it,
+---`:Dbgrid connections edit|remove` do the same.
 ---@param cb fun(conn?: dbgrid.Connection)
-function M.connection(cb)
+---@param opts? { prompt?: string, exclude?: string, saved_only?: boolean, allow_new?: boolean }
+function M.connection(cb, opts)
+  opts = opts or {}
   local connections = require("dbgrid.connections")
   local items = {}
   for _, c in ipairs(connections.all()) do
-    items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url) } }
+    local saved = c.source == "saved" or c.source == "project"
+    if c.name ~= opts.exclude and (saved or not opts.saved_only) then
+      items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url or "") } }
+    end
   end
-  items[#items + 1] = { text = "+ add connection", data = "new", preview = { "Save a new connection url." } }
+  if opts.saved_only and #items == 0 then
+    util.warn("no saved connections yet: add one with :Dbgrid connections")
+    return cb(nil)
+  end
+  if opts.allow_new ~= false then
+    items[#items + 1] = { text = "+ add connection", data = "new", preview = { "Save a new connection url." } }
+    items[#items + 1] = {
+      text = "+ add AWS RDS / Aurora connection",
+      data = "aws",
+      preview = { "Profile, cluster, bastion, secret." },
+    }
+  end
+  local function reopen()
+    M.connection(cb, opts)
+  end
   M.pick(items, {
-    prompt = "Connections",
+    prompt = opts.prompt or "Connections",
+    hint = "(<C-e> edit, <C-x> remove)",
     preview = false,
     on_select = function(item)
       if not item then
@@ -160,8 +204,23 @@ function M.connection(cb)
       if item.data == "new" then
         return connections.add_interactive(cb)
       end
+      if item.data == "aws" then
+        return require("dbgrid.aws").add_interactive(cb)
+      end
       cb(item.data)
     end,
+    actions = {
+      ["<C-e>"] = function(item)
+        if type(item.data) == "table" then
+          connections.edit_interactive(item.data, reopen)
+        end
+      end,
+      ["<C-x>"] = function(item)
+        if type(item.data) == "table" then
+          connections.remove_interactive(item.data, reopen)
+        end
+      end,
+    },
   })
 end
 

@@ -30,6 +30,13 @@ function M.context(buf, row, col)
   if not qualifier then
     word = before:match('([%w_"]*)$') or ""
   end
+  -- "{{name" completes cell references and parameters, ":name" parameters
+  local in_ref = before:match("{{%s*[%w_%-]*$") ~= nil
+  local in_param = not in_ref and before:match("[^:]:[%w_]*$") ~= nil and not before:match("::[%w_]*$")
+  if in_ref then
+    word = before:match("([%w_%-]*)$") or ""
+    qualifier = nil
+  end
   local cell = cells.cell_at(buf, row)
   local sql_text = cell and cells.body_text(cell) or ""
   local refs = sqlmod.referenced_tables(sql_text)
@@ -39,8 +46,57 @@ function M.context(buf, row, col)
     start_col = col - #(word or ""),
     refs = refs,
     cell = cell,
+    in_ref = in_ref,
+    in_param = in_param,
     after_keyword = before:lower():match('([%a_]+)%s+[%w_"%.]*$'),
   }
+end
+
+---Adapter of the buffer's connection (keywords, functions), Postgres by default.
+---@param buf integer
+---@return dbgrid.Adapter?
+local function adapter_for(buf)
+  local s = state_mod.get(buf)
+  local conn = s and s.nb.meta.connection and require("dbgrid.connections").get(s.nb.meta.connection)
+  local a = conn and require("dbgrid.adapters").for_connection(conn)
+  return a or require("dbgrid.adapters").get("postgres")
+end
+
+---Cell references and parameters of the notebook as completion items.
+---@param buf integer
+---@param ctx table
+---@param add fun(item: dbgrid.CompletionItem)
+local function notebook_items(buf, ctx, add)
+  local s = state_mod.get(buf)
+  local list = cells.parse(buf)
+  if ctx.in_ref then
+    for _, c in ipairs(list) do
+      if not ctx.cell or c.id ~= ctx.cell.id then
+        local name = cells.ref_name(c)
+        add({
+          label = name,
+          kind = M.KIND.alias,
+          kind_name = "cell",
+          detail = "cell " .. cells.label(c, 40),
+          documentation = cells.body_text(c),
+          insert = name .. "}}",
+          sort = "0" .. name,
+        })
+      end
+    end
+  end
+  if s then
+    for _, p in ipairs(require("dbgrid.expand").notebook_params(s)) do
+      add({
+        label = p.name,
+        kind = M.KIND.enum,
+        kind_name = "parameter",
+        detail = p.value and ("= " .. p.value) or "no value yet",
+        insert = ctx.in_ref and (p.name .. "}}") or p.name,
+        sort = "0" .. p.name,
+      })
+    end
+  end
 end
 
 ---@param buf integer
@@ -96,6 +152,10 @@ function M.items(buf, row, col)
         sort = prefix_sort .. c.name,
       })
     end
+  end
+  if ctx.in_ref or ctx.in_param then
+    notebook_items(buf, ctx, add)
+    return items, ctx
   end
   if ctx.qualifier then
     if not sch then
@@ -180,7 +240,7 @@ function M.items(buf, row, col)
     end
   end
   if config.get().completion.keywords then
-    local adapter = require("dbgrid.adapters").get("postgres")
+    local adapter = adapter_for(buf)
     for _, k in ipairs(adapter and adapter.keywords or {}) do
       add({
         label = k,

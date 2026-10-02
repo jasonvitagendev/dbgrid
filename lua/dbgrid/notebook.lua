@@ -22,6 +22,8 @@ local M = {}
 ---@field title string
 ---@field tags string[]
 ---@field connection string?
+---@field agent string?            coding agent used for prompts (overrides ai.agent)
+---@field params table<string,string>  parameter values entered for this notebook
 ---@field created_at integer
 ---@field updated_at integer
 ---@field cells table<string, dbgrid.CellMeta>
@@ -59,6 +61,13 @@ local function load_meta(nb)
   meta.title = meta.title or nb.name
   meta.tags = meta.tags or {}
   meta.cells = meta.cells or {}
+  meta.params = meta.params or {}
+  if meta.params == vim.NIL then
+    meta.params = {}
+  end
+  if meta.agent == vim.NIL then
+    meta.agent = nil
+  end
   meta.created_at = meta.created_at or util.epoch()
   meta.updated_at = meta.updated_at or meta.created_at
   if meta.connection == vim.NIL then
@@ -108,11 +117,15 @@ function M.from_path(path)
   if not path:match("%.sql$") then
     return nil
   end
+  -- buffer names are symlink-resolved (macOS /var -> /private/var), config paths may not be
+  local function real(p)
+    return vim.uv.fs_realpath(p) or p
+  end
   local dir = vim.fs.dirname(path)
   local name = vim.fn.fnamemodify(path, ":t:r")
   local st = config.get().storage
-  local data_projects = vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects/"
-  local in_data = dir:sub(1, #data_projects) == data_projects
+  local data_projects = real(vim.fn.fnamemodify(st.data_dir, ":p"):gsub("/$", "") .. "/projects") .. "/"
+  local in_data = real(dir):sub(1, #data_projects) == data_projects
   local in_project = vim.fs.basename(dir) == st.project_dir
   if not (in_data or in_project) then
     return nil
@@ -124,7 +137,7 @@ function M.from_path(path)
 end
 
 ---@param title string
----@param opts? { tags?: string[], connection?: string, root?: string }
+---@param opts? { tags?: string[], connection?: string, root?: string, body?: string }
 ---@return dbgrid.Notebook
 function M.create(title, opts)
   opts = opts or {}
@@ -157,9 +170,14 @@ function M.create(title, opts)
     created_at = util.epoch(),
     updated_at = util.epoch(),
     cells = {},
+    params = {},
   }
-  local id = util.short_id(4)
-  util.write_file(nb.path, require("dbgrid.cells").header_line(id) .. "\n\n")
+  if opts.body then
+    util.write_file(nb.path, opts.body:gsub("\n?$", "\n"))
+  else
+    local id = util.short_id(4)
+    util.write_file(nb.path, require("dbgrid.cells").header_line(id) .. "\n\n")
+  end
   M.save_meta(nb)
   return nb
 end
@@ -295,6 +313,9 @@ local function slim(result)
     sql_hash = result.sql_hash,
     truncated = result.truncated,
     cancelled = result.cancelled,
+    dry_run = result.dry_run,
+    params = result.params,
+    refs = result.refs,
     statements = {},
   }
   for i, st in ipairs(result.statements or {}) do
@@ -343,7 +364,12 @@ end
 ---@param result table
 function M.set_result(nb, cell, result)
   local cache = ensure_cache(nb)
+  local prev = cache[cell.id]
+  local analysis = prev ~= vim.NIL and prev and prev.analysis or nil
   cache[cell.id] = slim(result)
+  if analysis and analysis.sql_hash == result.sql_hash then
+    cache[cell.id].analysis = analysis
+  end
   local rows
   for _, st in ipairs(result.statements or {}) do
     for _, set in ipairs(st.sets or {}) do
@@ -363,6 +389,7 @@ function M.set_result(nb, cell, result)
     elapsed_ms = result.elapsed_ms,
     warnings = warnings,
     connection = result.connection,
+    dry_run = result.dry_run or nil,
   }
   M.save_meta(nb)
   schedule_cache_write(nb)
@@ -404,6 +431,52 @@ function M.prune(nb, live_ids)
     M.save_meta(nb)
     schedule_cache_write(nb)
   end
+end
+
+---Remember a parameter value (nil forgets it).
+---@param nb dbgrid.Notebook
+---@param name string
+---@param value string?
+function M.set_param(nb, name, value)
+  nb.meta.params = nb.meta.params or {}
+  nb.meta.params[name] = value
+  M.save_meta(nb)
+end
+
+---Coding agent for this notebook (nil = the configured default).
+---@param nb dbgrid.Notebook
+---@param agent string?
+function M.set_agent(nb, agent)
+  nb.meta.agent = agent
+  M.save_meta(nb)
+end
+
+---Attach an AI analysis (markdown text) to a cell's cached result.
+---@param nb dbgrid.Notebook
+---@param cell_id string
+---@param text string
+---@param kind string
+function M.set_analysis(nb, cell_id, text, kind)
+  local cache = ensure_cache(nb)
+  local r = cache[cell_id]
+  if r == nil or r == vim.NIL then
+    r = { statements = {} }
+    cache[cell_id] = r
+  end
+  r.analysis = { text = text, kind = kind, at = util.epoch() }
+  schedule_cache_write(nb)
+end
+
+---Store a result without touching the disk (live cells); `set_result` persists.
+---@param nb dbgrid.Notebook
+---@param cell dbgrid.Cell
+---@param result table
+function M.set_result_memory(nb, cell, result)
+  local cache = ensure_cache(nb)
+  local prev = cache[cell.id]
+  local analysis = prev ~= vim.NIL and prev and prev.analysis or nil
+  cache[cell.id] = slim(result)
+  cache[cell.id].analysis = analysis
 end
 
 ---@param nb dbgrid.Notebook

@@ -9,6 +9,9 @@ local M = {
   name = "postgres",
   schemes = { postgres = true, postgresql = true },
   executable = "psql",
+  dialect = "PostgreSQL",
+  -- what `explain_text(..., analyze = true)` does
+  analyze = true,
 }
 
 M.FS = "\31" -- field separator
@@ -57,10 +60,11 @@ M.NULL = "\1NULL\1"
 
 ---Environment for the psql process.
 ---@param conn dbgrid.Connection
+---@param appname? string   application_name, unique per run so the session can be found server side
 ---@return table<string,string>
-local function build_env(conn)
+local function build_env(conn, appname)
   local env = {
-    PGAPPNAME = "dbgrid.nvim",
+    PGAPPNAME = appname or "dbgrid.nvim",
     PGCONNECT_TIMEOUT = "10",
   }
   local options = {}
@@ -70,10 +74,15 @@ local function build_env(conn)
   if conn.statement_timeout_ms then
     options[#options + 1] = "-c statement_timeout=" .. tostring(conn.statement_timeout_ms)
   end
+  if conn.lock_timeout_ms then
+    options[#options + 1] = "-c lock_timeout=" .. tostring(conn.lock_timeout_ms)
+  end
   if #options > 0 then
     env.PGOPTIONS = table.concat(options, " ")
   end
-  if conn.password_cmd and conn.password_cmd ~= "" then
+  -- connections.resolve() runs password_cmd asynchronously and puts the result in
+  -- conn.env; the synchronous call below only serves callers that skipped it.
+  if not conn._resolved and conn.password_cmd and conn.password_cmd ~= "" then
     local out = vim.fn.system(conn.password_cmd)
     if vim.v.shell_error == 0 then
       env.PGPASSWORD = util.trim(out)
@@ -127,7 +136,7 @@ end
 ---line range it occupies (for mapping `psql:<stdin>:N` back to a statement).
 ---@param statements dbgrid.RunStatement[]
 ---@param nonce string
----@param opts { transaction?: boolean, timing?: boolean, wrap?: fun(sql: string, i: integer): string }
+---@param opts { transaction?: boolean, rollback?: boolean, read_write?: boolean, timing?: boolean, wrap?: fun(sql: string, i: integer): string, prelude?: string[] }
 ---@return string script, {first: integer, last: integer}[] ranges
 local function build_script(statements, nonce, opts)
   local lines = {}
@@ -135,8 +144,15 @@ local function build_script(statements, nonce, opts)
   if opts.timing ~= false then
     lines[#lines + 1] = "\\timing on"
   end
+  for _, l in ipairs(opts.prelude or {}) do
+    lines[#lines + 1] = l
+  end
   if opts.transaction then
     lines[#lines + 1] = "BEGIN;"
+    if opts.read_write then
+      -- a dry run on a read-only connection: the transaction is rolled back anyway
+      lines[#lines + 1] = "SET TRANSACTION READ WRITE;"
+    end
   end
   for i, st in ipairs(statements) do
     lines[#lines + 1] = "\\echo " .. marker(nonce, i)
@@ -149,7 +165,7 @@ local function build_script(statements, nonce, opts)
     ranges[i] = { first = first, last = #lines }
   end
   if opts.transaction then
-    lines[#lines + 1] = "COMMIT;"
+    lines[#lines + 1] = opts.rollback and "ROLLBACK;" or "COMMIT;"
   end
   lines[#lines + 1] = "\\echo " .. marker(nonce, #statements + 1)
   return table.concat(lines, "\n") .. "\n", ranges
@@ -361,41 +377,374 @@ local function parse_stderr(stderr, ranges, statements)
   return notices, err
 end
 
----Spawn psql with a script on stdin.
+-- ---------------------------------------------------------------------------
+-- Persistent sessions (query.session = true): one psql per connection kept
+-- alive across runs, so temp tables and SET carry over and a tunnel handshake
+-- is paid once. psql flushes its output after every command, so each script
+-- is fenced with an END marker and collected as it streams in.
+-- ---------------------------------------------------------------------------
+local sessions = {} ---@type table<string, table>
+
+---@param conn dbgrid.Connection
+local function session_key(conn)
+  return conn.name .. "|" .. (conn.url or "")
+end
+
+---End a session and fail whatever it still owed.
+---@param sess table
+---@param reason string
+local function session_close(sess, reason)
+  if sessions[sess.key] == sess then
+    sessions[sess.key] = nil
+  end
+  if sess.job and not sess.dead then
+    pcall(sess.job.kill, sess.job, 15)
+  end
+  sess.dead = true
+  local pending = sess.pending
+  sess.pending = nil
+  if pending then
+    if pending.timer then
+      pending.timer:stop()
+      pending.timer:close()
+    end
+    vim.schedule(function()
+      pending.cb({ code = 1, signal = 0, stdout = pending.stdout, stderr = pending.stderr .. "\npsql: " .. reason })
+    end)
+  end
+  for _, q in ipairs(sess.queue or {}) do
+    vim.schedule(function()
+      q.cb({ code = 1, signal = 0, stdout = "", stderr = "psql: " .. reason })
+    end)
+  end
+  sess.queue = {}
+end
+
+---Hand the next queued script to the session.
+---@param sess table
+local function session_next(sess)
+  if sess.pending or sess.dead then
+    return
+  end
+  local item = table.remove(sess.queue, 1)
+  if not item then
+    return
+  end
+  local nonce = util.short_id(6)
+  local end_marker = "__DBGRID_" .. nonce .. "__ END"
+  local script = item.script .. "\\echo " .. end_marker .. "\n"
+  local n_lines = select(2, script:gsub("\n", "")) -- lines psql will count for this script
+  item.stdout, item.stderr = {}, {}
+  item.end_marker = end_marker
+  item.line_offset = sess.lines_sent
+  sess.lines_sent = sess.lines_sent + n_lines
+  sess.pending = item
+  if item.timeout_ms then
+    local uv = vim.uv or vim.loop
+    item.timer = uv.new_timer()
+    item.timer:start(item.timeout_ms, 0, function()
+      vim.schedule(function()
+        if sess.pending == item then
+          session_close(sess, "statement timed out; the session was restarted")
+        end
+      end)
+    end)
+  end
+  sess.job:write(script)
+end
+
+---Complete the pending script once its END marker arrived.
+---@param sess table
+local function session_finish(sess)
+  local item = sess.pending
+  if not item then
+    return
+  end
+  sess.pending = nil
+  if item.timer then
+    item.timer:stop()
+    item.timer:close()
+  end
+  -- stderr may trail stdout by a moment: give it a tick
+  vim.defer_fn(function()
+    local stdout = table.concat(item.stdout)
+    local stderr = table.concat(item.stderr)
+    -- psql numbers <stdin> lines across the whole session; make them relative
+    stderr = stderr:gsub("psql:<stdin>:(%d+):", function(n)
+      return "psql:<stdin>:" .. (tonumber(n) - item.line_offset) .. ":"
+    end)
+    -- an error while the session's ON_ERROR_STOP is off does not exit psql;
+    -- report a failing exit code when an ERROR was printed so callers behave
+    -- exactly as with a one-shot process
+    local code = stderr:find("ERROR:", 1, true) and 3 or 0
+    item.cb({ code = code, signal = 0, stdout = stdout, stderr = stderr })
+    session_next(sess)
+  end, 20)
+end
+
+---@param sess table
+---@param data string
+local function session_on_stdout(sess, data)
+  local item = sess.pending
+  if not item then
+    return
+  end
+  item.stdout[#item.stdout + 1] = data
+  if data:find(item.end_marker, 1, true) then
+    -- strip the END marker line
+    local all = table.concat(item.stdout)
+    local at = all:find(item.end_marker, 1, true)
+    item.stdout = { all:sub(1, at - 1) }
+    session_finish(sess)
+  end
+end
+
+---@param conn dbgrid.Connection
+---@return table sess
+local function session_get(conn)
+  local key = session_key(conn)
+  local sess = sessions[key]
+  if sess and not sess.dead then
+    return sess
+  end
+  sess = { key = key, queue = {}, lines_sent = 0, stderr_tail = {} }
+  local args = argv(conn, false)
+  sess.job = vim.system(args, {
+    stdin = true,
+    env = build_env(conn),
+    clear_env = true,
+    text = true,
+    stdout = function(_, data)
+      if data then
+        vim.schedule(function()
+          session_on_stdout(sess, data)
+        end)
+      end
+    end,
+    stderr = function(_, data)
+      if data then
+        vim.schedule(function()
+          if sess.pending then
+            sess.pending.stderr[#sess.pending.stderr + 1] = data
+          else
+            sess.stderr_tail[#sess.stderr_tail + 1] = data
+            if #sess.stderr_tail > 20 then
+              table.remove(sess.stderr_tail, 1)
+            end
+          end
+        end)
+      end
+    end,
+  }, function(out)
+    vim.schedule(function()
+      sess.dead = true
+      local tail = table.concat(sess.stderr_tail)
+      if sess.pending then
+        sess.pending.stderr[#sess.pending.stderr + 1] = tail
+        local item = sess.pending
+        sess.pending = nil
+        if item.timer then
+          item.timer:stop()
+          item.timer:close()
+        end
+        item.cb({
+          code = out.code ~= 0 and out.code or 1,
+          signal = out.signal,
+          stdout = table.concat(item.stdout),
+          stderr = table.concat(item.stderr),
+        })
+      end
+      local why = "session exited with code " .. tostring(out.code)
+      if tail ~= "" then
+        why = why .. ": " .. util.trim(tail)
+      end
+      session_close(sess, why)
+    end)
+  end)
+  sess.pid = sess.job.pid
+  sessions[key] = sess
+  return sess
+end
+
+---Run a script through the persistent session of a connection.
 ---@param conn dbgrid.Connection
 ---@param script string
----@param opts { stop_on_error?: boolean, timeout_ms?: integer }
+---@param opts { timeout_ms?: integer }
+---@param cb fun(out: vim.SystemCompleted)
+---@return dbgrid.Job
+local function session_spawn(conn, script, opts, cb)
+  local ok, sess = pcall(session_get, conn)
+  if not ok then
+    vim.schedule(function()
+      cb({ code = 127, signal = 0, stdout = "", stderr = "psql could not be started: " .. tostring(sess) })
+    end)
+    return { kill = function() end }
+  end
+  local item = { script = script, timeout_ms = opts.timeout_ms, cb = cb }
+  sess.queue[#sess.queue + 1] = item
+  session_next(sess)
+  return {
+    pid = sess.pid,
+    conn = conn,
+    is_done = function()
+      return sess.pending ~= item and not vim.tbl_contains(sess.queue, item)
+    end,
+    kill = function(_, signal)
+      -- SIGINT makes psql cancel the query; it then stops reading its input and
+      -- exits, which ends the session (a new one starts on the next run)
+      if sess.job and not sess.dead then
+        pcall(sess.job.kill, sess.job, signal or 2)
+      end
+    end,
+  }
+end
+
+---Close the persistent session of a connection (or all of them).
+---@param conn? dbgrid.Connection
+function M.close_session(conn)
+  if conn then
+    local sess = sessions[session_key(conn)]
+    if sess then
+      session_close(sess, "closed")
+    end
+    return
+  end
+  for _, key in ipairs(vim.tbl_keys(sessions)) do
+    local live = sessions[key]
+    if live then
+      session_close(live, "closed")
+    end
+  end
+end
+
+---@return { key: string, pid: integer?, busy: boolean }[]
+function M.sessions()
+  local out = {}
+  for key, sess in pairs(sessions) do
+    out[#out + 1] = { key = key, pid = sess.pid, busy = sess.pending ~= nil }
+  end
+  return out
+end
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = vim.api.nvim_create_augroup("dbgrid_postgres_sessions", { clear = true }),
+  callback = function()
+    for _, sess in pairs(sessions) do
+      if sess.job and not sess.dead then
+        pcall(sess.job.kill, sess.job, 15)
+      end
+    end
+  end,
+})
+
+---Spawn psql with a script on stdin (or hand it to the persistent session).
+---@param conn dbgrid.Connection
+---@param script string
+---@param opts { stop_on_error?: boolean, timeout_ms?: integer, appname?: string }
 ---@param cb fun(out: vim.SystemCompleted)
 ---@return dbgrid.Job
 local function spawn(conn, script, opts, cb)
-  local ok, job = pcall(vim.system, argv(conn, opts.stop_on_error ~= false), {
+  local use_session = conn.session
+  if use_session == nil then
+    local cfg = require("dbgrid.config").get()
+    use_session = cfg.query and cfg.query.session
+  end
+  if use_session then
+    return session_spawn(conn, script, opts, cb)
+  end
+  local appname = opts.appname or ("dbgrid.nvim:" .. util.short_id(8))
+  local done = false
+  local ok, proc = pcall(vim.system, argv(conn, opts.stop_on_error ~= false), {
     stdin = script,
-    env = build_env(conn),
+    env = build_env(conn, appname),
     clear_env = true,
     timeout = opts.timeout_ms,
     text = true,
   }, function(out)
+    done = true
     vim.schedule(function()
       cb(out)
     end)
   end)
   if not ok then
     vim.schedule(function()
-      cb({ code = 127, signal = 0, stdout = "", stderr = "psql could not be started: " .. tostring(job) })
+      cb({ code = 127, signal = 0, stdout = "", stderr = "psql could not be started: " .. tostring(proc) })
     end)
-    return { kill = function() end }
+    return {
+      kill = function() end,
+      is_done = function()
+        return true
+      end,
+    }
   end
-  return job
+  return {
+    pid = proc.pid,
+    appname = appname,
+    conn = conn,
+    kill = function(_, signal)
+      return proc:kill(signal)
+    end,
+    is_done = function()
+      return done
+    end,
+    wait = function(_, ms)
+      return proc:wait(ms)
+    end,
+  }
+end
+
+---Ask the server to cancel every backend of this connection whose
+---application_name matches (a run's psql session), through a fresh
+---connection. Works where the client's cancel request never arrives
+---(proxies, some tunnels).
+---@param conn dbgrid.Connection
+---@param appname string
+---@param cb? fun(ok: boolean, message: string)
+function M.server_cancel(conn, appname, cb)
+  if not appname or not appname:match("^[%w%.:_%-]+$") then
+    if cb then
+      cb(false, "invalid application name")
+    end
+    return
+  end
+  local sql = string.format(
+    "select count(pg_cancel_backend(pid)) from pg_stat_activity where application_name = '%s' and pid <> pg_backend_pid()",
+    appname
+  )
+  local statements = { { sql = sql, kind = "select", class = "read", line = 1 } }
+  local script = build_script(statements, "cancel", { timing = false })
+  local fresh = vim.deepcopy(conn)
+  fresh.session = false
+  spawn(fresh, script, { stop_on_error = true, timeout_ms = 10000, appname = "dbgrid.nvim:cancel" }, function(out)
+    if out.code ~= 0 then
+      if cb then
+        cb(false, util.trim(out.stderr or ""))
+      end
+      return
+    end
+    local blocks = split_blocks(out.stdout or "", "cancel", 1)
+    local sets = blocks[1] and parse_block(blocks[1]) or {}
+    local n = sets[1] and sets[1].rows[1] and sets[1].rows[1][1]
+    if cb then
+      cb(true, tostring(n or "0") .. " backend(s) cancelled")
+    end
+  end)
 end
 
 ---@param conn dbgrid.Connection
 ---@param statements dbgrid.RunStatement[]
----@param opts { transaction?: boolean, timeout_ms?: integer }
+---@param opts { transaction?: boolean, rollback?: boolean, read_write?: boolean, timeout_ms?: integer,
+---  prelude?: string[] }
 ---@param cb fun(result: dbgrid.RunResult)
 ---@return dbgrid.Job
 function M.run(conn, statements, opts, cb)
   local nonce = util.short_id(6)
-  local script, ranges = build_script(statements, nonce, { transaction = opts.transaction })
+  local script, ranges = build_script(statements, nonce, {
+    transaction = opts.transaction or opts.rollback,
+    rollback = opts.rollback,
+    read_write = opts.rollback and opts.read_write,
+    prelude = opts.prelude,
+  })
   local started = util.now()
   return spawn(conn, script, { stop_on_error = true, timeout_ms = opts.timeout_ms }, function(out)
     local elapsed = (util.now() - started) * 1000
@@ -422,7 +771,8 @@ function M.run(conn, statements, opts, cb)
     end
     local notices, err = parse_stderr(out.stderr or "", ranges, statements)
     local cancelled = out.signal == 2 or out.signal == 15 or out.code == 124
-    if out.code ~= 0 and not err then
+    -- a process killed by a signal reports code 0 and the signal
+    if (out.code ~= 0 or (out.signal or 0) ~= 0) and not err then
       err = {
         message = cancelled and "cancelled" or ("psql exited with code " .. tostring(out.code)),
         raw = out.stderr or "",
@@ -438,6 +788,29 @@ function M.run(conn, statements, opts, cb)
       cancelled = cancelled,
     })
   end)
+end
+
+---Did the run fail before reaching the server? True for libpq's connection
+---errors when no statement produced output, so the run can be repeated safely.
+---@param res table   result handed to M.run's callback
+---@return boolean
+function M.connection_failed(res)
+  local msg = res.error and res.error.message or ""
+  if
+    not (
+      msg:find("^connection to server")
+      or msg:find("^could not connect to server")
+      or msg:find("^server closed the connection unexpectedly")
+    )
+  then
+    return false
+  end
+  for _, st in ipairs(res.statements or {}) do
+    if st.ran then
+      return false
+    end
+  end
+  return true
 end
 
 ---EXPLAIN (FORMAT JSON) for every statement; failures yield nil plans.
@@ -477,15 +850,17 @@ function M.explain(conn, statements, cb)
   end)
 end
 
----Text EXPLAIN (optionally ANALYZE inside a rolled-back transaction).
+---EXPLAIN (optionally ANALYZE inside a rolled-back transaction) rendered as
+---text. The third callback value carries the JSON plan, per-line highlight
+---marks and, for ANALYZE, the findings (bad row estimates, disk sorts, ...).
 ---@param conn dbgrid.Connection
 ---@param sql string
 ---@param analyze boolean
----@param cb fun(lines: string[], err?: string)
+---@param cb fun(lines: string[], err?: string, info?: { plan: table, marks: table<integer,string>, findings: dbgrid.PlanFinding[] })
 ---@return dbgrid.Job
 function M.explain_text(conn, sql, analyze, cb)
   local nonce = util.short_id(6)
-  local options = analyze and "ANALYZE, BUFFERS, FORMAT TEXT" or "FORMAT TEXT"
+  local options = analyze and "ANALYZE, BUFFERS, FORMAT JSON" or "FORMAT JSON"
   local statements = { { sql = "EXPLAIN (" .. options .. ") " .. sql, kind = "explain", class = "read", line = 1 } }
   local script = build_script(statements, nonce, { timing = false, transaction = analyze })
   if analyze then
@@ -493,12 +868,15 @@ function M.explain_text(conn, sql, analyze, cb)
   end
   return spawn(conn, script, { stop_on_error = true, timeout_ms = nil }, function(out)
     local blocks = split_blocks(out.stdout or "", nonce, 1)
-    local lines = {}
+    local plan
     if blocks[1] then
       local sets = parse_block(blocks[1])
-      for _, set in ipairs(sets) do
-        for _, row in ipairs(set.rows) do
-          lines[#lines + 1] = row[1] ~= vim.NIL and row[1] or ""
+      local set = sets[1]
+      local text = set and set.rows[1] and set.rows[1][1]
+      if type(text) == "string" then
+        local ok, decoded = pcall(vim.json.decode, text)
+        if ok then
+          plan = decoded
         end
       end
     end
@@ -507,7 +885,67 @@ function M.explain_text(conn, sql, analyze, cb)
       local _, e = parse_stderr(out.stderr or "", { { first = 1, last = 1e9 } }, statements)
       err = e and e.message or util.trim(out.stderr or "")
     end
-    cb(lines, err)
+    if not plan then
+      cb({}, err or "no plan returned")
+      return
+    end
+    local explain = require("dbgrid.explain")
+    local lines, marks = explain.to_lines(plan)
+    local findings = analyze and explain.analyze_findings(plan, { schema = require("dbgrid.schema").loaded(conn) })
+      or {}
+    cb(lines, err, { plan = plan, marks = marks, findings = findings })
+  end)
+end
+
+---EXPLAIN (FORMAT JSON) of one statement with options; ANALYZE runs inside a
+---transaction that is rolled back.
+---@param conn dbgrid.Connection
+---@param sql string
+---@param opts { analyze?: boolean, buffers?: boolean, verbose?: boolean, settings?: boolean, timeout_ms?: integer }
+---@param cb fun(plan?: table, err?: string)
+---@return dbgrid.Job
+function M.explain_json(conn, sql, opts, cb)
+  opts = opts or {}
+  local nonce = util.short_id(6)
+  local options = { "FORMAT JSON" }
+  if opts.analyze then
+    table.insert(options, 1, "ANALYZE")
+    if opts.buffers ~= false then
+      table.insert(options, 2, "BUFFERS")
+    end
+  end
+  if opts.verbose then
+    options[#options + 1] = "VERBOSE"
+  end
+  if opts.settings then
+    options[#options + 1] = "SETTINGS"
+  end
+  local statements = {
+    { sql = "EXPLAIN (" .. table.concat(options, ", ") .. ") " .. sql, kind = "explain", class = "read", line = 1 },
+  }
+  local script =
+    build_script(statements, nonce, { timing = false, transaction = opts.analyze, rollback = opts.analyze })
+  return spawn(conn, script, { stop_on_error = true, timeout_ms = opts.timeout_ms }, function(out)
+    local blocks = split_blocks(out.stdout or "", nonce, 1)
+    local plan
+    if blocks[1] then
+      local sets = parse_block(blocks[1])
+      local set = sets[1]
+      local text = {}
+      for _, row in ipairs(set and set.rows or {}) do
+        text[#text + 1] = row[1] ~= vim.NIL and row[1] or ""
+      end
+      local ok, decoded = pcall(vim.json.decode, table.concat(text, "\n"))
+      if ok then
+        plan = decoded
+      end
+    end
+    if out.code ~= 0 or not plan then
+      local _, e = parse_stderr(out.stderr or "", { { first = 1, last = 1e9 } }, statements)
+      cb(nil, e and e.message or util.trim(out.stderr or ("psql exited with " .. tostring(out.code))))
+      return
+    end
+    cb(plan)
   end)
 end
 
@@ -588,16 +1026,42 @@ function M.test(conn, cb)
   end)
 end
 
----Cancel a running job: SIGINT makes psql send a cancel request to the server.
+---Cancel a running job. SIGINT makes psql send a cancel request; when the
+---query is still running after `query.cancel_grace_ms`, the server is asked
+---directly (pg_cancel_backend by application_name) and, as a last resort,
+---the client is killed.
 ---@param job dbgrid.Job
-function M.cancel(job)
+---@param conn? dbgrid.Connection
+function M.cancel(job, conn)
   if not job or not job.kill then
     return
   end
   pcall(job.kill, job, 2)
+  local cfg = require("dbgrid.config").get().query
+  local grace = cfg.cancel_grace_ms or 1500
+  conn = conn or job.conn
+  local function still_running()
+    return not (job.is_done and job.is_done())
+  end
   vim.defer_fn(function()
-    pcall(job.kill, job, 15)
-  end, 2000)
+    if not still_running() then
+      return
+    end
+    if cfg.server_cancel ~= false and conn and job.appname then
+      M.server_cancel(conn, job.appname, function(ok, msg)
+        if ok then
+          util.notify("asked the server to cancel: " .. msg)
+        else
+          util.warn("server-side cancel failed: " .. msg)
+        end
+      end)
+    end
+    vim.defer_fn(function()
+      if still_running() then
+        pcall(job.kill, job, 15)
+      end
+    end, grace + 3000)
+  end, grace)
 end
 
 M.keywords = {

@@ -159,3 +159,54 @@ H.describe("sql.write_targets", function()
     H.eq(targets("with a as (select 1) select * from a"), nil)
   end)
 end)
+
+H.describe("sql.placeholders", function()
+  H.it("finds :name and {{name}} outside strings, comments and casts", function()
+    local text =
+      "select x::int from t where id=:id and a = ':nope' -- :c\n and b = {{ since }} and c = {{overdue-invoices}} and $1 = 1"
+    local names = vim.tbl_map(function(r)
+      return r.style .. r.name
+    end, sql.placeholders(text))
+    H.eq(names, { ":id", "{{since", "{{overdue-invoices" })
+    local out = sql.substitute(text, sql.placeholders(text), function(r)
+      return "<" .. r.name .. ">"
+    end)
+    H.matches(out, "id=<id>")
+    H.matches(out, "b = <since>")
+    H.matches(out, "c = <overdue%-invoices>")
+    H.matches(out, "':nope'")
+    H.matches(out, "x::int")
+  end)
+  H.it("normalises and inlines text", function()
+    H.eq(sql.normalize("SELECT  a ,\n b FROM t -- x"), sql.normalize("select a, b\nfrom t"))
+    H.truthy(sql.normalize("select 'A'") ~= sql.normalize("select 'a'"))
+    H.eq(
+      sql.inline("select a.b, -- c\n  1e-5, x::int\nfrom t /* z */ where a = 1"),
+      "select a.b, 1e-5, x::int from t where a = 1"
+    )
+    H.eq(#sql.tokenize("select 1 -- c\n/* b */", { comments = true }), 4)
+    H.eq(sql.tokenize("select 1e-5, 2.5E+3, 3-1")[2].value, "1e-5")
+    H.eq(#sql.tokenize("select 3-1"), 4)
+  end)
+  H.it("lists the columns a WHERE clause uses", function()
+    H.eq(
+      sql.where_columns(
+        "select * from t where balance > 5 and email like 'x' order by id",
+        { "id", "email", "balance" }
+      ),
+      { "balance", "email" }
+    )
+  end)
+end)
+
+H.describe("bundled templates", function()
+  H.it("blue-green only reads", function()
+    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+    local text = require("dbgrid.util").read_file(root .. "/lua/dbgrid/templates/blue-green.sql")
+    local stmts = sql.split(text)
+    H.truthy(#stmts > 10)
+    for _, st in ipairs(stmts) do
+      H.eq(st.class, "read", st.kind)
+    end
+  end)
+end)

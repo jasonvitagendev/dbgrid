@@ -91,6 +91,239 @@ H.describe("connections", function()
   end)
 end)
 
+H.describe("saved connection edit / remove", function()
+  local connections = require("dbgrid.connections")
+  local util = require("dbgrid.util")
+  local saved_file = tmp .. "/data/connections.json"
+
+  ---Run fn with vim.ui.input / vim.ui.select answered by the given functions.
+  ---@param inputs fun(prompt: string, default?: string): string?
+  ---@param selects fun(items: any[], prompt: string): integer?
+  local function with_ui(inputs, selects, fn)
+    local orig_input, orig_select = vim.ui.input, vim.ui.select
+    vim.ui.input = function(opts, on_confirm)
+      vim.schedule(function()
+        on_confirm(inputs(opts.prompt, opts.default))
+      end)
+    end
+    vim.ui.select = function(items, opts, on_choice)
+      local idx = selects(items, opts.prompt)
+      vim.schedule(function()
+        on_choice(idx and items[idx] or nil, idx)
+      end)
+    end
+    local ok, err = pcall(fn)
+    vim.ui.input, vim.ui.select = orig_input, orig_select
+    if not ok then
+      error(err, 0)
+    end
+  end
+
+  local function sync(fn)
+    local out
+    fn(function(...)
+      out = { ... }
+    end)
+    H.truthy(
+      H.wait(5000, function()
+        return out ~= nil
+      end),
+      "callback never called"
+    )
+    return unpack(out, 1, 2)
+  end
+
+  local function saved_names()
+    return vim.tbl_map(function(c)
+      return c.name
+    end, util.read_json(saved_file).connections)
+  end
+
+  H.it("finds the saved entry behind a picker connection", function()
+    connections.save({ name = "edit-me", url = "postgres://u@h/d" }, "global")
+    connections.save({ name = "here-only", url = "sqlite:local.db" }, "project")
+    local e, scope = connections.saved_entry("edit-me")
+    H.eq(e.url, "postgres://u@h/d")
+    H.eq(scope, "global")
+    local e2, scope2 = connections.saved_entry("here-only")
+    H.eq(scope2, "project")
+    H.eq(e2.project, require("dbgrid.project").root())
+    H.eq(connections.saved_entry("nope"), nil)
+    H.eq(connections.get("edit-me").source, "saved")
+    H.eq(connections.get("here-only").source, "project")
+    H.matches(connections.origin({ name = "x", source = "setup" }), "^x comes from setup%(%)")
+    local from_env_file = connections.origin({ name = "DATABASE_URL (.env)", source = ".env" })
+    H.matches(from_env_file, "comes from %.env: change it there")
+    H.matches(connections.origin({ name = "DATABASE_URL", source = "env" }), "environment variable DATABASE_URL")
+    H.matches(connections.origin({ name = "rails:test", source = "config/database.yml" }), "database%.yml")
+    H.matches(connections.origin({ name = "prod/reader", parent = "prod", source = "setup" }), "^prod comes from")
+  end)
+
+  H.it("edits name, url, read-only and scope with prefilled prompts", function()
+    local defaults, choices = {}, nil
+    with_ui(function(prompt, default)
+      defaults[#defaults + 1] = default
+      return prompt:find("name") and "edited" or "postgres://u@h2/d2"
+    end, function(items, prompt)
+      H.eq(prompt, "Save connection")
+      choices = items
+      return 4 -- read-only, everywhere
+    end, function()
+      local conn = sync(function(cb)
+        connections.edit_interactive(connections.get("edit-me"), cb)
+      end)
+      H.truthy(conn, "the edited connection is returned")
+      H.eq(conn.name, "edited")
+      H.eq(conn.url, "postgres://u@h2/d2")
+      H.eq(conn.readonly, true)
+      H.eq(conn.source, "saved")
+    end)
+    H.eq(defaults, { "edit-me", "postgres://u@h/d" })
+    H.eq(choices[2], "everywhere  (current)")
+    H.eq(connections.get("edit-me"), nil, "the old name is gone")
+    H.eq(saved_names(), { "here-only", "edited" })
+  end)
+
+  H.it("refuses a rename onto an existing connection and a bad url", function()
+    with_ui(function()
+      return "here-only"
+    end, function()
+      return 2
+    end, function()
+      H.eq(
+        sync(function(cb)
+          connections.edit_interactive(connections.get("edited"), cb)
+        end),
+        nil
+      )
+    end)
+    with_ui(function(prompt)
+      return prompt:find("name") and "edited" or "nonsense"
+    end, function()
+      return 2
+    end, function()
+      H.eq(
+        sync(function(cb)
+          connections.edit_interactive(connections.get("edited"), cb)
+        end),
+        nil
+      )
+    end)
+    H.eq(connections.get("edited").url, "postgres://u@h2/d2", "nothing changed")
+    H.eq(saved_names(), { "here-only", "edited" })
+  end)
+
+  H.it("moves a connection between scopes and follows renames in open notebooks", function()
+    local nb = notebook.create("Uses edited")
+    notebook.set_connection(nb, "edited")
+    local buf = vim.api.nvim_create_buf(false, true)
+    local s = require("dbgrid.state").attach(buf, nb)
+    with_ui(function(prompt, default)
+      return prompt:find("name") and "renamed" or default
+    end, function()
+      return 1 -- this project only, writable
+    end, function()
+      local conn = sync(function(cb)
+        connections.edit_interactive(connections.get("edited"), cb)
+      end)
+      H.eq(conn.name, "renamed")
+      H.eq(conn.readonly, nil)
+      H.eq(conn.source, "project")
+    end)
+    H.eq(s.nb.meta.connection, "renamed")
+    H.eq(notebook.load(nb.name).meta.connection, "renamed", "the rename is written to the notebook")
+    local entry, scope = connections.saved_entry("renamed")
+    H.eq(scope, "project")
+    H.eq(entry.url, "postgres://u@h2/d2")
+    require("dbgrid.state").detach(buf)
+  end)
+
+  H.it("cannot edit connections that come from elsewhere", function()
+    require("dbgrid.config").setup({
+      storage = { data_dir = tmp .. "/data", mode = "data" },
+      connections = { { name = "fixed", url = "postgres://x@y/z" } },
+    })
+    local called = false
+    with_ui(function()
+      called = true
+      return "x"
+    end, function()
+      called = true
+      return 1
+    end, function()
+      H.eq(
+        sync(function(cb)
+          connections.edit_interactive(connections.get("fixed"), cb)
+        end),
+        nil
+      )
+      H.eq(
+        sync(function(cb)
+          connections.remove_interactive(connections.get("fixed"), cb)
+        end),
+        false
+      )
+    end)
+    H.falsy(called, "no prompt for a setup() connection")
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data" } })
+  end)
+
+  H.it("removes after confirmation and leaves other projects alone", function()
+    local data = util.read_json(saved_file)
+    data.connections[#data.connections + 1] =
+      { name = "here-only", url = "sqlite:elsewhere.db", project = "/elsewhere" }
+    util.write_json(saved_file, data)
+    local orig_confirm = vim.fn.confirm
+    vim.fn.confirm = function()
+      return 2
+    end
+    local removed = sync(function(cb)
+      connections.remove_interactive(connections.get("here-only"), cb)
+    end)
+    H.eq(removed, false, "cancelled")
+    H.truthy(connections.get("here-only"))
+    vim.fn.confirm = function()
+      return 1
+    end
+    removed = sync(function(cb)
+      connections.remove_interactive(connections.get("here-only"), cb)
+    end)
+    vim.fn.confirm = orig_confirm
+    H.eq(removed, true)
+    H.eq(connections.get("here-only"), nil)
+    H.eq(saved_names(), { "renamed", "here-only" }, "the entry of the other project survives")
+    H.eq(util.read_json(saved_file).connections[2].project, "/elsewhere")
+    H.truthy(connections.remove("renamed"))
+    H.falsy(connections.remove("renamed"))
+    H.eq(saved_names(), { "here-only" })
+  end)
+
+  H.it("opens the json file and forgets resolved connections when it is written", function()
+    connections.save({ name = "plain", url = "postgres://u@h/d" }, "global")
+    local first
+    connections.resolve(connections.get("plain"), function(c)
+      first = c
+    end)
+    H.truthy(first and first._resolved)
+    local again
+    connections.resolve(connections.get("plain"), function(c)
+      again = c
+    end)
+    H.eq(again, first, "cached")
+    connections.open_file()
+    -- resolve both: on macOS the temp dir sits behind the /var -> /private/var symlink
+    H.eq(vim.fn.resolve(vim.api.nvim_buf_get_name(0)), vim.fn.resolve(saved_file))
+    vim.cmd("silent write")
+    local fresh
+    connections.resolve(connections.get("plain"), function(c)
+      fresh = c
+    end)
+    H.truthy(fresh._resolved)
+    H.falsy(fresh == first, "the resolved form was dropped by the write")
+    H.eq(saved_names(), { "here-only", "plain" }, "writing the buffer keeps the file intact")
+  end)
+end)
+
 H.describe("ai", function()
   local ai = require("dbgrid.ai")
   H.it("cleans agent output", function()
@@ -154,6 +387,119 @@ H.describe("ai", function()
     H.matches(text, "Existing SQL")
     H.falsy(text:find("unrelated", 1, true), "unrelated table should be left out")
   end)
+  H.it("builds a review prompt from the query and its result", function()
+    local result = {
+      ok = true,
+      ran_at = 0,
+      elapsed_ms = 12,
+      server_ms = 3,
+      connection = "test",
+      truncated = true,
+      statements = {
+        {
+          sql = "select id, note from users",
+          kind = "select",
+          class = "read",
+          limit_applied = 2,
+          sets = {
+            {
+              columns = { "id", "note" },
+              rows = { { "1", vim.NIL }, { "2", "line one\nline two" }, { "3", "x" } },
+              row_count = 3,
+            },
+          },
+          tags = {},
+        },
+        { sql = "update users set note = null", kind = "update", class = "write", sets = {}, tags = { "UPDATE 1" } },
+      },
+      notices = { "NOTICE: hi" },
+      warnings = { { message = "Seq Scan on users (~5,000 rows)" } },
+    }
+    local text = ai.build_review_prompt({
+      question = "why so slow?",
+      sql = "select id, note from users;\nupdate users set note = null;",
+      sql_edited = true,
+      cell_label = "q1 slow",
+      result = result,
+      max_rows = 2,
+      rows_note = "sorted by id descending",
+      plan = { "Seq Scan on users" },
+      plan_kind = "EXPLAIN",
+      history = { { question = "earlier?", answer = "earlier answer" } },
+    })
+    H.matches(text, "## Question\nwhy so slow%?")
+    H.matches(text, "## Query %(cell q1 slow%)\nThe cell was edited after this run")
+    H.matches(text, "select id, note from users;\nupdate users set note = null;")
+    H.matches(text, "took 12 ms %(server 3 ms%)")
+    H.matches(text, "as displayed in the grid: sorted by id descending")
+    H.matches(text, "### Statement 1 of 2 %(SELECT%)\nThe notebook added LIMIT 2 to this statement, and it was hit")
+    H.matches(text, "3 rows, first 2 shown:\nid | note\n1 | NULL\n2 | line one line two\n")
+    H.falsy(text:find("3 | x", 1, true), "rows beyond max_rows should be left out")
+    H.matches(text, "### Statement 2 of 2 %(UPDATE%)\nUPDATE 1")
+    H.matches(text, "Notices from the server:\nNOTICE: hi")
+    H.matches(text, "Index check before the run warned:\n%- Seq Scan on users")
+    H.matches(text, "## Plan %(EXPLAIN%)\nSeq Scan on users")
+    H.matches(text, "## Earlier questions about this same result\nQ: earlier%?\nA: earlier answer")
+  end)
+  H.it("puts errors and the displayed rows into the review prompt", function()
+    local text = ai.build_review_prompt({
+      question = "q",
+      sql = "select nope",
+      result = {
+        ok = false,
+        statements = { { sql = "select nope", kind = "select", sets = {}, tags = {} } },
+        error = { message = 'column "nope" does not exist', line = 1, col = 8, hint = "Perhaps you meant note" },
+      },
+    })
+    H.matches(
+      text,
+      'The query failed with an error:\nERROR: column "nope" does not exist\n'
+        .. "at line 1, column 8 of the cell\nHINT: Perhaps you meant note"
+    )
+    H.falsy(text:find("Statement 1 of", 1, true), "a single statement needs no heading")
+    local text2 = ai.build_review_prompt({
+      question = "q",
+      sql = "select 1",
+      result = {
+        statements = {
+          { sql = "select 1", kind = "select", sets = { { columns = { "a" }, rows = { { "1" }, { "2" } } } } },
+        },
+      },
+      rows_of = function(entry)
+        return { entry.set.rows[2] }
+      end,
+    })
+    H.matches(text2, "2 rows, first 1 shown:\na\n2\n")
+    local text3 =
+      ai.build_review_prompt({ question = "q", sql = "select 1", plan = { "Result" }, plan_kind = "EXPLAIN" })
+    H.matches(text3, "The cell has not been run; only its plan is available")
+    H.matches(text3, "## Plan %(EXPLAIN%)\nResult")
+  end)
+  H.it("runs an agent and hands back its raw answer", function()
+    require("dbgrid.config").get().ai.agents.echo = { cmd = { "cat" }, stdin = true }
+    local answer, err
+    local job = ai.run_agent("hello\nworld", function(text, e)
+      answer, err = text, e
+    end, { agent = "echo" })
+    H.truthy(job)
+    H.truthy(H.wait(5000, function()
+      return answer ~= nil or err ~= nil
+    end))
+    H.eq(err, nil)
+    H.eq(answer, "hello\nworld")
+    local sql
+    ai.ask("select 1;", function(text)
+      sql = text
+    end, "echo")
+    H.truthy(H.wait(5000, function()
+      return sql ~= nil
+    end))
+    H.eq(sql, "select 1;")
+    ai.run_agent("x", function(_, e)
+      err = e
+    end, { agent = "nope" })
+    H.matches(err, "unknown agent")
+  end)
   H.it("writes sql under the prompt lines", function()
     local cells = require("dbgrid.cells")
     local b = vim.api.nvim_create_buf(false, true)
@@ -188,5 +534,37 @@ H.describe("completion", function()
     H.eq(ctx2.word, "users")
     local items = completion.items(b, 2, 22)
     H.truthy(#items > 0) -- keywords still come without a schema
+  end)
+end)
+
+H.describe("notebook delete", function()
+  H.it("deletes several notebooks after one confirmation", function()
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data" } })
+    local before = #notebook.list()
+    local a = notebook.create("Bulk A")
+    local b = notebook.create("Bulk B")
+    local c = notebook.create("Bulk C")
+    local prompts = {}
+    local orig_confirm = vim.fn.confirm
+    vim.fn.confirm = function(msg)
+      prompts[#prompts + 1] = msg
+      return 2
+    end
+    require("dbgrid").delete({ a, b })
+    H.eq(#notebook.list(), before + 3, "cancelled: nothing deleted")
+    vim.fn.confirm = function(msg)
+      prompts[#prompts + 1] = msg
+      return 1
+    end
+    require("dbgrid").delete({ a, b })
+    require("dbgrid").delete(c)
+    vim.fn.confirm = orig_confirm
+    H.eq(#prompts, 3, "one prompt per call")
+    H.matches(prompts[1], "^Delete 2 notebooks")
+    H.matches(prompts[1], "\n  Bulk A\n  Bulk B$")
+    H.matches(prompts[3], "^Delete notebook 'Bulk C'")
+    H.eq(#notebook.list(), before)
+    H.eq(notebook.load("bulk-a"), nil)
+    H.eq(notebook.load("bulk-c"), nil)
   end)
 end)
