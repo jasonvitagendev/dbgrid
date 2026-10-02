@@ -147,6 +147,25 @@ H.describe("postgres integration", function()
     H.eq(users.columns[2].name, "email")
     H.truthy(#users.indexes >= 2)
     H.eq(users.indexes[1].columns, { "id" })
+
+    -- foreign keys carry their ON DELETE rule in the constraint definition
+    local relations = require("dbgrid.relations")
+    local data = { tables = schema.tables, by_name = {} }
+    for _, t in ipairs(data.tables) do
+      data.by_name[(t.schema .. "." .. t.name):lower()] = t
+      data.by_name[t.name:lower()] = t
+    end
+    local incoming = relations.incoming(data, users)
+    local sessions = vim.tbl_filter(function(e)
+      return e.from.name == "sessions"
+    end, incoming)[1]
+    H.truthy(sessions, "sessions should reference users")
+    H.eq(sessions.rule, "cascade")
+    H.eq(sessions.columns, { "user_id" })
+    H.eq(relations.outgoing(data, users)[1].rule, "no action")
+    local dangers = relations.write_warnings(data, require("dbgrid.sql").split("delete from users where id = 1"))
+    H.eq(dangers, { "DELETE on users cascades to sessions" })
+    H.eq(relations.referenced_by_lines(data, users), { "  ← sessions (user_id)  on delete cascade" })
   end)
 
   H.it("produces text plans, including analyze inside a rolled back tx", function()

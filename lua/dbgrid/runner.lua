@@ -120,9 +120,15 @@ local function confirm_writes(conn, stmts)
   if #kinds == 0 then
     return true
   end
+  -- what a DELETE / TRUNCATE reaches through foreign keys (from the schema cache)
+  local cascades, notes = require("dbgrid.relations").write_warnings(schema.loaded(conn), stmts)
+  vim.list_extend(dangers, cascades)
   local msg = string.format("Run %s on %s?", table.concat(util.uniq(kinds), ", "), conn.name)
   if #dangers > 0 then
     msg = msg .. "\n\n" .. table.concat(dangers, "\n")
+  end
+  if #notes > 0 then
+    msg = msg .. "\n\n" .. table.concat(notes, "\n")
   end
   local choice = vim.fn.confirm(msg, #dangers > 0 and "&Cancel\n&Run" or "&Run\n&Cancel", 1, "Warning")
   if #dangers > 0 then

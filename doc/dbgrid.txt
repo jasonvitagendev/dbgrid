@@ -82,6 +82,8 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid ask {prompt}           add a prompt to the cell and generate SQL
 :Dbgrid schema refresh|tables  refresh the schema cache / browse tables
 :Dbgrid describe {table}       describe a table
+:Dbgrid relations [table]      foreign-key tree of a table (under the cursor
+                               when omitted); see |dbgrid-relations|
 :Dbgrid rename {title}         rename the notebook
 :Dbgrid delete                 delete the notebook
 :Dbgrid close                  close the notebook layout
@@ -104,7 +106,8 @@ Query pane ~
   \m          rename cell            \g          generate SQL from prompt
   \t          edit tags              \c          pick connection
   \s  \S      refresh schema / browse tables
-  K           describe identifier    \<Tab>      focus results
+  K           describe identifier    \k          relations of the table
+  \<Tab>      focus results
   \z          zoom pane              \q          close notebook
   ic  ac      text objects (inner cell / whole cell)
 
@@ -128,6 +131,13 @@ LIMIT           read-only statements without a top-level LIMIT/FETCH get
 Writes          INSERT/UPDATE/DELETE/MERGE/DDL/DO/CALL ask for confirmation
                 (`query.confirm_writes`); UPDATE/DELETE without WHERE get a
                 louder prompt. `readonly` connections reject writes.
+Cascades        the prompt for a DELETE lists the tables that lose rows
+                through ON DELETE CASCADE (transitively), the ones that get
+                SET NULL and the ones whose rows would make it fail. A
+                TRUNCATE ... CASCADE lists what else is truncated; without
+                CASCADE, which referencing tables would make it fail. All of
+                it comes from the schema cache, so refresh it (`\s`) after
+                changing constraints.
 Index check     `index_check.mode`: "warn" (default), "confirm" or "off".
                 Statements are EXPLAINed first; a Seq Scan on a table with at
                 least `index_check.min_rows` rows, or an Index Scan with a
@@ -160,7 +170,14 @@ Omnifunc: set on notebook buffers by default (`completion.omnifunc`).
 Items come from the schema cache: columns of the tables in the current
 statement first, alias-qualified columns after `alias.`, then tables,
 schemas, keywords and functions. `K` describes the identifier under the
-cursor.
+cursor: columns, foreign keys with their ON DELETE rule, indexes, and the
+tables that reference it.
+
+                                                            *dbgrid-relations*
+`\k` or `:Dbgrid relations [table]` opens the foreign-key tree of a table:
+what it references, what references it (`schema.relations_depth` hops each
+way, cycles marked), and what a DELETE on it would reach. On `u.email` the
+table is whatever `u` aliases in the current cell.
 
 ==============================================================================
 9. ADAPTERS                                                  *dbgrid-adapters*

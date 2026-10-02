@@ -145,12 +145,19 @@ M.subcommands = {
           return util.warn("no table named " .. args[1])
         end
         vim.lsp.util.open_floating_preview(
-          require("dbgrid.schema").describe_lines(t),
+          require("dbgrid.schema").describe_lines(t, sch),
           "",
           { border = "rounded", title = " " .. args[1] .. " " }
         )
       end)
     end)
+  end,
+  relations = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    require("dbgrid.ui.query").relations(s, args[1])
   end,
   close = function()
     require("dbgrid").close()
@@ -249,6 +256,13 @@ function M.complete(arglead, cmdline)
     candidates = { "analyze" }
   elseif sub == "schema" then
     candidates = { "refresh", "tables" }
+  elseif sub == "describe" or sub == "relations" then
+    local s = require("dbgrid.state").current()
+    local conn = s and s.nb.meta.connection and require("dbgrid.connections").get(s.nb.meta.connection)
+    local sch = conn and require("dbgrid.schema").loaded(conn)
+    for _, t in ipairs(sch and sch.tables or {}) do
+      candidates[#candidates + 1] = require("dbgrid.schema").display_name(t)
+    end
   elseif sub == "tag" then
     candidates = { "add", "remove" }
   elseif sub == "export" then

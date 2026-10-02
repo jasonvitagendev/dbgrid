@@ -110,6 +110,8 @@ M.defaults = {
     ttl_seconds = 3600,
     -- Schemas never listed (pg_catalog & co are always excluded).
     exclude = {},
+    -- How many foreign-key hops `:Dbgrid relations` follows in each direction.
+    relations_depth = 3,
   },
 
   completion = {
@@ -142,6 +144,7 @@ M.defaults = {
       schema_refresh = "<localleader>s",
       tables = "<localleader>S",
       describe = "K",
+      relations = "<localleader>k",
       focus_results = "<localleader><Tab>",
       zoom = "<localleader>z",
       close = "<localleader>q",

@@ -179,7 +179,7 @@ function M.table(schema, cb)
         util.fmt_int(t.rows or 0),
         #(t.columns or {})
       ),
-      preview = schemamod.describe_lines(t),
+      preview = schemamod.describe_lines(t, schema),
       data = t,
     }
   end

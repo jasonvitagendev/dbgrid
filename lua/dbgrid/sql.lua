@@ -480,6 +480,30 @@ local CLAUSE_WORDS = {
   ["end"] = true,
 }
 
+---A possibly schema-qualified name starting at token k (`a.b.c`), or nil
+---when the token is not a name. Returns the name and the index after it.
+---@param tokens dbgrid.Token[]
+---@param k integer
+---@return string? name, integer next
+local function qualified_name(tokens, k)
+  local t = tokens[k]
+  if not t or (t.type ~= "word" and t.type ~= "ident") or (t.type == "word" and CLAUSE_WORDS[t.lower]) then
+    return nil, k
+  end
+  local parts = { t.value }
+  local j = k + 1
+  while tokens[j] and tokens[j].type == "punct" and tokens[j].value == "." do
+    local nxt = tokens[j + 1]
+    if nxt and (nxt.type == "word" or nxt.type == "ident") then
+      parts[#parts + 1] = nxt.value
+      j = j + 2
+    else
+      break
+    end
+  end
+  return table.concat(parts, "."), j
+end
+
 ---Tables referenced by FROM / JOIN / UPDATE / INSERT INTO / DELETE FROM, with aliases.
 ---@param text string
 ---@return {name:string, alias?:string}[]
@@ -506,22 +530,7 @@ function M.referenced_tables(text)
   }
 
   local function name_at(k)
-    local t = tokens[k]
-    if not t or (t.type ~= "word" and t.type ~= "ident") or (t.type == "word" and CLAUSE_WORDS[t.lower]) then
-      return nil, k
-    end
-    local parts = { t.value }
-    local j = k + 1
-    while tokens[j] and tokens[j].type == "punct" and tokens[j].value == "." do
-      local nxt = tokens[j + 1]
-      if nxt and (nxt.type == "word" or nxt.type == "ident") then
-        parts[#parts + 1] = nxt.value
-        j = j + 2
-      else
-        break
-      end
-    end
-    return table.concat(parts, "."), j
+    return qualified_name(tokens, k)
   end
 
   ---Parse one table reference starting at token k. Returns the next token index.
@@ -604,6 +613,74 @@ local KNOWN_OTHER = {
   load = true,
   unlisten = true,
 }
+
+---Tables a DELETE or TRUNCATE removes rows from: `delete from t`, `with ... delete
+---from t`, `truncate [table] [only] a, b [cascade]`. Nil for other statements.
+---@param stmt dbgrid.Statement
+---@return { kind: "delete"|"truncate", names: string[], cascade: boolean }?
+function M.write_targets(stmt)
+  local tokens = stmt.tokens or {}
+  if stmt.kind == "delete" or (stmt.kind == "with" and stmt.class == "write") then
+    for i, t in ipairs(tokens) do
+      local nxt = tokens[i + 1]
+      if
+        t.depth == 0
+        and t.type == "word"
+        and t.lower == "delete"
+        and nxt
+        and nxt.type == "word"
+        and nxt.lower == "from"
+      then
+        local k = i + 2
+        if tokens[k] and tokens[k].type == "word" and tokens[k].lower == "only" then
+          k = k + 1
+        end
+        local name = qualified_name(tokens, k)
+        if name then
+          return { kind = "delete", names = { name }, cascade = false }
+        end
+        return nil
+      end
+    end
+    return nil
+  end
+  if stmt.kind ~= "truncate" then
+    return nil
+  end
+  local names, cascade = {}, false
+  local k = 2
+  if tokens[k] and tokens[k].type == "word" and tokens[k].lower == "table" then
+    k = k + 1
+  end
+  local STOP = { restart = true, continue = true, cascade = true, restrict = true }
+  while tokens[k] do
+    local t = tokens[k]
+    if t.type == "word" and STOP[t.lower] then
+      break
+    end
+    if t.type == "word" and t.lower == "only" then
+      k = k + 1
+    elseif (t.type == "punct" and t.value == ",") or (t.type == "op" and t.value == "*") then
+      k = k + 1
+    else
+      local name, nk = qualified_name(tokens, k)
+      if not name then
+        break
+      end
+      names[#names + 1] = name
+      k = nk
+    end
+  end
+  for j = k, #tokens do
+    if tokens[j].type == "word" and tokens[j].lower == "cascade" then
+      cascade = true
+    end
+  end
+  if #names == 0 then
+    return nil
+  end
+  return { kind = "truncate", names = names, cascade = cascade }
+end
 
 ---Does the statement start like SQL (and not like prose)?
 ---@param stmt dbgrid.Statement

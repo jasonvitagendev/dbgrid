@@ -38,14 +38,17 @@ the cache, so moving between cells never re-runs anything.
 - **Tags and per-project storage.** Notebooks are stored per repository and
   carry tags; pick them by name or by tag from anywhere.
 - **Safety rails.** `SELECT`s without a `LIMIT` get `LIMIT 500`. Writes ask
-  first, and an `UPDATE`/`DELETE` without `WHERE` is called out. Connections
-  can be marked read-only (enforced server side).
+  first, and an `UPDATE`/`DELETE` without `WHERE` is called out. A `DELETE`
+  or `TRUNCATE` says which other tables it reaches through `ON DELETE
+  CASCADE` before it runs. Connections can be marked read-only (enforced
+  server side).
 - **Index warnings.** Before running, the planner is asked for the plan; a
   sequential scan (or an index scan that only serves `ORDER BY`) on a big
   table is flagged with a suggested index. Optionally ask for confirmation.
 - **Schema-aware completion** for blink.cmp, nvim-cmp or plain omnifunc:
   tables, the columns of the tables in the current statement, aliases,
-  keywords. `K` describes the table or column under the cursor.
+  keywords. `K` describes the table or column under the cursor, including
+  which tables reference it; `\k` shows its foreign-key tree.
 - **Prompt to SQL.** Write `-- ? users who never logged in` in a cell and press
   `<CR>` (or `<localleader>g`): the schema and the prompt go to `claude`,
   `kimi` or `codex`, the SQL comes back into the cell for review.
@@ -191,6 +194,7 @@ Query pane:
 | `\c` | pick the connection |
 | `\s` / `\S` | refresh the schema cache / browse tables (inserts the name) |
 | `K` | describe the table or column under the cursor |
+| `\k` | foreign-key relations of the table under the cursor |
 | `\<Tab>` | focus the results pane |
 | `\z` | zoom the current pane |
 | `\q` | close the notebook |
@@ -229,6 +233,7 @@ Results pane:
 | `ask <prompt>` | add a prompt to the current cell and generate |
 | `schema refresh` / `schema tables` | refresh the cache / browse tables |
 | `describe <table>` | describe a table |
+| `relations [table]` | foreign-key tree of a table (the one under the cursor when omitted) |
 | `rename <title>` / `delete` / `close` | notebook management |
 | `export csv|json [path]` | current result to the clipboard or a file |
 | `cancel` | stop what is running |
@@ -248,6 +253,13 @@ Notices (`RAISE NOTICE`) show above the grid.
 - **Writes:** `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL and `DO`/`CALL`
   blocks ask for confirmation, with a louder prompt when an `UPDATE` or
   `DELETE` has no `WHERE`. `query.confirm_writes = false` turns it off.
+- **Cascade check:** a `DELETE` is looked up in the schema cache before the
+  prompt. Tables that lose rows through `ON DELETE CASCADE` (followed
+  transitively) are listed as a warning, e.g. `DELETE on users cascades to
+  invoices, invoice_lines (via invoices)`; tables that get `SET NULL` and
+  tables whose rows would make the delete fail (`RESTRICT` / `NO ACTION`)
+  are listed as notes. `TRUNCATE ... CASCADE` lists what else is truncated;
+  a `TRUNCATE` without it says which referencing tables would make it fail.
 - **Index check:** explainable statements are sent through `EXPLAIN (FORMAT
   JSON)` first. A `Seq Scan` on a table with at least `index_check.min_rows`
   rows (from the schema cache) produces a warning such as
@@ -311,8 +323,33 @@ refreshed after `schema.ttl_seconds` or with `\s`. Completion uses the
 statement around the cursor: after `u.` you get the columns of whatever `u`
 aliases, otherwise the columns of the tables in the statement first, then all
 tables, schemas, keywords and functions. `K` on `users`, `u.email` or a bare
-column name opens a description with types, defaults, foreign keys and
-indexes.
+column name opens a description with types, defaults, foreign keys (with
+their `ON DELETE` rule), indexes and the tables that reference it.
+
+## Relations
+
+`\k` (or `:Dbgrid relations [table]`) shows the foreign-key neighbourhood of
+a table as a text tree, `schema.relations_depth` hops in each direction,
+ending with what a `DELETE` on it would reach:
+
+```
+users  (~5,000 rows)
+
+References:
+  → plans (plan_id → id)
+
+Referenced by:
+  ← invoices (user_id)  on delete cascade
+    ← invoice_lines (invoice_id)  on delete cascade
+  ← orders (user_id)
+  ← sessions (user_id)  on delete set null
+
+DELETE on users cascades to invoices, invoice_lines (via invoices)
+DELETE on users sets NULL / default in sessions.user_id
+DELETE on users fails while rows in orders.user_id still reference it
+```
+
+On `u.email` the tree is for whatever `u` aliases in the current cell.
 
 ## Configuration
 
@@ -330,7 +367,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   index_check = { mode = "warn", min_rows = 10000 },        -- "off" | "warn" | "confirm"
   results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },
   ai = { agent = "claude", agents = { ... }, max_tables = 40, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18" },
-  schema = { ttl_seconds = 3600, exclude = {} },
+  schema = { ttl_seconds = 3600, exclude = {}, relations_depth = 3 },
   completion = { omnifunc = true, keywords = true },
   keymaps = { query = { ... }, results = { ... } },          -- see lua/dbgrid/config.lua
   icons = { ... },

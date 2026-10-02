@@ -490,7 +490,7 @@ function M.describe_under_cursor(s)
       end
       local tbl = schemamod.find_table(sch, (qualifier and (qualifier .. ".") or "") .. word)
       if tbl then
-        lines = schemamod.describe_lines(tbl)
+        lines = schemamod.describe_lines(tbl, sch)
       elseif qualifier then
         local t = alias_table(qualifier)
         local col = t and schemamod.find_column(t, word)
@@ -536,6 +536,64 @@ function M.describe_under_cursor(s)
         return util.notify("no table or column named '" .. word .. "'")
       end
       vim.lsp.util.open_floating_preview(lines, "", { border = "rounded", focusable = true, title = " dbgrid " })
+    end)
+  end)
+end
+
+---Resolve `name` (or the identifier under the cursor) to a table of the
+---schema, following aliases of the current cell: on `u.email` or `u` it is
+---whatever `u` stands for.
+---@param s dbgrid.State
+---@param sch dbgrid.SchemaData
+---@param name? string
+---@return dbgrid.SchemaTable?, string
+local function table_at_cursor(s, sch, name)
+  local schemamod = require("dbgrid.schema")
+  if name then
+    return schemamod.find_table(sch, name), name
+  end
+  local qualifier, word = identifier_under_cursor()
+  if not word or word == "" then
+    return nil, ""
+  end
+  local cell = M.current_cell(s)
+  local refs = cell and require("dbgrid.sql").referenced_tables(cells.body_text(cell)) or {}
+  local function alias_table(alias)
+    for _, r in ipairs(refs) do
+      if (r.alias and r.alias:lower() == alias:lower()) or r.name:lower() == alias:lower() then
+        return schemamod.find_table(sch, r.name)
+      end
+    end
+    return schemamod.find_table(sch, alias)
+  end
+  local full = (qualifier and (qualifier .. ".") or "") .. word
+  local tbl = schemamod.find_table(sch, full)
+  if tbl then
+    return tbl, full
+  end
+  if qualifier then
+    return alias_table(qualifier), qualifier
+  end
+  return alias_table(word), word
+end
+
+---Show the foreign-key tree of a table (`:Dbgrid relations [table]`, `\k`):
+---what it references, what references it, and what a DELETE on it reaches.
+---@param s dbgrid.State
+---@param name? string  table name; the identifier under the cursor when nil
+function M.relations(s, name)
+  require("dbgrid.runner").with_connection(s, nil, function(conn)
+    require("dbgrid.schema").get(conn, function(sch, err)
+      if not sch then
+        return util.error("schema: " .. tostring(err))
+      end
+      local tbl, word = table_at_cursor(s, sch, name)
+      if not tbl then
+        return util.notify("no table named '" .. word .. "'")
+      end
+      local depth = config.get().schema.relations_depth or 3
+      local lines = require("dbgrid.relations").tree_lines(sch, tbl, { depth = depth })
+      vim.lsp.util.open_floating_preview(lines, "", { border = "rounded", focusable = true, title = " relations " })
     end)
   end)
 end
@@ -663,6 +721,9 @@ function M.attach(s)
   map(buf, "n", k.describe, function()
     M.describe_under_cursor(s)
   end, "describe table/column under cursor")
+  map(buf, "n", k.relations, function()
+    M.relations(s)
+  end, "foreign-key relations of the table under cursor")
   map(buf, "n", k.focus_results, function()
     layout.focus_results(s)
   end, "focus results pane")

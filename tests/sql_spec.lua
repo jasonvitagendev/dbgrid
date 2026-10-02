@@ -120,3 +120,42 @@ H.describe("sql.referenced_tables", function()
     H.eq(sql.referenced_tables('select * from "Weird Table" w'), { { name = '"Weird Table"', alias = "w" } })
   end)
 end)
+
+H.describe("sql.write_targets", function()
+  local function targets(text)
+    return sql.write_targets(sql.split(text)[1])
+  end
+  H.it("finds the table of a DELETE", function()
+    H.eq(targets("delete from users where id = 1"), { kind = "delete", names = { "users" }, cascade = false })
+    H.eq(targets("DELETE FROM ONLY billing.invoices i USING x WHERE i.x = x.id"), {
+      kind = "delete",
+      names = { "billing.invoices" },
+      cascade = false,
+    })
+    H.eq(targets('delete from "Users"'), { kind = "delete", names = { '"Users"' }, cascade = false })
+    H.eq(targets("with old as (select id from users) delete from sessions where user_id in (select id from old)"), {
+      kind = "delete",
+      names = { "sessions" },
+      cascade = false,
+    })
+  end)
+  H.it("finds the tables of a TRUNCATE", function()
+    H.eq(targets("truncate users"), { kind = "truncate", names = { "users" }, cascade = false })
+    H.eq(targets("truncate table only users *, app.plans restart identity cascade"), {
+      kind = "truncate",
+      names = { "users", "app.plans" },
+      cascade = true,
+    })
+    H.eq(targets("truncate users, invoices continue identity restrict"), {
+      kind = "truncate",
+      names = { "users", "invoices" },
+      cascade = false,
+    })
+  end)
+  H.it("ignores other statements", function()
+    H.eq(targets("select * from users"), nil)
+    H.eq(targets("update users set a = 1"), nil)
+    H.eq(targets("insert into users values (1)"), nil)
+    H.eq(targets("with a as (select 1) select * from a"), nil)
+  end)
+end)

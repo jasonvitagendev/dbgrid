@@ -157,7 +157,7 @@ function M.items(buf, row, col)
           tbl.rows or 0,
           #(tbl.columns or {})
         ),
-        documentation = table.concat(schema.describe_lines(tbl), "\n"),
+        documentation = table.concat(schema.describe_lines(tbl, sch), "\n"),
         sort = "1" .. tbl.name,
       })
     end

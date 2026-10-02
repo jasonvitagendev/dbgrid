@@ -32,6 +32,7 @@ local M = {}
 ---@field functions string[]
 ---@field fetched_at integer
 ---@field by_name table<string, dbgrid.SchemaTable>
+---@field referenced_by table<string, dbgrid.Edge[]>|nil  built on demand by dbgrid.relations
 
 local memory = {} ---@type table<string, dbgrid.SchemaData>
 local inflight = {} ---@type table<string, fun(schema?: dbgrid.SchemaData, err?: string)[]>
@@ -216,10 +217,13 @@ end
 
 local KIND = { r = "table", v = "view", m = "materialized view", p = "partitioned table", f = "foreign table" }
 
----Lines describing a table (hover / describe).
+---Lines describing a table (hover / describe). With the schema document the
+---tables that reference this one are listed too.
 ---@param tbl dbgrid.SchemaTable
+---@param sch? dbgrid.SchemaData
 ---@return string[]
-function M.describe_lines(tbl)
+function M.describe_lines(tbl, sch)
+  local relations = require("dbgrid.relations")
   local lines = {}
   lines[#lines + 1] =
     string.format("%s %s  (~%s rows)", KIND[tbl.kind] or tbl.kind, M.display_name(tbl), util.fmt_int(tbl.rows or 0))
@@ -235,8 +239,12 @@ function M.describe_lines(tbl)
         pk[c] = true
       end
     elseif con.type == "f" then
+      local rule = relations.delete_rule(con)
       for _, c in ipairs(con.columns) do
         fk[c] = (con.ref_table or "?") .. "(" .. table.concat(con.ref_columns or {}, ", ") .. ")"
+        if rule ~= "no action" then
+          fk[c] = fk[c] .. " on delete " .. rule
+        end
       end
     end
   end
@@ -274,6 +282,14 @@ function M.describe_lines(tbl)
       local kind = ix.primary and "PRIMARY KEY" or (ix.unique and "UNIQUE" or "")
       local def = ix.def:match("USING (.*)$") or ix.def
       lines[#lines + 1] = string.format("  %s  %s%s", ix.name, def, kind ~= "" and ("  " .. kind) or "")
+    end
+  end
+  if sch then
+    local refs = relations.referenced_by_lines(sch, tbl)
+    if #refs > 0 then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "Referenced by:"
+      vim.list_extend(lines, refs)
     end
   end
   return lines
