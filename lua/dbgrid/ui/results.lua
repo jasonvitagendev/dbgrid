@@ -873,6 +873,51 @@ function M.toggle_schema(s)
 end
 
 ---Keys that mean something else in the schema document.
+---Open the foreign-key tree (see dbgrid.relations) for the table under the
+---cursor in the schema document, else for the table(s) the current cell reads.
+---@param s dbgrid.State
+function M.relations(s)
+  local query = require("dbgrid.ui.query")
+  if s.view.mode == "schema" then
+    local t = schema_table_at_cursor(s)
+    if t then
+      return query.relations(s, require("dbgrid.schema").display_name(t))
+    end
+    return util.notify("no table under the cursor")
+  end
+  local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id)
+  if not cell then
+    return util.notify("no cell selected")
+  end
+  local names, seen = {}, {}
+  for _, r in ipairs(require("dbgrid.sql").referenced_tables(cells.body_text(cell))) do
+    if not seen[r.name:lower()] then
+      seen[r.name:lower()] = true
+      names[#names + 1] = r.name
+    end
+  end
+  if #names == 0 then
+    return util.notify("the cell reads no table")
+  end
+  if #names == 1 then
+    return query.relations(s, names[1])
+  end
+  require("dbgrid.ui.picker").pick(
+    vim.tbl_map(function(n)
+      return { text = n, data = n }
+    end, names),
+    {
+      prompt = "Relations of",
+      preview = false,
+      on_select = function(item)
+        if item then
+          query.relations(s, item.data)
+        end
+      end,
+    }
+  )
+end
+
 ---@param s dbgrid.State
 ---@param action "toggle"|"describe"|"yank"|"next"|"prev"|"filter"
 ---@return boolean handled
@@ -1711,6 +1756,9 @@ function M.attach(s)
   map(buf, k.schema_view, function()
     M.toggle_schema(s)
   end, "toggle the schema document")
+  map(buf, k.relations, function()
+    M.relations(s)
+  end, "foreign-key relations of the table")
   map(buf, k.record_view, function()
     M.toggle_record(s)
   end, "toggle record view")

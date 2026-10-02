@@ -490,6 +490,26 @@ H.describe("notebook ui", function()
     end)
     results.move_column(s, 1)
     H.truthy(vim.api.nvim_win_get_cursor(s.results_win)[1] > plans_lnum)
+    -- \k opens the relations tree of the table under the cursor
+    vim.api.nvim_win_set_cursor(s.results_win, { plans_lnum, 0 })
+    local function floats()
+      return vim.tbl_filter(function(w)
+        return vim.api.nvim_win_get_config(w).relative ~= ""
+      end, vim.api.nvim_list_wins())
+    end
+    local before = #floats()
+    results.relations(s)
+    H.truthy(
+      H.wait(3000, function()
+        return #floats() > before
+      end),
+      "relations float did not open"
+    )
+    local float = floats()[#floats()]
+    local ftext = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(float), 0, -1, false), "\n")
+    H.matches(ftext, "^plans  %(~")
+    H.matches(ftext, "← users %(plan_id%)")
+    vim.api.nvim_win_close(float, true)
     results.yank_cell(s)
     H.matches(vim.fn.getreg('"'), "^%a+$")
     H.matches(layout.winbar_results(s.buf), "schema")

@@ -283,6 +283,7 @@ M.defaults = {
       record_view = "<localleader>v",
       plan_view = "<localleader>p",
       schema_view = "<localleader>b",
+      relations = "<localleader>k",
       toggle_truncate = "<localleader>w",
       sort = "<localleader>s",
       filter = "<localleader>f",

@@ -188,6 +188,8 @@ Results pane ~
   \h          sparkline (live cells)
   \yc \yr \ya \yi \yp   yank value / row JSON / CSV / row INSERT / plan
   \a          ask about the query and its result (|dbgrid-review|)
+  \k          relations of the table (under the cursor in the schema
+              document, else the table the cell reads)
   <Tab> <S-Tab>     next / previous column (row in record view)
   ]c  [c      next / previous cell   \<Tab>      focus query pane
   \z          zoom pane              q           close notebook

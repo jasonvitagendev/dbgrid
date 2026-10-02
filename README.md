@@ -475,6 +475,7 @@ Results pane:
 | `\d` | diff against the previous run of the cell (toggle) |
 | `\h` | sparkline of the column under the cursor across live ticks |
 | `\yc` / `\yr` / `\ya` / `\yi` / `\yp` | yank value / row as JSON / result as CSV / row as INSERT / plan JSON |
+| `\k` | foreign-key relations of the table under the cursor (schema document) or of the table the cell reads |
 | `\a` | ask the agent about the query and the result (again for a follow-up) |
 | `<Tab>` / `<S-Tab>` | next / previous column (next / previous row in record view) |
 | `]c` / `[c` | next / previous cell |
@@ -482,6 +483,7 @@ Results pane:
 | `q` | close the notebook |
 
 In the schema document `<CR>` folds and unfolds a table, `K` describes it,
+`\k` shows its foreign-key relations,
 `<Tab>` / `<S-Tab>` jump between tables, `\f` filters tables by name, `\yc`
 yanks the table or column name, and `/`, `zo`, `zc`, `zR`, `zM` work as they
 do everywhere.
