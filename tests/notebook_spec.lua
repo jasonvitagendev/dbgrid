@@ -535,6 +535,93 @@ H.describe("completion", function()
     local items = completion.items(b, 2, 22)
     H.truthy(#items > 0) -- keywords still come without a schema
   end)
+
+  H.it("completes enum values in comparison strings", function()
+    require("dbgrid.config").setup({
+      connections = { { name = "enumtest", url = "postgres://localhost:5499/enumtest" } },
+    })
+    local conn = require("dbgrid.connections").get("enumtest")
+    H.truthy(conn)
+    local schema = require("dbgrid.schema")
+    local dir = require("dbgrid.project").data_dir() .. "/schema"
+    vim.fn.mkdir(dir, "p")
+    require("dbgrid.util").write_json(dir .. "/" .. schema.key(conn) .. ".json", {
+      schemas = { "public" },
+      tables = {
+        {
+          schema = "public",
+          name = "orders",
+          kind = "r",
+          rows = 10,
+          columns = {
+            { name = "id", type = "integer" },
+            { name = "status", type = "order_status" },
+            { name = "note", type = "text" },
+          },
+        },
+        {
+          schema = "public",
+          name = "tickets",
+          kind = "r",
+          rows = 5,
+          columns = {
+            { name = "id", type = "integer" },
+            { name = "status", type = "ticket_status" },
+          },
+        },
+      },
+      enums = {
+        { name = "order_status", values = { "pending", "paid", "shipped" } },
+        { name = "ticket_status", values = { "open", "closed" } },
+      },
+    })
+    H.truthy(schema.loaded(conn))
+    local state = require("dbgrid.state")
+    local b = vim.api.nvim_create_buf(false, true)
+    state.attach(b, { name = "enum-nb", meta = { connection = "enumtest", cells = {}, params = {} } })
+    local function items(sql)
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, { "-- %% [e1]", sql })
+      vim.b[b].dbgrid_cells_cache = nil
+      return completion.items(b, 2, #sql)
+    end
+    local function value_map(list)
+      local m = {}
+      for _, it in ipairs(list) do
+        if it.kind_name == "value" then
+          m[it.label] = it.detail
+        end
+      end
+      return m
+    end
+    local order_values = { pending = "order_status", paid = "order_status", shipped = "order_status" }
+    -- unqualified column, partially typed value: only the enum's values
+    local list = items("select * from orders where status = 'p")
+    H.eq(value_map(list), order_values)
+    H.eq(#list, 3)
+    -- alias-qualified column, IN list, UPDATE target
+    H.eq(value_map(items("select * from orders o where o.status = '")), order_values)
+    H.eq(value_map(items("select * from orders where status in ('paid', '")), order_values)
+    H.eq(value_map(items("update orders set status = '")), order_values)
+    -- unambiguous column name used by two referenced tables: union of both enums
+    H.eq(
+      value_map(items("select * from orders join tickets on tickets.id = orders.id where status = '")),
+      {
+        pending = "order_status",
+        paid = "order_status",
+        shipped = "order_status",
+        open = "ticket_status",
+        closed = "ticket_status",
+      }
+    )
+    -- an escaped quote does not close the string
+    H.eq(value_map(items("select * from orders where status = 'it''s")), order_values)
+    -- a text column keeps the ordinary items, and a closed string offers no values
+    list = items("select * from orders where note = 'n")
+    H.eq(next(value_map(list)), nil)
+    H.truthy(#list > 0)
+    H.eq(next(value_map(items("select * from orders where status = 'paid'"))), nil)
+    state.detach(b)
+  end)
 end)
 
 H.describe("notebook delete", function()

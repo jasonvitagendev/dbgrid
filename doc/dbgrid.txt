@@ -470,7 +470,9 @@ Completion: blink.cmp provider `{ name = "dbgrid", module =
 "dbgrid", require("dbgrid.completion.cmp").new())`; omnifunc by default.
 Items: columns of the tables in the statement first, alias-qualified columns
 after `alias.`, tables, schemas, keywords and functions of the connection's
-dialect, cell names and parameters after `{{`, parameters after `:`.
+dialect, cell names and parameters after `{{`, parameters after `:`. In a
+comparison string on an enum column (`status = '…`, `in ('…`) only the
+enum's values are offered.
 
                                                             *dbgrid-relations*
 `\k` or `:Dbgrid relations [table]` opens the foreign-key tree of a table:

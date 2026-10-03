@@ -19,6 +19,30 @@ M.KIND = { column = 5, table = 7, keyword = 14, ["function"] = 3, schema = 9, al
 ---@field sort string
 ---@field filter string?
 
+---Byte offset (into `before`) of the quote opening the string the cursor is in, if any.
+---SQL escapes a quote by doubling it, so '' pairs don't toggle the state.
+---@param before string  line text before the cursor
+---@return integer?
+local function string_open(before)
+  local open
+  local i = 1
+  while i <= #before do
+    if before:sub(i, i) == "'" then
+      if open then
+        if before:sub(i + 1, i + 1) == "'" then
+          i = i + 1
+        else
+          open = nil
+        end
+      else
+        open = i
+      end
+    end
+    i = i + 1
+  end
+  return open
+end
+
 ---Context at a buffer position.
 ---@param buf integer
 ---@param row integer 1-based
@@ -49,6 +73,8 @@ function M.context(buf, row, col)
     in_ref = in_ref,
     in_param = in_param,
     after_keyword = before:lower():match('([%a_]+)%s+[%w_"%.]*$'),
+    string_open = string_open(before),
+    before = before,
   }
 end
 
@@ -117,6 +143,67 @@ local function schema_for(buf)
   return loaded
 end
 
+---Enum values for the string the cursor is in, when it is the right side of a
+---comparison (`status = '…`, `o.status <> '…`, `status in ('…`) on an enum column.
+---@param sch dbgrid.SchemaData
+---@param ctx table
+---@param add fun(item: dbgrid.CompletionItem)
+---@return boolean  true when enum items were offered (caller should offer nothing else)
+local function enum_value_items(sch, ctx, add)
+  local prefix = ctx.before:sub(1, ctx.string_open - 1)
+  local colref = prefix:match('([%w_".]+)%s*[!<>=]*=%s*$')
+    or prefix:match('([%w_".]+)%s*<>%s*$')
+    or prefix:match('([%w_".]+)%s+[iI][nN]%s*%([^)]*$')
+  if not colref then
+    return false
+  end
+  local parts = {}
+  for p in colref:gmatch("[^%.]+") do
+    parts[#parts + 1] = (p:gsub('"', ""))
+  end
+  local name = parts[#parts]
+  local qual = #parts > 1 and parts[#parts - 1] or nil
+  local found = false
+  local function from_table(t)
+    if not t then
+      return
+    end
+    for _, c in ipairs(t.columns or {}) do
+      if c.name:lower() == name:lower() then
+        local tname = ((c.type or ""):gsub('"', "")):lower():match("[^%.]+$")
+        for _, e in ipairs(sch.enums or {}) do
+          if e.name:lower() == tname then
+            for _, v in ipairs(e.values or {}) do
+              add({
+                label = v,
+                kind = M.KIND.enum,
+                kind_name = "value",
+                detail = e.name,
+                insert = (v:gsub("'", "''")),
+                sort = "0" .. v,
+              })
+              found = true
+            end
+          end
+        end
+      end
+    end
+  end
+  if qual then
+    for _, r in ipairs(ctx.refs) do
+      if r.alias and r.alias:lower() == qual:lower() then
+        from_table(schema.find_table(sch, r.name))
+      end
+    end
+    from_table(schema.find_table(sch, qual))
+  else
+    for _, r in ipairs(ctx.refs) do
+      from_table(schema.find_table(sch, r.name))
+    end
+  end
+  return found
+end
+
 ---@param buf integer
 ---@param row integer
 ---@param col integer
@@ -152,6 +239,9 @@ function M.items(buf, row, col)
         sort = prefix_sort .. c.name,
       })
     end
+  end
+  if sch and ctx.string_open and enum_value_items(sch, ctx, add) then
+    return items, ctx
   end
   if ctx.in_ref or ctx.in_param then
     notebook_items(buf, ctx, add)

@@ -64,7 +64,8 @@ the cache, so moving between cells never re-runs anything.
   searchable document (every table one fold: columns, indexes, foreign keys).
 - **Schema-aware completion** for blink.cmp, nvim-cmp or plain omnifunc:
   tables, the columns of the tables in the current statement, aliases,
-  keywords, `{{cell}}` references and `:parameters`. `K` describes the table
+  keywords, enum values in `= '…` comparisons, `{{cell}}` references and
+  `:parameters`. `K` describes the table
   or column under the cursor, including which tables reference it; `\k`
   shows its foreign-key tree.
 - **Prompt to SQL.** Write `-- ? users who never logged in` in a cell and press
@@ -834,7 +835,8 @@ Completion uses the statement around the cursor: after `u.` you get the
 columns of whatever `u` aliases, otherwise the columns of the tables in the
 statement first, then all tables, schemas, keywords and functions of the
 connection's dialect. After `{{` it offers cell names and parameters, after
-`:` parameters.
+`:` parameters. In a comparison string on an enum column (`status = '…`,
+`in ('…`) it offers the enum's values.
 
 ## Configuration
 
