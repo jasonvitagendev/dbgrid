@@ -1172,7 +1172,8 @@ end
 ---Show a cell's result in the results pane.
 ---
 ---The schema document is not tied to a cell, so moving between cells keeps
----it; a fresh result (`opts.ran`) or an explicit view replaces it.
+---it; a fresh result (`opts.ran`) or an explicit view replaces it. The plan
+---view is tied to the cell: leaving and coming back restores it.
 ---@param s dbgrid.State
 ---@param cell_id string
 ---@param opts? { view?: "grid"|"record"|"plan"|"diff"|"schema", ran?: boolean }
@@ -1192,7 +1193,9 @@ function M.show(s, cell_id, opts)
     s.view.mode = "grid"
     s.view.schema_key = nil
   end
-  local mode = opts.view or (same and s.view.mode) or "grid"
+  -- a view the user picked for a cell (plan) survives leaving and coming back
+  local remembered = s.runtime[cell_id] and s.runtime[cell_id].view_mode
+  local mode = opts.view or (same and s.view.mode) or (not opts.ran and remembered) or "grid"
   if not same then
     s.view = { truncate = s.view.truncate }
   end
@@ -1213,6 +1216,12 @@ function M.render(s, reset_cursor)
   local result = current_result(s)
   local ctx = { lines = {}, line_hl = {}, rows_layout = {}, header_layout = {} }
   local mode = s.view.mode or "grid"
+  -- remember grid/plan per cell; schema is global, and the diff/record
+  -- payloads live in s.view, which a cell switch drops
+  if s.view.cell_id and (mode == "grid" or mode == "plan") then
+    s.runtime[s.view.cell_id] = s.runtime[s.view.cell_id] or {}
+    s.runtime[s.view.cell_id].view_mode = mode
+  end
   if mode == "schema" then
     if render_schema(s, ctx) == false then
       M.refresh_winbar(s)

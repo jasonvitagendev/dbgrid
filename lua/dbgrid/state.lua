@@ -10,7 +10,7 @@ local M = {}
 ---@field tab integer?
 ---@field active_cell string?     id of the cell whose result is shown
 ---@field running table<string, { job: dbgrid.Job, started: number, kind: string }>
----@field runtime table<string, table>   per-cell transient status (warnings, generated flag)
+---@field runtime table<string, table>   per-cell transient status (warnings, generated flag, view mode)
 ---@field view table              results view state
 ---@field live table<string, table>      live (`@every`) cells: timer, interval, ticks, history, changed
 ---@field previous table<string, table>  result before the last run, per cell (for the diff view)

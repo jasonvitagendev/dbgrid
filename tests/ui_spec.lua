@@ -423,6 +423,32 @@ H.describe("notebook ui", function()
     H.eq(s.view.mode, "plan")
   end)
 
+  H.it("restores the plan view when the cursor leaves and returns to the cell", function()
+    set_cells(s, {
+      "-- %% [pa1] filtered",
+      "select * from users where balance > 7000",
+      "",
+      "-- %% [pa2] other",
+      "select 1",
+    })
+    runner.explain_cell(s, cells.parse(s.buf)[1], true)
+    H.truthy(H.wait(15000, function()
+      return s.runtime.pa1 and s.runtime.pa1.plan_text ~= nil
+    end))
+    H.eq(s.view.mode, "plan")
+    -- moving to another cell shows its grid
+    vim.api.nvim_win_set_cursor(s.query_win, { 5, 0 })
+    query.on_cursor(s)
+    H.eq(s.active_cell, "pa2")
+    H.eq(s.view.mode, "grid")
+    -- coming back restores the plan instead of the grid
+    vim.api.nvim_win_set_cursor(s.query_win, { 2, 0 })
+    query.on_cursor(s)
+    H.eq(s.active_cell, "pa1")
+    H.eq(s.view.mode, "plan")
+    H.matches(table.concat(results_lines(s), "\n"), "EXPLAIN ANALYZE")
+  end)
+
   H.it("shows the schema as a foldable document with indexes", function()
     set_cells(s, { "-- %% [sv1]", "select * from users u" })
     query.on_cursor(s, true)
