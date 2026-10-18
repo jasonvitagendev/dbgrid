@@ -403,23 +403,43 @@ end
 
 local LIMITABLE = { select = true, with = true, values = true, table = true }
 
----Append `LIMIT n` to read-only statements that lack one.
+---Append `LIMIT n` (and `OFFSET offset` for a later page) to read-only
+---statements that lack one.
 ---@param stmt dbgrid.Statement
 ---@param n integer
+---@param offset? integer
 ---@return string sql, boolean applied
-function M.ensure_limit(stmt, n)
+function M.ensure_limit(stmt, n, offset)
   if not n or n <= 0 or stmt.class ~= "read" or not LIMITABLE[stmt.kind] then
     return stmt.sql, false
   end
   if M.first_top_level_word(stmt, { limit = true, fetch = true }) then
     return stmt.sql, false
   end
+  local clause = "LIMIT " .. n .. ((offset or 0) > 0 and (" OFFSET " .. offset) or "")
   local locking = M.first_top_level_word(stmt, { ["for"] = true })
   if locking then
     local rel = locking.s - stmt.s + 1
-    return stmt.sql:sub(1, rel - 1) .. "\nLIMIT " .. n .. "\n" .. stmt.sql:sub(rel), true
+    return stmt.sql:sub(1, rel - 1) .. "\n" .. clause .. "\n" .. stmt.sql:sub(rel), true
   end
-  return stmt.sql .. "\nLIMIT " .. n, true
+  return stmt.sql .. "\n" .. clause, true
+end
+
+---Undo what `ensure_limit` appended, or nil when the text does not end (or
+---continue) with exactly that clause.
+---@param sql string
+---@param n integer
+---@return string?
+function M.strip_limit(sql, n)
+  local tail = "\nLIMIT " .. n
+  if sql:sub(-#tail) == tail then
+    return sql:sub(1, -#tail - 1)
+  end
+  local s, e = sql:find(tail .. "\n", 1, true)
+  if s then
+    return sql:sub(1, s - 1) .. sql:sub(e + 1)
+  end
+  return nil
 end
 
 ---Describe why a write statement looks dangerous, or nil.

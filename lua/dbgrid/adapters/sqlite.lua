@@ -487,6 +487,51 @@ function M.run(conn, statements, opts, cb)
   end)
 end
 
+---Load a delimited file into a table with the shell's `.import`, through a
+---temporary table named by the header so the columns are matched by name.
+---@param conn dbgrid.Connection
+---@param opts { path: string, table: string, columns: string[], delimiter: string, header?: boolean,
+---  create_sql?: string, timeout_ms?: integer }
+---@param cb fun(ok: boolean, message: string, rows?: integer)
+---@return dbgrid.Job
+function M.import(conn, opts, cb)
+  local tmp = "dbgrid_import_" .. util.short_id(6)
+  local cols = table.concat(vim.tbl_map(util.sql_ident, opts.columns or {}), ", ")
+  local delim = opts.delimiter == "\t" and "\\t" or (opts.delimiter or ",")
+  local lines = {}
+  if opts.create_sql then
+    lines[#lines + 1] = opts.create_sql
+  end
+  lines[#lines + 1] = ".mode csv"
+  lines[#lines + 1] = '.separator "' .. delim .. '"'
+  lines[#lines + 1] = ".import '" .. opts.path:gsub("'", "''") .. "' " .. tmp
+  if opts.header == false then
+    -- no header: the first row became the column names; nothing sensible to do
+    lines[#lines + 1] = string.format("insert into %s select * from %s;", opts.table, tmp)
+  else
+    lines[#lines + 1] = string.format("insert into %s (%s) select %s from %s;", opts.table, cols, cols, tmp)
+  end
+  lines[#lines + 1] = "select changes();"
+  lines[#lines + 1] = "drop table " .. tmp .. ";"
+  local script = table.concat(lines, "\n") .. "\n"
+  return spawn(conn, script, { bail = true, timeout_ms = opts.timeout_ms or 600000 }, function(out)
+    if out.code ~= 0 then
+      local _, err = parse_stderr(out.stderr or "", {}, {})
+      cb(
+        false,
+        err and err.message
+          or util.trim(out.stderr ~= "" and out.stderr or ("sqlite3 exited with " .. tostring(out.code)))
+      )
+      return
+    end
+    local rows
+    for n in (out.stdout or ""):gmatch("(%d+)") do
+      rows = tonumber(n)
+    end
+    cb(true, "INSERT " .. tostring(rows or 0), rows or 0)
+  end)
+end
+
 ---Parse the shell's rendering of EXPLAIN QUERY PLAN into a tree.
 ---@param text string
 ---@return { sqlite: boolean, nodes: { depth: integer, detail: string }[] }?

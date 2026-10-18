@@ -15,6 +15,7 @@ local M = {}
 ---@field schema fun(conn: dbgrid.Connection, cb: fun(schema?: table, err?: string)): dbgrid.Job
 ---@field test fun(conn: dbgrid.Connection, cb: fun(ok: boolean, message: string)): dbgrid.Job
 ---@field cancel fun(job: dbgrid.Job, conn?: dbgrid.Connection)
+---@field import? fun(conn: dbgrid.Connection, opts: table, cb: fun(ok: boolean, message: string, rows?: integer)): dbgrid.Job   load a delimited file into a table
 ---@field keywords string[]
 ---@field functions string[]
 

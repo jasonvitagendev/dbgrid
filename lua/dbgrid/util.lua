@@ -376,6 +376,30 @@ function M.sql_literal(v)
   return "'" .. tostring(v):gsub("'", "''") .. "'"
 end
 
+-- Names that need quotes even when they are plain lower-case words.
+local RESERVED = {}
+for w in
+  ([[all and any as asc both case cast check collate column constraint create cross current_date
+  current_time current_timestamp current_user default desc distinct do else end except false fetch for
+  foreign from full grant group having in initially inner intersect into is join leading left like limit
+  localtime localtimestamp natural not null offset on only or order outer placing primary references
+  returning right select session_user similar some symmetric table then to trailing true union unique
+  user using variadic when where window with]]):gmatch("%S+")
+do
+  RESERVED[w] = true
+end
+
+---Quote an identifier when it is not a plain lower-case name (or is reserved).
+---@param name string
+---@return string
+function M.sql_ident(name)
+  name = tostring(name)
+  if name:match("^[a-z_][a-z0-9_]*$") and not RESERVED[name] then
+    return name
+  end
+  return '"' .. name:gsub('"', '""') .. '"'
+end
+
 ---Make keymap hint plugins pick up buffer-local keymaps set after the buffer
 ---was entered. which-key caches a buffer's keymaps on BufEnter and only
 ---rescans on BufNew/BufReadPost/LspAttach, so without this `<localleader>`

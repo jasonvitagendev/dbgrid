@@ -177,8 +177,10 @@ M.defaults = {
     newline = "↵",
     -- Right align numeric columns.
     align_numbers = true,
-    -- Row limit rendered in the grid (cached rows are already capped by storage.cache_rows).
+    -- Row limit rendered in the grid (the disk cache is capped by storage.cache_rows).
     max_render_rows = 2000,
+    -- Bars of the chart view: nil sizes them to the window.
+    chart_width = nil,
   },
 
   ai = {
@@ -291,7 +293,16 @@ M.defaults = {
       sort = "<localleader>s",
       filter = "<localleader>f",
       diff = "<localleader>d",
+      pin = "<localleader>P",
       history = "<localleader>h",
+      follow = "gf",
+      follow_cell = "gF",
+      more = "<localleader>m",
+      edit = "<localleader>e",
+      backend = "<localleader>x",
+      hide_column = "<localleader>c",
+      show_columns = "<localleader>C",
+      chart = "<localleader>g",
       yank_cell = "<localleader>yc",
       yank_row_json = "<localleader>yr",
       yank_csv = "<localleader>ya",
@@ -325,6 +336,8 @@ M.defaults = {
     index = "⌗",
     live = "◉",
     changed = "Δ",
+    pin = "📌",
+    follow = "↳",
   },
 }
 

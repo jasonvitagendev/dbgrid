@@ -200,6 +200,7 @@ end
 ---Close the notebook UI (writes the query buffer first).
 ---@param s dbgrid.State
 function M.close(s)
+  require("dbgrid.ui.pins").close_all(s)
   if vim.api.nvim_buf_is_valid(s.buf) and vim.bo[s.buf].modified then
     vim.api.nvim_buf_call(s.buf, function()
       pcall(vim.cmd, "silent update")

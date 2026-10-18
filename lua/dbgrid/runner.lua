@@ -444,9 +444,12 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
   local truncated = false
   for i, st in ipairs(res.statements) do
     st.plan = extra.plans[i]
+    st.unlimited = run_stmts[i] and run_stmts[i].unlimited or nil
+    st.more = nil
     for _, set in ipairs(st.sets) do
       if st.limit_applied and (set.row_count or #set.rows) >= st.limit_applied then
         truncated = true
+        st.more = true
       end
     end
   end
@@ -505,12 +508,245 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
   elseif state.view.cell_id == fresh.id then
     ui_results().show(state, fresh.id)
   end
+  require("dbgrid.ui.pins").refresh(state, fresh.id)
   if not res.ok and live then
     M.stop_live(state, fresh.id, "error")
   end
   if cb then
     cb(result)
   end
+end
+
+---Run SQL that belongs to no cell (a followed foreign key, a backend
+---signal, a peek after an import) on the notebook's connection and hand back
+---a result shaped like a cell's. `opts.limit = false` skips the LIMIT
+---injection; `opts.id` registers the job under that id so the spinner and
+---cancel see it.
+---@param state dbgrid.State
+---@param sql string
+---@param opts? { connection?: string, limit?: boolean, id?: string, title?: string }
+---@param cb fun(result?: table, err?: string)
+function M.run_sql(state, sql, opts, cb)
+  opts = opts or {}
+  local cfg = config.get()
+  local stmts = sqlmod.split(sql)
+  if #stmts == 0 then
+    return cb(nil, "nothing to run")
+  end
+  M.with_connection(state, opts.connection, function(conn)
+    local adapter = adapter_for(conn)
+    if not adapter then
+      return cb(nil, "no adapter")
+    end
+    local run_stmts = {}
+    local has_write = false
+    for i, st in ipairs(stmts) do
+      local text, applied = st.sql, false
+      if opts.limit ~= false and cfg.query.limit then
+        text, applied = sqlmod.ensure_limit(st, cfg.query.limit)
+      end
+      if st.class == "write" or st.class == "ddl" then
+        has_write = true
+      end
+      run_stmts[i] = {
+        sql = text,
+        kind = st.kind,
+        class = st.class,
+        line = st.line,
+        limit_applied = applied and cfg.query.limit or nil,
+        unlimited = applied and st.sql or nil,
+      }
+    end
+    if has_write and conn.readonly then
+      return cb(nil, "connection '" .. conn.name .. "' is read-only")
+    end
+    local id = opts.id
+    if id then
+      state.running[id] = { started = util.now(), kind = "run", conn = conn, adapter = adapter }
+      ui_query().start_spinner(state)
+    end
+    local job = adapter.run(conn, run_stmts, { timeout_ms = cfg.query.timeout_ms }, function(res)
+      if id then
+        state.running[id] = nil
+      end
+      local truncated = false
+      for i, st in ipairs(res.statements) do
+        st.unlimited = run_stmts[i] and run_stmts[i].unlimited or nil
+        for _, set in ipairs(st.sets) do
+          if st.limit_applied and (set.row_count or #set.rows) >= st.limit_applied then
+            truncated = true
+            st.more = true
+          end
+        end
+      end
+      cb({
+        ok = res.ok,
+        statements = res.statements,
+        notices = res.notices,
+        error = res.error,
+        elapsed_ms = res.elapsed_ms,
+        server_ms = res.server_ms,
+        cancelled = res.cancelled,
+        ran_at = util.epoch(),
+        connection = conn.name,
+        warnings = {},
+        truncated = truncated,
+        title = opts.title,
+      }, res.ok and nil or (res.error and res.error.message or "failed"))
+    end)
+    if id and state.running[id] then
+      state.running[id].job = job
+    end
+  end)
+end
+
+---Fetch the next page of a statement whose LIMIT dbgrid added, and append
+---the rows to the cell's result (`\m` in the results pane).
+---@param state dbgrid.State
+---@param cell_id string
+---@param stmt_index? integer   the statement to page; the first truncated one when nil
+---@param cb? fun(result?: table, err?: string)
+function M.load_more(state, cell_id, stmt_index, cb)
+  local function fail(msg)
+    util.notify(msg)
+    if cb then
+      cb(nil, msg)
+    end
+  end
+  local result = notebook.result_of(state.nb, cell_id)
+  if not result or not result.ok then
+    return fail("no result to extend: run the cell first")
+  end
+  local idx, st
+  for i, candidate in ipairs(result.statements or {}) do
+    if candidate.limit_applied and (not stmt_index or i == stmt_index) then
+      idx, st = i, candidate
+      break
+    end
+  end
+  if not st then
+    return fail("this result has no LIMIT added by dbgrid: it is complete, or has its own LIMIT")
+  end
+  if not st.more then
+    return fail("every row is already here (" .. util.fmt_int(#(st.sets[1] or {}).rows) .. " rows)")
+  end
+  local set = st.sets[1]
+  local n = st.limit_applied
+  local base = st.unlimited or sqlmod.strip_limit(st.sql, n)
+  local stmt = base and sqlmod.split(base)[1]
+  if not stmt then
+    return fail("the statement could not be paged")
+  end
+  local fetched = #set.rows
+  local sql, applied = sqlmod.ensure_limit(stmt, n, fetched)
+  if not applied then
+    return fail("the statement could not be paged")
+  end
+  local cell = cells.by_id(state.buf, cell_id)
+  M.with_connection(state, result.connection, function(conn)
+    local adapter = adapter_for(conn)
+    if not adapter then
+      return fail("no adapter")
+    end
+    if state.running[cell_id] then
+      return fail("the cell is busy")
+    end
+    state.running[cell_id] = { started = util.now(), kind = "run", conn = conn, adapter = adapter }
+    if cell then
+      set_runtime(state, cell, "running")
+    end
+    ui_query().start_spinner(state)
+    local run_stmts = { { sql = sql, kind = stmt.kind, class = stmt.class, line = 1 } }
+    state.running[cell_id].job = adapter.run(
+      conn,
+      run_stmts,
+      { timeout_ms = config.get().query.timeout_ms },
+      function(res)
+        state.running[cell_id] = nil
+        if cell then
+          state.runtime[cell.id] = { status = res.ok and "ok" or "error" }
+        end
+        if not res.ok then
+          ui_query().render(state)
+          return fail("page: " .. tostring(res.error and res.error.message or "failed"))
+        end
+        local page = res.statements[1] and res.statements[1].sets[1]
+        local got = page and #page.rows or 0
+        for _, row in ipairs(page and page.rows or {}) do
+          set.rows[#set.rows + 1] = row
+        end
+        set.row_count = #set.rows
+        set.evicted = nil
+        st.more = got >= n
+        st.pages = (st.pages or 1) + 1
+        result.elapsed_ms = (result.elapsed_ms or 0) + (res.elapsed_ms or 0)
+        result.server_ms = (result.server_ms or 0) + (res.server_ms or 0)
+        local truncated = false
+        for _, other in ipairs(result.statements) do
+          truncated = truncated or other.more == true
+        end
+        result.truncated = truncated
+        if cell then
+          notebook.set_result(state.nb, cell, result)
+        else
+          notebook.set_result_memory(state.nb, { id = cell_id }, result)
+        end
+        ui_query().render(state)
+        if state.view.cell_id == cell_id then
+          ui_results().render(state)
+        end
+        require("dbgrid.ui.pins").refresh(state, cell_id)
+        util.notify(
+          got == 0 and "no more rows"
+            or string.format(
+              "%s more %s (%s so far)",
+              util.fmt_int(got),
+              got == 1 and "row" or "rows",
+              util.fmt_int(#set.rows)
+            )
+        )
+        if cb then
+          cb(result)
+        end
+      end
+    )
+  end)
+end
+
+---Cancel the query of a backend, or terminate its session (PostgreSQL).
+---@param state dbgrid.State
+---@param pid integer
+---@param action "cancel"|"terminate"
+---@param opts? { connection?: string }
+---@param cb fun(ok: boolean, message: string)
+function M.signal_backend(state, pid, action, opts, cb)
+  opts = opts or {}
+  M.with_connection(state, opts.connection, function(conn)
+    local adapter = adapter_for(conn)
+    if not adapter then
+      return cb(false, "no adapter")
+    end
+    if adapter.name ~= "postgres" then
+      return cb(false, "backend signals need PostgreSQL (" .. (adapter.dialect or adapter.name) .. " has none)")
+    end
+    local fn = action == "terminate" and "pg_terminate_backend" or "pg_cancel_backend"
+    local sql = string.format("select %s(%d)", fn, pid)
+    adapter.run(conn, { { sql = sql, kind = "select", class = "read", line = 1 } }, {}, function(res)
+      if not res.ok then
+        return cb(false, tostring(res.error and res.error.message or "failed"))
+      end
+      local set = res.statements[1] and res.statements[1].sets[1]
+      local v = set and set.rows[1] and set.rows[1][1]
+      if v == "t" or v == "true" then
+        cb(
+          true,
+          (action == "terminate" and "terminated the session of backend " or "cancelled the query of backend ") .. pid
+        )
+      else
+        cb(false, "no backend with pid " .. pid .. " (already gone?)")
+      end
+    end)
+  end)
 end
 
 ---Run one cell: dependencies first (when their result is stale), then the
@@ -620,6 +856,7 @@ function M.run_cell(state, cell, opts)
           class = st.class,
           line = st.line,
           limit_applied = applied and cfg.query.limit or nil,
+          unlimited = applied and st.sql or nil,
         }
       end
       dry_run = dry_run and has_write

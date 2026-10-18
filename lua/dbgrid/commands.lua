@@ -159,6 +159,72 @@ M.subcommands = {
     end
     require("dbgrid.runner").diff_on(s, cell, args[1])
   end,
+  pin = function()
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local cell_id = s.view and s.view.cell_id
+    if not cell_id then
+      local cell = current_cell(s)
+      cell_id = cell and cell.id
+    end
+    require("dbgrid.ui.pins").toggle(s, cell_id)
+  end,
+  follow = function(args)
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.results").follow(s, nil, { cell = args[1] == "cell" })
+    end
+  end,
+  more = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.results").load_more(s)
+    end
+  end,
+  edit = function()
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.results").edit_value(s)
+    end
+  end,
+  backend = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local action = args[1]
+    if action ~= nil and action ~= "cancel" and action ~= "terminate" then
+      return util.error("usage: :Dbgrid backend [cancel|terminate] [pid]")
+    end
+    require("dbgrid.ui.results").signal_backend(s, { action = action, pid = tonumber(args[2]) })
+  end,
+  columns = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local results = require("dbgrid.ui.results")
+    if args[1] == "hide" then
+      return results.hide_column(s, args[2])
+    elseif args[1] == "show" then
+      return results.show_columns(s, args[2] or "all")
+    end
+    results.show_columns(s)
+  end,
+  chart = function(args)
+    local s = current_or_warn()
+    if s then
+      require("dbgrid.ui.results").toggle_chart(s, #args > 0 and table.concat(args, " ") or nil)
+    end
+  end,
+  import = function(args)
+    if not args[1] then
+      return util.error("usage: :Dbgrid import <file> [table]")
+    end
+    require("dbgrid.import").run({ path = args[1], table = args[2], state = require("dbgrid.state").current() })
+  end,
   settings = function(args)
     if args[1] ~= "diff" then
       return util.error("usage: :Dbgrid settings diff <a> <b>")
@@ -647,6 +713,35 @@ function M.complete(arglead, cmdline)
     end
   elseif sub == "settings" then
     candidates = { "diff" }
+  elseif sub == "follow" then
+    candidates = { "cell" }
+  elseif sub == "backend" then
+    candidates = { "cancel", "terminate" }
+  elseif sub == "columns" then
+    if n == 2 then
+      candidates = { "hide", "show" }
+    else
+      local s = require("dbgrid.state").current()
+      local result = s and s.view.cell_id and require("dbgrid.notebook").result_of(s.nb, s.view.cell_id)
+      for _, st in ipairs(result and result.statements or {}) do
+        for _, set in ipairs(st.sets or {}) do
+          vim.list_extend(candidates, set.columns)
+        end
+      end
+      if words[3] == "show" then
+        table.insert(candidates, 1, "all")
+      end
+    end
+  elseif sub == "import" then
+    if n == 2 then
+      return vim.fn.getcompletion(arglead, "file")
+    end
+    local s = require("dbgrid.state").current()
+    local conn = s and s.nb.meta.connection and require("dbgrid.connections").get(s.nb.meta.connection)
+    local sch = conn and require("dbgrid.schema").loaded(conn)
+    for _, t in ipairs(sch and sch.tables or {}) do
+      candidates[#candidates + 1] = require("dbgrid.schema").display_name(t)
+    end
   elseif sub == "tag" then
     candidates = { "add", "remove" }
   elseif sub == "export" then

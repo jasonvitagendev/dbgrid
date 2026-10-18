@@ -296,11 +296,12 @@ function M.result_of(nb, cell_id)
   return r
 end
 
----Strip a result down to what is worth caching.
+---Strip a result down to what is worth keeping. Every row stays in memory
+---(pages loaded later append to them); the copy written to disk is capped at
+---`storage.cache_rows` by `for_disk`.
 ---@param result table
 ---@return table
 local function slim(result)
-  local max_rows = config.get().storage.cache_rows or 500
   local copy = {
     ok = result.ok,
     ran_at = result.ran_at,
@@ -316,18 +317,13 @@ local function slim(result)
     dry_run = result.dry_run,
     params = result.params,
     refs = result.refs,
+    title = result.title,
     statements = {},
   }
   for i, st in ipairs(result.statements or {}) do
     local sets = {}
     for j, set in ipairs(st.sets or {}) do
-      local rows = set.rows
-      local evicted = false
-      if #rows > max_rows then
-        rows = vim.list_slice(rows, 1, max_rows)
-        evicted = true
-      end
-      sets[j] = { columns = set.columns, rows = rows, row_count = set.row_count, evicted = evicted }
+      sets[j] = { columns = set.columns, rows = set.rows, row_count = set.row_count, evicted = set.evicted or nil }
     end
     copy.statements[i] = {
       sql = st.sql,
@@ -335,6 +331,9 @@ local function slim(result)
       class = st.class,
       line = st.line,
       limit_applied = st.limit_applied,
+      unlimited = st.unlimited,
+      more = st.more,
+      pages = st.pages,
       sets = sets,
       tags = st.tags,
       server_ms = st.server_ms,
@@ -345,13 +344,41 @@ local function slim(result)
   return copy
 end
 
+---The cache as written to disk: result sets capped at `storage.cache_rows`
+---rows (marked `evicted` so the footer can say so after a reload).
+---@param cache table<string, table>
+---@return table<string, table>
+local function for_disk(cache)
+  local max_rows = config.get().storage.cache_rows or 500
+  local out = {}
+  for id, r in pairs(cache) do
+    local copy = r
+    if r ~= vim.NIL and type(r) == "table" then
+      for i, st in ipairs(r.statements or {}) do
+        for j, set in ipairs(st.sets or {}) do
+          if #set.rows > max_rows then
+            if copy == r then
+              copy = vim.deepcopy(r)
+            end
+            local cs = copy.statements[i].sets[j]
+            cs.rows = vim.list_slice(set.rows, 1, max_rows)
+            cs.evicted = true
+          end
+        end
+      end
+    end
+    out[id] = copy
+  end
+  return out
+end
+
 ---@param nb dbgrid.Notebook
 local function schedule_cache_write(nb)
   local key = nb.cache_path
   if not cache_writers[key] then
     cache_writers[key] = util.debounce(500, function()
       if nb.cache and (config.get().storage.cache_rows or 0) > 0 then
-        pcall(util.write_json, nb.cache_path, nb.cache)
+        pcall(util.write_json, nb.cache_path, for_disk(nb.cache))
       end
     end)
   end

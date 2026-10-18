@@ -86,6 +86,13 @@ the cache, so moving between cells never re-runs anything.
   when there is one) to the agent with your question — "which of these is
   blocking?", "why is this slow?" — and shows the answer over the grid.
   Follow-ups keep the context.
+- **Act on a result.** `gf` on a value follows its foreign key (the row a
+  `user_id` points at, or the invoices that point back at a user's `id`);
+  `\e` turns the value under the cursor into an `UPDATE … WHERE pk = …` cell
+  to review and run; `\m` loads the next page when the added `LIMIT` was
+  hit; `\c` hides a column; `\g` draws the result as a bar chart (or
+  `-- @chart count by plan` keeps it one); `\x` on a `pid` row cancels or
+  terminates that backend; `:Dbgrid import file.csv [table]` loads a CSV.
 - **AWS RDS and Aurora.** A connection can be a profile plus a cluster: the
   plugin resolves the writer and reader endpoints, opens an SSM port forward
   through a bastion, fetches the password from Secrets Manager (or an IAM
@@ -420,6 +427,16 @@ sparkline of the numeric column under the cursor over the last `live.history`
 ticks. Live results stay in memory and are written to the cache when the loop
 stops.
 
+### Pinned results
+
+`\P` in the results pane (or `:Dbgrid pin`) pins the shown result in its own
+small window under the pane, so it stays visible while you move between cells
+and run other queries — the results pane keeps following you. A pin tracks
+its cell: re-running the cell (or a live tick) re-renders it, and the winbar
+shows the running state. Inside a pin, `<CR>`/`K` inspects a value, `\w`
+toggles truncation and `q` (or `\P` on the same cell again) unpins. Pins
+close with the notebook.
+
 Open a notebook file by hand (`:e`) and the plugin attaches too.
 
 ## Keymaps
@@ -474,7 +491,14 @@ Results pane:
 | `\s` | sort by the column under the cursor (asc → desc → off) |
 | `\f` | filter rows by text |
 | `\d` | diff against the previous run of the cell (toggle) |
+| `\P` | pin the shown result in its own window (toggle) |
 | `\h` | sparkline of the column under the cursor across live ticks |
+| `gf` / `gF` | follow the foreign key of the value (into the pane / into a new cell; `gF` on a followed result keeps it as a cell) |
+| `\m` | load the next page of rows (when the added `LIMIT` was hit) |
+| `\e` | edit the value: writes the `UPDATE` as a cell to review |
+| `\x` | cancel or terminate the backend on this row (`pid` column) |
+| `\c` / `\C` | hide the column under the cursor / show hidden columns |
+| `\g` | toggle the bar chart of the result |
 | `\yc` / `\yr` / `\ya` / `\yi` / `\yp` | yank value / row as JSON / result as CSV / row as INSERT / plan JSON |
 | `\k` | foreign-key relations of the table under the cursor (schema document) or of the table the cell reads |
 | `\a` | ask the agent about the query and the result (again for a follow-up) |
@@ -508,6 +532,12 @@ one confirmation. Subcommands (with completion):
 | `params [name value | clear]` | edit, set or forget parameter values |
 | `live [interval | stop]` | start / stop the live loop of the cell |
 | `diff [connection]` | diff against the previous run, or run the cell on another connection and diff |
+| `pin` | pin the shown result in its own window (toggle) |
+| `follow [cell]` / `more` / `edit` | follow the foreign key under the cursor / load the next page / write the UPDATE for the value |
+| `backend [cancel\|terminate] [pid]` | signal the backend of the row under the cursor (asks when no action is given) |
+| `columns [hide col \| show col\|all]` | hide or show columns of the shown result |
+| `chart [value [by label]]` | toggle the bar chart of the shown result |
+| `import <file> [table]` | load a CSV / TSV into a table (new table from the header when it does not exist) |
 | `schema diff [a] [b]` / `settings diff [a] [b]` | compare two connections |
 | `history` | pick a statement from the history (Enter: new cell, `<C-y>`: yank) |
 | `aws add|login|refresh|tunnels|status|events|bluegreen [connection]` | the AWS layer |
@@ -656,6 +686,49 @@ a look:
 
 Estimates that are off by 10× are also marked inline in the plan. SQLite has
 no `EXPLAIN ANALYZE`; `\E` shows its query plan instead.
+
+## Working with a result
+
+Everything here starts in the results pane, on the row and column under the
+cursor.
+
+- **Follow a foreign key (`gf`).** On `invoices.user_id = 42` the pane shows
+  `SELECT * FROM users WHERE id = 42`; on `users.id = 42` it shows the rows
+  that reference it (several referencing tables: a picker). Foreign keys from
+  the schema cache come first; without one, `user_id` → `users.id` and
+  `users.id` ← `*.user_id` are guessed by name (Rails schemas). The lookup is
+  not a cell: `]c` or a run brings the pane back, `gf` again follows further,
+  `gF` keeps it as a cell (and `gF` on an ordinary result follows into a new
+  cell straight away).
+- **Load the next page (`\m`).** When the added `LIMIT 500` was hit, `\m`
+  runs the statement again with `OFFSET 500` and appends the rows; the
+  footer counts the pages. Without an `ORDER BY` the pages may overlap.
+  Every row stays in memory; the disk cache keeps `storage.cache_rows`.
+- **Edit a value (`\e`).** The prompt is prefilled with the current value as
+  a SQL literal; what you type is used verbatim (`NULL`, `now()`, `'text'`).
+  The `UPDATE table SET col = … WHERE pk = …` lands in a new cell below the
+  current one, keyed by the table's primary key (which has to be in the
+  result), and nothing runs until you run it, with the usual confirmation.
+- **Backends (`\x`).** On a row of the diagnostics notebook (any column
+  ending in `pid`, or the row's `pid` / `blocking_pid` / `blocked_pid`),
+  choose between `pg_cancel_backend` and `pg_terminate_backend`; the cell
+  re-runs afterwards. `:Dbgrid backend cancel|terminate [pid]` does the same.
+- **Hide columns (`\c`, `\C`).** `\c` hides the column under the cursor,
+  `\C` brings one (or all) back; the choice is remembered per cell, the
+  winbar counts the hidden ones, and `\ya` yanks what is shown.
+- **Bar chart (`\g`).** The numeric column under the cursor (else the first
+  one) by the first text column, as horizontal bars with the values; sort
+  (`\s`) and filter (`\f`) first to chart a subset. `:Dbgrid chart count
+  by plan` names the columns; `-- @chart count by plan` in a cell shows the
+  chart every time the cell runs. `results.chart_width` fixes the bar width
+  (nil: the window's).
+- **Import a CSV.** `:Dbgrid import people.csv [table]` reads the header,
+  detects the delimiter (comma, tab, semicolon, pipe), checks that every
+  header column exists in the table, shows a summary and asks. Without a
+  table name a picker lists the tables, plus "new table" which creates one
+  from the header (every column `text`). PostgreSQL loads with psql's
+  `\copy` (the file stays local), SQLite with `.import`; a read-only
+  connection refuses. When a notebook is open, the table is shown afterwards.
 
 ## Prompt to SQL
 
@@ -864,7 +937,8 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   aws = { cli = "aws", endpoint_ttl_seconds = 86400, tunnel_ready_ms = 15000, probe_ms = 500, handshake_ms = 3000,
           login_cmd = { "aws", "sso", "login", "--profile", "{profile}" }, ssl = "require",
           bastion_names = { "bastion", "jump" } },
-  results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000 },
+  results = { max_col_width = 40, null_text = "NULL", newline = "↵", align_numbers = true, max_render_rows = 2000,
+              chart_width = nil },
   ai = { agent = "claude", agents = { ... }, max_tables = 40, max_result_rows = 100, timeout_ms = 180000, instructions = "", dialect = "PostgreSQL 18",
          analyze = { mode = "analyze", include_stats = true }, redact_literals = false, investigate = false },
   schema = { ttl_seconds = 3600, exclude = {}, relations_depth = 3 },
@@ -877,7 +951,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
 Highlight groups (`DbgridCellHeader`, `DbgridCellHeaderActive`, `DbgridNull`,
 `DbgridNumber`, `DbgridCurrentColumn`, `DbgridWarn`, `DbgridSchemaTable`,
 `DbgridSchemaIndex`, `DbgridFindingWarn`, `DbgridChanged`, `DbgridDiffAdd`,
-`DbgridDiffDelete`, `DbgridDiffChange`, `DbgridLive`, …) link to standard
+`DbgridDiffDelete`, `DbgridDiffChange`, `DbgridLive`, `DbgridChartBar`, …) link to standard
 groups and can be overridden.
 
 ## Other databases
@@ -936,8 +1010,8 @@ and agent features are tested against a fake `aws` CLI and a fake agent in
 
 ## Ideas not built yet
 
-- Pinned results
 - Result view in a floating window for one-off peeks from any buffer (`:Dbgrid run` on a visual selection)
+- Editing several values of a row at once (the record view as a form)
 - Column statistics popup (distinct count, min/max) on demand
 - Django awareness: read `settings.py` for connections
 - Adapters for MySQL (`mysql`), DuckDB

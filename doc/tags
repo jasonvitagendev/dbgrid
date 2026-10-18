@@ -1,5 +1,6 @@
 :Dbgrid	dbgrid.txt	/*:Dbgrid*
 dbgrid	dbgrid.txt	/*dbgrid*
+dbgrid-actions	dbgrid.txt	/*dbgrid-actions*
 dbgrid-adapters	dbgrid.txt	/*dbgrid-adapters*
 dbgrid-ai	dbgrid.txt	/*dbgrid-ai*
 dbgrid-analyze	dbgrid.txt	/*dbgrid-analyze*

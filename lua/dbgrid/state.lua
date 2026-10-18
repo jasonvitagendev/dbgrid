@@ -14,6 +14,7 @@ local M = {}
 ---@field view table              results view state
 ---@field live table<string, table>      live (`@every`) cells: timer, interval, ticks, history, changed
 ---@field previous table<string, table>  result before the last run, per cell (for the diff view)
+---@field pins table<string, table>      pinned results, per cell: buf, win, view, label
 
 M.by_buf = {} ---@type table<integer, dbgrid.State>
 
@@ -32,7 +33,7 @@ function M.attach(buf, nb)
     s.nb = nb
     return s
   end
-  s = { buf = buf, nb = nb, running = {}, runtime = {}, view = {}, live = {}, previous = {} }
+  s = { buf = buf, nb = nb, running = {}, runtime = {}, view = {}, live = {}, previous = {}, pins = {} }
   M.by_buf[buf] = s
   return s
 end
@@ -49,6 +50,19 @@ function M.by_results_buf(results_buf)
   for _, s in pairs(M.by_buf) do
     if s.results_buf == results_buf then
       return s
+    end
+  end
+end
+
+---State and pin entry owning a pinned-results buffer.
+---@param pin_buf integer
+---@return dbgrid.State?, table?, string?
+function M.pin_of(pin_buf)
+  for _, s in pairs(M.by_buf) do
+    for cell_id, pin in pairs(s.pins or {}) do
+      if pin.buf == pin_buf then
+        return s, pin, cell_id
+      end
     end
   end
 end

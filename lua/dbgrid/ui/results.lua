@@ -32,6 +32,37 @@ local function current_result(s)
   return notebook.result_of(s.nb, s.view.cell_id)
 end
 
+---A keymap as shown to the user (`\m`, `Enter`).
+---@param v string|string[]|false|nil
+---@return string
+local function key_label(v)
+  if type(v) == "table" then
+    v = v[1]
+  end
+  return (tostring(v or ""):gsub("<localleader>", vim.g.maplocalleader or "\\"):gsub("<CR>", "Enter"))
+end
+
+---Indexes of the columns of a set that the view shows (hidden ones left out;
+---never none: hiding the last column shows every column again).
+---@param view table
+---@param entry { set: dbgrid.ResultSet, stmt_index: integer }
+---@return integer[]
+function M.visible_columns(view, entry)
+  local hidden = view.hidden and view.hidden[entry.stmt_index]
+  local out = {}
+  for j, name in ipairs(entry.set.columns) do
+    if not (hidden and hidden[name:lower()]) then
+      out[#out + 1] = j
+    end
+  end
+  if #out == 0 then
+    for j = 1, #entry.set.columns do
+      out[j] = j
+    end
+  end
+  return out
+end
+
 ---Flatten the result sets of a result.
 ---@param result table
 ---@return { set: dbgrid.ResultSet, stmt: dbgrid.StatementResult, stmt_index: integer }[]
@@ -61,10 +92,11 @@ end
 ---Rows of a set after the view's filter and sort.
 ---@param s dbgrid.State
 ---@param entry { set: dbgrid.ResultSet, stmt: dbgrid.StatementResult, stmt_index: integer }
+---@param view? table   defaults to the results pane view (pins pass their own)
 ---@return any[][]
-function M.display_rows(s, entry)
+function M.display_rows(s, entry, view)
   local rows = entry.set.rows
-  local view = s.view
+  view = view or s.view
   if view.filter and view.filter ~= "" then
     local needle = view.filter:lower()
     local kept = {}
@@ -126,51 +158,54 @@ end
 ---Build one set as grid lines.
 ---@param s dbgrid.State
 ---@param entry table
----@param ctx { lines: string[], line_hl: table, rows_layout: table, header_layout: table }
+---@param ctx { lines: string[], line_hl: table, rows_layout: table, header_layout: table, view: table, ... }
 local function render_set(s, entry, ctx)
   local cfg = config.get().results
   local set = entry.set
-  local columns = set.columns
-  local rows = M.display_rows(s, entry)
-  local truncate = s.view.truncate ~= false
+  local rows = M.display_rows(s, entry, ctx.view)
+  local truncate = ctx.view.truncate ~= false
+  -- the columns shown, as positions in the set (hidden ones left out)
+  local cols = M.visible_columns(ctx.view, entry)
+  local columns = {}
+  for k, j in ipairs(cols) do
+    columns[k] = set.columns[j]
+  end
   local ncols = #columns
   -- formatted values, numeric / bool detection, widths
   local widths, numeric, boolean = {}, {}, {}
-  for j = 1, ncols do
-    widths[j] = util.width(columns[j])
-    numeric[j] = #rows > 0
-    boolean[j] = #rows > 0
+  for k = 1, ncols do
+    widths[k] = util.width(columns[k])
+    numeric[k] = #rows > 0
+    boolean[k] = #rows > 0
   end
   local formatted = {}
   for i, row in ipairs(rows) do
     local frow = {}
-    for j = 1, ncols do
-      local v = row[j]
+    for k = 1, ncols do
+      local v = row[cols[k]]
       local text
       if v == vim.NIL or v == nil then
         text = cfg.null_text
-        if numeric[j] and (i == #rows) and not frow.seen_value then
-          -- all nulls so far; keep flags, decided below
-        end
       else
         text = tostring(v):gsub("\r?\n", cfg.newline):gsub("\t", "  ")
         if not is_number(v) then
-          numeric[j] = false
+          numeric[k] = false
         end
         if not BOOL[v] then
-          boolean[j] = false
+          boolean[k] = false
         end
       end
-      frow[j] = text
+      frow[k] = text
       local w = util.width(text)
-      if w > widths[j] then
-        widths[j] = w
+      if w > widths[k] then
+        widths[k] = w
       end
     end
     formatted[i] = frow
   end
   -- a column that is entirely NULL is neither numeric nor boolean
-  for j = 1, ncols do
+  for k = 1, ncols do
+    local j = cols[k]
     local any = false
     for _, row in ipairs(rows) do
       if row[j] ~= vim.NIL and row[j] ~= nil then
@@ -179,10 +214,10 @@ local function render_set(s, entry, ctx)
       end
     end
     if not any then
-      numeric[j], boolean[j] = false, false
+      numeric[k], boolean[k] = false, false
     end
-    if truncate and widths[j] > cfg.max_col_width then
-      widths[j] = cfg.max_col_width
+    if truncate and widths[k] > cfg.max_col_width then
+      widths[k] = cfg.max_col_width
     end
   end
   local align_right = cfg.align_numbers
@@ -223,7 +258,7 @@ local function render_set(s, entry, ctx)
   end)
   lines[#lines + 1] = header
   line_hl[#lines] = hhls
-  ctx.header_layout[#lines] = { entry = entry, starts = hstarts, ends = hends }
+  ctx.header_layout[#lines] = { entry = entry, starts = hstarts, ends = hends, cols = cols }
   -- rule
   local rule = {}
   for j = 1, ncols do
@@ -233,27 +268,28 @@ local function render_set(s, entry, ctx)
   lines[#lines + 1] = rule_line
   line_hl[#lines] = { { 0, #rule_line, "DbgridRule" } }
   -- rows
-  local live = s.live and s.view.cell_id and s.live[s.view.cell_id]
+  local live = s.live and ctx.cell_id and s.live[ctx.cell_id]
   local changed = live and live.changed or nil
   for i, frow in ipairs(formatted) do
     local raw = rows[i]
     local row_changed = changed and changed[raw] or nil
-    local line, starts, ends, hls = build(frow, function(j)
+    local line, starts, ends, hls = build(frow, function(k)
+      local j = cols[k]
       if row_changed and (row_changed[j] or row_changed[0]) then
         return "DbgridChanged"
       end
       local v = raw[j]
       if v == vim.NIL or v == nil then
         return "DbgridNull"
-      elseif numeric[j] then
+      elseif numeric[k] then
         return "DbgridNumber"
-      elseif boolean[j] then
+      elseif boolean[k] then
         return "DbgridBool"
       end
     end)
     lines[#lines + 1] = line
     line_hl[#lines] = hls
-    ctx.rows_layout[#lines] = { entry = entry, row = raw, row_index = i, starts = starts, ends = ends }
+    ctx.rows_layout[#lines] = { entry = entry, row = raw, row_index = i, starts = starts, ends = ends, cols = cols }
   end
   if #rows == 0 then
     lines[#lines + 1] = " (no rows)"
@@ -320,11 +356,12 @@ local function render_footer(s, result, ctx)
     end
   end
   local total = 0
-  local limit
+  local limit, pages
   local evicted = false
   for _, st in ipairs(result.statements or {}) do
     if st.limit_applied then
       limit = st.limit_applied
+      pages = math.max(pages or 1, st.pages or 1)
     end
     for _, set in ipairs(st.sets or {}) do
       total = total + (set.row_count or #set.rows)
@@ -338,7 +375,7 @@ local function render_footer(s, result, ctx)
   parts[#parts + 1] = util.fmt_ms(result.elapsed_ms or 0)
     .. (result.server_ms and result.server_ms > 0 and (" (server " .. util.fmt_ms(result.server_ms) .. ")") or "")
   if limit then
-    parts[#parts + 1] = "LIMIT " .. limit .. " added"
+    parts[#parts + 1] = "LIMIT " .. limit .. ((pages or 1) > 1 and (" · " .. pages .. " pages") or " added")
   end
   if result.ran_at then
     parts[#parts + 1] = os.date("%H:%M:%S", result.ran_at) .. " · " .. util.ago(result.ran_at)
@@ -349,7 +386,7 @@ local function render_footer(s, result, ctx)
   if result.dry_run then
     parts[#parts + 1] = "dry run, rolled back"
   end
-  local live = s.live and s.view.cell_id and s.live[s.view.cell_id]
+  local live = s.live and ctx.cell_id and s.live[ctx.cell_id]
   if live then
     parts[#parts + 1] = string.format(
       "%s live every %s · tick %d%s",
@@ -381,14 +418,17 @@ local function render_footer(s, result, ctx)
     add(" inlines " .. table.concat(util.uniq(names), ", "), "DbgridFooter")
   end
   if result.truncated then
+    local more = key_label(config.get().keymaps.results.more)
     add(
       " "
         .. icons.warn
         .. " only the first "
-        .. limit
+        .. util.fmt_int(total)
         .. " rows were fetched (LIMIT "
-        .. limit
-        .. " was added); write your own LIMIT to change it",
+        .. tostring(limit)
+        .. " was added); "
+        .. (more ~= "" and (more .. " loads " .. tostring(limit) .. " more, or ") or "")
+        .. "write your own LIMIT",
       "DbgridWarn"
     )
   end
@@ -411,12 +451,7 @@ local function render_placeholder(s, cell, ctx)
   local cfg = config.get()
   local icons = cfg.icons
   local k = cfg.keymaps.query
-  local function key(v)
-    if type(v) == "table" then
-      v = v[1]
-    end
-    return (tostring(v or ""):gsub("<localleader>", vim.g.maplocalleader or "\\"):gsub("<CR>", "Enter"))
-  end
+  local key = key_label
   local lines, line_hl = ctx.lines, ctx.line_hl
   local function add(text, hl)
     lines[#lines + 1] = text
@@ -506,6 +541,60 @@ local function render_record(s, result, ctx)
       end
       line_hl[#lines] = hls
       ctx.rows_layout[#lines] = { entry = entry, row = row, row_index = idx, col = j, record = true }
+    end
+  end
+end
+
+---Bar chart of the set and columns in `s.view.chart`.
+---@param s dbgrid.State
+---@param result table
+---@param ctx table
+local function render_chart(s, result, ctx)
+  local chart = require("dbgrid.ui.chart")
+  local lines, line_hl = ctx.lines, ctx.line_hl
+  local sets = all_sets(result)
+  local spec = s.view.chart or {}
+  local entry = sets[1]
+  for _, e in ipairs(sets) do
+    if e.stmt_index == spec.set then
+      entry = e
+    end
+  end
+  if not entry then
+    lines[#lines + 1] = " (no rows to chart)"
+    line_hl[#lines] = { { 0, #lines[#lines], "DbgridStatusDim" } }
+    return
+  end
+  local rows = M.display_rows(s, entry)
+  local value, label = spec.value, spec.label
+  if not value or not entry.set.columns[value] then
+    value, label = chart.pick_columns(entry.set.columns, rows)
+    spec.value, spec.label = value, label
+  end
+  if not value then
+    lines[#lines + 1] = " no numeric column to chart"
+    line_hl[#lines] = { { 0, #lines[#lines], "DbgridStatusDim" } }
+    return
+  end
+  local width = config.get().results.chart_width
+  if not width then
+    local win = s.results_win
+    width = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_width(win) or 80
+  end
+  local out, hls, row_at = chart.lines({
+    columns = entry.set.columns,
+    rows = rows,
+    value = value,
+    label = label,
+    width = width,
+  })
+  local base = #lines
+  for i, l in ipairs(out) do
+    lines[#lines + 1] = l
+    line_hl[#lines] = hls[i]
+    local ri = row_at[i]
+    if ri then
+      ctx.rows_layout[base + i] = { entry = entry, row = rows[ri], row_index = ri, col = value, record = true }
     end
   end
 end
@@ -1242,11 +1331,79 @@ function M.show(s, cell_id, opts)
   local remembered = s.runtime[cell_id] and s.runtime[cell_id].view_mode
   local mode = opts.view or (same and s.view.mode) or (not opts.ran and remembered) or "grid"
   if not same then
-    s.view = { truncate = s.view.truncate }
+    s.view = { truncate = s.view.truncate, hidden = s.hidden_columns and s.hidden_columns[cell_id] or nil }
+  end
+  if opts.ran and not opts.view then
+    -- `-- @chart [value [by label]]`: the cell wants its result drawn
+    local cell = cells.by_id(s.buf, cell_id)
+    local spec = cell and cells.directives(cell).chart
+    local result = notebook.result_of(s.nb, cell_id)
+    local entry = result and all_sets(result)[1]
+    if spec and entry and result.ok then
+      local value, label = require("dbgrid.ui.chart").from_directive(spec, entry.set.columns, entry.set.rows)
+      if value then
+        s.view.chart = { set = 1, value = value, label = label }
+        mode = "chart"
+      end
+    end
   end
   s.view.cell_id = cell_id
   s.view.mode = mode
   M.render(s, not same)
+end
+
+---Show a result that belongs to no cell (a followed foreign key, a peek
+---after an import) in the results pane under a pseudo cell id.
+---@param s dbgrid.State
+---@param id string
+---@param result table   with `title`
+function M.show_result(s, id, result)
+  require("dbgrid.ui.layout").ensure_results(s)
+  notebook.set_result_memory(s.nb, { id = id }, result)
+  s.view = { truncate = s.view.truncate, cell_id = id, mode = "grid" }
+  M.render(s, true)
+end
+
+---Grid document of a result: notices, one grid per set, statement tags and
+---the footer. `ctx.view` drives filter/sort/truncate, `ctx.cell_id` the live
+---indicator — the results pane and pinned windows share this.
+---@param s dbgrid.State
+---@param result table
+---@param ctx { lines: string[], line_hl: table, rows_layout: table, header_layout: table, view: table, ... }
+function M.render_grid(s, result, ctx)
+  render_notices(result, ctx)
+  local sets = all_sets(result)
+  for _, entry in ipairs(sets) do
+    if #sets > 1 then
+      local title =
+        string.format(" %s statement %d · %s", config.get().icons.cell, entry.stmt_index, entry.stmt.kind:upper())
+      ctx.lines[#ctx.lines + 1] = title
+      ctx.line_hl[#ctx.lines] = { { 0, #title, "DbgridSetTitle" } }
+    end
+    render_set(s, entry, ctx)
+    ctx.lines[#ctx.lines + 1] = ""
+  end
+  for _, st in ipairs(result.statements or {}) do
+    if #(st.sets or {}) == 0 then
+      for _, tag in ipairs(st.tags or {}) do
+        ctx.lines[#ctx.lines + 1] = " " .. tag
+        ctx.line_hl[#ctx.lines] = { { 0, #tag + 1, "DbgridTag" } }
+      end
+    end
+  end
+  if #sets == 0 and not result.error then
+    local any_tag = false
+    for _, st in ipairs(result.statements or {}) do
+      if #(st.tags or {}) > 0 then
+        any_tag = true
+      end
+    end
+    if not any_tag then
+      ctx.lines[#ctx.lines + 1] = " (no rows)"
+      ctx.line_hl[#ctx.lines] = { { 0, 10, "DbgridStatusDim" } }
+    end
+  end
+  render_footer(s, result, ctx)
 end
 
 ---Re-render the results buffer from the view state.
@@ -1259,7 +1416,8 @@ function M.render(s, reset_cursor)
   end
   local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id) or nil
   local result = current_result(s)
-  local ctx = { lines = {}, line_hl = {}, rows_layout = {}, header_layout = {} }
+  local ctx =
+    { lines = {}, line_hl = {}, rows_layout = {}, header_layout = {}, view = s.view, cell_id = s.view.cell_id }
   local mode = s.view.mode or "grid"
   -- remember grid/plan per cell; schema is global, and the diff/record
   -- payloads live in s.view, which a cell switch drops
@@ -1282,40 +1440,12 @@ function M.render(s, reset_cursor)
     render_notices(result, ctx)
     render_record(s, result, ctx)
     render_footer(s, result, ctx)
-  else
+  elseif mode == "chart" then
     render_notices(result, ctx)
-    local sets = all_sets(result)
-    for _, entry in ipairs(sets) do
-      if #sets > 1 then
-        local title =
-          string.format(" %s statement %d · %s", config.get().icons.cell, entry.stmt_index, entry.stmt.kind:upper())
-        ctx.lines[#ctx.lines + 1] = title
-        ctx.line_hl[#ctx.lines] = { { 0, #title, "DbgridSetTitle" } }
-      end
-      render_set(s, entry, ctx)
-      ctx.lines[#ctx.lines + 1] = ""
-    end
-    for _, st in ipairs(result.statements or {}) do
-      if #(st.sets or {}) == 0 then
-        for _, tag in ipairs(st.tags or {}) do
-          ctx.lines[#ctx.lines + 1] = " " .. tag
-          ctx.line_hl[#ctx.lines] = { { 0, #tag + 1, "DbgridTag" } }
-        end
-      end
-    end
-    if #sets == 0 and not result.error then
-      local any_tag = false
-      for _, st in ipairs(result.statements or {}) do
-        if #(st.tags or {}) > 0 then
-          any_tag = true
-        end
-      end
-      if not any_tag then
-        ctx.lines[#ctx.lines + 1] = " (no rows)"
-        ctx.line_hl[#ctx.lines] = { { 0, 10, "DbgridStatusDim" } }
-      end
-    end
+    render_chart(s, result, ctx)
     render_footer(s, result, ctx)
+  else
+    M.render_grid(s, result, ctx)
   end
   if #ctx.lines == 0 then
     ctx.lines = { "" }
@@ -1359,6 +1489,39 @@ function M.render(s, reset_cursor)
   M.update_cursor_column(s)
 end
 
+---The grid cell at a cursor position in a rendered view (results pane or pin).
+---@param view table   view carrying rows_layout
+---@param pos integer[]  { line, col } as from nvim_win_get_cursor
+---@return { entry: table, row: any[], row_index: integer, col: integer, column: string, value: any, record?: boolean }?
+function M.cell_at(view, pos)
+  local layout = (view.rows_layout or {})[pos[1]]
+  if not layout then
+    return nil
+  end
+  local col, vcol
+  if layout.record then
+    col = layout.col
+  else
+    vcol = 1
+    for k, st in ipairs(layout.starts) do
+      if pos[2] >= st then
+        vcol = k
+      end
+    end
+    col = layout.cols and layout.cols[vcol] or vcol
+  end
+  return {
+    entry = layout.entry,
+    row = layout.row,
+    row_index = layout.row_index,
+    col = col,
+    vcol = vcol,
+    column = layout.entry.set.columns[col],
+    value = layout.row[col],
+    record = layout.record,
+  }
+end
+
 ---The grid cell under the cursor of the results window.
 ---@param s dbgrid.State
 ---@return { entry: table, row: any[], row_index: integer, col: integer, column: string, value: any, record?: boolean }?
@@ -1367,38 +1530,14 @@ function M.cell_at_cursor(s)
   if not win or not vim.api.nvim_win_is_valid(win) then
     return nil
   end
-  local pos = vim.api.nvim_win_get_cursor(win)
-  local layout = (s.view.rows_layout or {})[pos[1]]
-  if not layout then
-    return nil
-  end
-  local col
-  if layout.record then
-    col = layout.col
-  else
-    col = 1
-    for j, st in ipairs(layout.starts) do
-      if pos[2] >= st then
-        col = j
-      end
-    end
-  end
-  return {
-    entry = layout.entry,
-    row = layout.row,
-    row_index = layout.row_index,
-    col = col,
-    column = layout.entry.set.columns[col],
-    value = layout.row[col],
-    record = layout.record,
-  }
+  return M.cell_at(s.view, vim.api.nvim_win_get_cursor(win))
 end
 
 ---Remember the cursor column for the column highlight.
 ---@param s dbgrid.State
 function M.update_cursor_column(s)
   local c = M.cell_at_cursor(s)
-  local new = c and not c.record and c.col or nil
+  local new = c and not c.record and c.vcol or nil
   if new ~= s.view.cursor_col then
     s.view.cursor_col = new
     if s.results_win and vim.api.nvim_win_is_valid(s.results_win) then
@@ -1429,10 +1568,37 @@ function M.winbar(s)
       .. "│ <CR> fold · K describe · / search · Tab next table"
   end
   local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id)
-  if not cell then
-    return "%#DbgridWinbarDim# results"
-  end
   local parts = {}
+  if not cell then
+    -- a result that belongs to no cell: a followed key, an import peek
+    local result = current_result(s)
+    if not result then
+      return "%#DbgridWinbarDim# results"
+    end
+    parts[#parts + 1] = "%#DbgridWinbarTitle# " .. esc(icons.follow) .. " " .. esc(result.title or "result") .. " "
+    parts[#parts + 1] = "%#DbgridWinbarDim#│"
+    local running = s.running[s.view.cell_id]
+    if running then
+      parts[#parts + 1] = "%#DbgridWinbarWarn# " .. esc(icons.running) .. " running "
+    elseif result.ok then
+      local n = 0
+      for _, e in ipairs(all_sets(result)) do
+        n = n + (e.set.row_count or #e.set.rows)
+      end
+      parts[#parts + 1] = "%#DbgridWinbarOk# " .. esc(icons.ok) .. " "
+      parts[#parts + 1] = "%#DbgridWinbarDim#"
+        .. util.fmt_int(n)
+        .. " rows · "
+        .. util.fmt_ms(result.elapsed_ms or 0)
+        .. " "
+    else
+      parts[#parts + 1] = "%#DbgridWinbarError# " .. esc(icons.error) .. " error "
+    end
+    parts[#parts + 1] = "%#DbgridWinbarDim#│ not a cell · "
+      .. esc(key_label(config.get().keymaps.results.follow_cell))
+      .. " keeps it"
+    return table.concat(parts)
+  end
   parts[#parts + 1] = "%#DbgridWinbarTitle# "
     .. esc(icons.cell)
     .. " q"
@@ -1482,19 +1648,21 @@ function M.winbar(s)
   if s.view.truncate == false then
     parts[#parts + 1] = " · full width"
   end
+  local hidden = 0
+  for _, names in pairs(s.view.hidden or {}) do
+    for _ in pairs(names) do
+      hidden = hidden + 1
+    end
+  end
+  if hidden > 0 then
+    parts[#parts + 1] = " · " .. hidden .. (hidden == 1 and " column hidden" or " columns hidden")
+  end
   return table.concat(parts)
 end
 
----Show the full value under the cursor in a float.
----@param s dbgrid.State
-function M.inspect(s, key)
-  if M.schema_action(s, key == "K" and "describe" or "toggle") then
-    return
-  end
-  local c = M.cell_at_cursor(s)
-  if not c then
-    return
-  end
+---Show the full value of a grid cell in a float.
+---@param c table  a cell_at() result
+function M.inspect_value(c)
   local text = raw_text(c.value)
   local ft = "text"
   if c.value ~= vim.NIL and util.looks_json(text) then
@@ -1517,6 +1685,19 @@ function M.inspect(s, key)
     local fbuf = vim.api.nvim_win_get_buf(win)
     vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = fbuf, nowait = true })
   end
+end
+
+---Show the full value under the cursor in a float.
+---@param s dbgrid.State
+function M.inspect(s, key)
+  if M.schema_action(s, key == "K" and "describe" or "toggle") then
+    return
+  end
+  local c = M.cell_at_cursor(s)
+  if not c then
+    return
+  end
+  M.inspect_value(c)
 end
 
 ---@param s dbgrid.State
@@ -1625,12 +1806,17 @@ function M.yank_csv(s)
   if not entry then
     return
   end
-  local out = { table.concat(vim.tbl_map(util.csv_escape, entry.set.columns), ",") }
+  local cols = M.visible_columns(s.view, entry)
+  local names = {}
+  for k, j in ipairs(cols) do
+    names[k] = util.csv_escape(entry.set.columns[j])
+  end
+  local out = { table.concat(names, ",") }
   for _, row in ipairs(M.display_rows(s, entry)) do
     local vals = {}
-    for j = 1, #entry.set.columns do
+    for k, j in ipairs(cols) do
       local v = row[j]
-      vals[j] = (v == vim.NIL or v == nil) and "" or util.csv_escape(tostring(v))
+      vals[k] = (v == vim.NIL or v == nil) and "" or util.csv_escape(tostring(v))
     end
     out[#out + 1] = table.concat(vals, ",")
   end
@@ -1686,35 +1872,463 @@ function M.move_column(s, delta)
   vim.api.nvim_win_set_cursor(win, { pos[1], layout.starts[target] })
 end
 
+---Connection and schema for actions on the shown result: the connection the
+---result came from (so a followed key reads the same server), its schema loaded.
+---@param s dbgrid.State
+---@param cb fun(conn: dbgrid.Connection, sch: dbgrid.SchemaData)
+local function with_schema(s, cb)
+  local result = current_result(s)
+  require("dbgrid.runner").with_connection(s, result and result.connection or nil, function(conn)
+    require("dbgrid.schema").get(conn, function(sch, err)
+      if not sch then
+        return util.error("schema: " .. tostring(err))
+      end
+      cb(conn, sch)
+    end)
+  end)
+end
+
+---Insert a cell below the shown one (at the end when the result belongs to
+---no cell) with the given body, and put the cursor on it in the query pane.
+---@param s dbgrid.State
+---@param title string
+---@param body string[]
+---@return string id
+local function insert_cell(s, title, body)
+  local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id)
+  local id, lnum = cells.insert(s.buf, cell and "below" or "end", cell, title)
+  vim.api.nvim_buf_set_lines(s.buf, lnum, lnum + 1, false, body)
+  vim.b[s.buf].dbgrid_cells_cache = nil
+  local query = require("dbgrid.ui.query")
+  query.render(s)
+  if s.query_win and vim.api.nvim_win_is_valid(s.query_win) then
+    pcall(vim.api.nvim_win_set_cursor, s.query_win, { lnum + 1, 0 })
+  end
+  return id
+end
+
+---Follow the foreign key of the value under the cursor (`gf`): show the row
+---it points at, or the rows pointing back at it, in the results pane. With
+---`opts.cell` the lookup becomes a cell of the notebook and runs as one.
+---@param s dbgrid.State
+---@param c? table   a cell_at() result (the cursor's when nil)
+---@param opts? { cell?: boolean }
+function M.follow(s, c, opts)
+  opts = opts or {}
+  c = c or M.cell_at_cursor(s)
+  if not c then
+    return util.notify("put the cursor on a value first")
+  end
+  with_schema(s, function(conn, sch)
+    local follow = require("dbgrid.follow")
+    local targets, reason = follow.targets(sch, c.entry.stmt.sql or "", c.entry.set.columns, c.row, c.col)
+    if #targets == 0 then
+      return util.notify(reason or ("nothing to follow from " .. tostring(c.column)))
+    end
+    local function go(t)
+      local title = t.direction .. " " .. require("dbgrid.schema").display_name(t.table)
+      if opts.cell then
+        local id = insert_cell(s, title, util.lines(t.sql))
+        local cell = cells.by_id(s.buf, id)
+        if cell then
+          require("dbgrid.runner").run_cell(s, cell)
+        end
+        return
+      end
+      require("dbgrid.runner").run_sql(
+        s,
+        t.sql,
+        { connection = conn.name, id = "__follow", title = t.label },
+        function(result, err)
+          if not result then
+            return util.error("follow: " .. tostring(err))
+          end
+          M.show_result(s, "__follow", result)
+          if not result.ok then
+            util.error("follow: " .. tostring(err))
+          end
+        end
+      )
+    end
+    if #targets == 1 then
+      return go(targets[1])
+    end
+    require("dbgrid.ui.picker").pick(
+      vim.tbl_map(function(t)
+        return {
+          text = t.label .. (t.via == "name" and "  (by name)" or ""),
+          data = t,
+          preview = util.lines(t.sql),
+          preview_ft = "sql",
+        }
+      end, targets),
+      {
+        prompt = "Follow " .. tostring(c.column),
+        on_select = function(item)
+          if item then
+            go(item.data)
+          end
+        end,
+      }
+    )
+  end)
+end
+
+---Turn the result shown under a pseudo id (a followed key) into a cell.
+---@param s dbgrid.State
+function M.keep_result(s)
+  local result = current_result(s)
+  local st = result and result.statements and result.statements[1]
+  if not st or cells.by_id(s.buf, s.view.cell_id or "") then
+    return false
+  end
+  local sql = st.unlimited or st.sql
+  local id = insert_cell(s, result.title or "kept result", util.lines(sql))
+  local copy = vim.deepcopy(result)
+  copy.title = nil
+  local cell = cells.by_id(s.buf, id)
+  if cell then
+    copy.sql_hash = cells.hash(cell)
+    notebook.set_result(s.nb, cell, copy)
+    require("dbgrid.ui.query").render(s)
+    M.show(s, id)
+  end
+  util.notify("kept as cell " .. id)
+  return true
+end
+
+---Fetch the next page of the shown result (`\m`).
+---@param s dbgrid.State
+function M.load_more(s)
+  local id = s.view.cell_id
+  if not id or not current_result(s) then
+    return util.notify("no result shown")
+  end
+  local c = M.cell_at_cursor(s)
+  require("dbgrid.runner").load_more(s, id, c and c.entry.stmt_index or nil)
+end
+
+---Edit the value under the cursor: writes the UPDATE for it as a new cell
+---to review and run (`\e`).
+---@param s dbgrid.State
+function M.edit_value(s)
+  local c = M.cell_at_cursor(s)
+  if not c then
+    return util.notify("put the cursor on a value first")
+  end
+  with_schema(s, function(_, sch)
+    local follow = require("dbgrid.follow")
+    local sql = c.entry.stmt.sql or ""
+    local probe, err = follow.update_sql(sch, sql, c.entry.set.columns, c.row, c.col, "NULL")
+    if not probe then
+      return util.notify(err or "cannot build an UPDATE for this value")
+    end
+    vim.ui.input({
+      prompt = "SET " .. tostring(c.column) .. " = ",
+      default = follow.literal_default(c.value),
+      completion = nil,
+    }, function(expr)
+      if expr == nil or util.trim(expr) == "" then
+        return
+      end
+      local text, uerr, tbl = follow.update_sql(sch, sql, c.entry.set.columns, c.row, c.col, util.trim(expr))
+      if not text then
+        return util.notify(uerr or "cannot build an UPDATE for this value")
+      end
+      local title = "update " .. require("dbgrid.schema").display_name(tbl)
+      local id = insert_cell(s, title, util.lines(text))
+      require("dbgrid.ui.layout").focus_query(s)
+      util.notify("UPDATE written as cell " .. id .. ": review it and run it")
+    end)
+  end)
+end
+
+local PID_COLUMNS = { "pid", "blocking_pid", "blocked_pid", "procpid" }
+
+---Cancel the query of the backend on the row under the cursor, or terminate
+---its session (`\x`). The pid comes from the column under the cursor when its
+---name ends in `pid`, else from the first pid-like column of the row.
+---@param s dbgrid.State
+---@param opts? { action?: "cancel"|"terminate", pid?: integer }
+function M.signal_backend(s, opts)
+  opts = opts or {}
+  local c = M.cell_at_cursor(s)
+  local pid, pid_col = opts.pid, nil
+  if not pid then
+    if not c then
+      return util.notify("put the cursor on a row with a pid column first")
+    end
+    local columns = c.entry.set.columns
+    if c.column and c.column:lower():match("pid$") then
+      pid_col = c.col
+    else
+      for _, name in ipairs(PID_COLUMNS) do
+        for j, col in ipairs(columns) do
+          if col:lower() == name then
+            pid_col = j
+            break
+          end
+        end
+        if pid_col then
+          break
+        end
+      end
+    end
+    if not pid_col then
+      return util.notify("this result has no pid column")
+    end
+    pid = tonumber(c.row[pid_col])
+    if not pid then
+      return util.notify("no pid on this row")
+    end
+  end
+  local function describe()
+    if not c then
+      return ""
+    end
+    local parts = {}
+    local want = {
+      usename = true,
+      user = true,
+      state = true,
+      query = true,
+      blocked_query = true,
+      blocking_query = true,
+      last_query = true,
+      application_name = true,
+    }
+    for j, col in ipairs(c.entry.set.columns) do
+      local v = c.row[j]
+      if want[col:lower()] and v ~= vim.NIL and v ~= nil and tostring(v) ~= "" then
+        parts[#parts + 1] = col .. ": " .. util.truncate(tostring(v):gsub("%s+", " "), 70)
+      end
+    end
+    return #parts > 0 and ("\n" .. table.concat(parts, "\n")) or ""
+  end
+  local function run(action)
+    local result = current_result(s)
+    require("dbgrid.runner").signal_backend(
+      s,
+      pid,
+      action,
+      { connection = result and result.connection },
+      function(ok, message)
+        if ok then
+          util.notify(message)
+        else
+          util.warn(message)
+        end
+        local cell = s.view.cell_id and cells.by_id(s.buf, s.view.cell_id)
+        if ok and cell then
+          require("dbgrid.runner").run_cell(s, cell, { silent = true })
+        end
+      end
+    )
+  end
+  if opts.action then
+    return run(opts.action)
+  end
+  local choice = vim.fn.confirm(
+    string.format("Backend %d%s\n\nCancel its query, or terminate the session?", pid, describe()),
+    "&Cancel query\n&Terminate session\n&Nothing",
+    3,
+    "Question"
+  )
+  if choice == 1 then
+    run("cancel")
+  elseif choice == 2 then
+    run("terminate")
+  end
+end
+
+---Remember the hidden columns of the shown cell across cell switches.
+---@param s dbgrid.State
+local function save_hidden(s)
+  if s.view.cell_id then
+    s.hidden_columns = s.hidden_columns or {}
+    s.hidden_columns[s.view.cell_id] = s.view.hidden
+  end
+end
+
+---Hide the column under the cursor (`\c`), or the named one.
+---@param s dbgrid.State
+---@param name? string
+function M.hide_column(s, name)
+  if s.view.mode ~= "grid" then
+    return util.notify("columns are hidden in the grid view")
+  end
+  local c = M.cell_at_cursor(s)
+  local entry = c and c.entry or all_sets(current_result(s) or {})[1]
+  if not entry then
+    return util.notify("no result shown")
+  end
+  local column = name or (c and c.column)
+  if not column then
+    return util.notify("put the cursor on a column first")
+  end
+  local found = false
+  for _, col in ipairs(entry.set.columns) do
+    if col:lower() == column:lower() then
+      found = true
+    end
+  end
+  if not found then
+    return util.notify("no column named " .. column)
+  end
+  if #M.visible_columns(s.view, entry) <= 1 then
+    return util.notify("the last column stays")
+  end
+  s.view.hidden = s.view.hidden or {}
+  s.view.hidden[entry.stmt_index] = s.view.hidden[entry.stmt_index] or {}
+  s.view.hidden[entry.stmt_index][column:lower()] = true
+  save_hidden(s)
+  local win = s.results_win
+  local pos = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_cursor(win)
+  M.render(s)
+  if pos and c and c.vcol then
+    -- stay on the same visible slot (the next column slides in)
+    local layout = (s.view.rows_layout or {})[pos[1]]
+    local target = layout and layout.starts[math.min(c.vcol, #layout.starts)]
+    if target then
+      pcall(vim.api.nvim_win_set_cursor, win, { pos[1], target })
+    end
+  end
+end
+
+---Show hidden columns again (`\C`): all of them, the named one, or one
+---picked from a list.
+---@param s dbgrid.State
+---@param name? string   "all", a column name, or nil to pick
+function M.show_columns(s, name)
+  local hidden = s.view.hidden or {}
+  local items = {}
+  for set_index, names in pairs(hidden) do
+    for col in pairs(names) do
+      items[#items + 1] = { set = set_index, col = col }
+    end
+  end
+  if #items == 0 then
+    return util.notify("no column is hidden")
+  end
+  local function unhide(item)
+    hidden[item.set][item.col] = nil
+    if not next(hidden[item.set]) then
+      hidden[item.set] = nil
+    end
+    if not next(hidden) then
+      s.view.hidden = nil
+    end
+  end
+  if name == "all" then
+    s.view.hidden = nil
+    save_hidden(s)
+    return M.render(s)
+  elseif name then
+    for _, item in ipairs(items) do
+      if item.col == name:lower() then
+        unhide(item)
+      end
+    end
+    save_hidden(s)
+    return M.render(s)
+  end
+  table.sort(items, function(a, b)
+    return a.col < b.col
+  end)
+  local choices = { { text = "(show all)", data = "all" } }
+  for _, item in ipairs(items) do
+    choices[#choices + 1] = { text = item.col, data = item }
+  end
+  require("dbgrid.ui.picker").pick(choices, {
+    prompt = "Show column",
+    preview = false,
+    on_select = function(choice)
+      if not choice then
+        return
+      end
+      if choice.data == "all" then
+        s.view.hidden = nil
+      else
+        unhide(choice.data)
+      end
+      save_hidden(s)
+      M.render(s)
+    end,
+  })
+end
+
+---Toggle the bar chart of the shown result (`\g`): the numeric column under
+---the cursor (else the first numeric one) by the first text column. `spec`
+---names them like the `@chart` directive: `value [by label]`.
+---@param s dbgrid.State
+---@param spec? string
+function M.toggle_chart(s, spec)
+  if s.view.mode == "chart" and not spec then
+    s.view.mode = "grid"
+    return M.render(s, true)
+  end
+  local result = current_result(s)
+  if not result then
+    return util.notify("no result to chart: run a cell first")
+  end
+  local c = s.view.mode == "grid" and M.cell_at_cursor(s) or nil
+  local entry = c and c.entry or all_sets(result)[1]
+  if not entry then
+    return util.notify("no rows to chart")
+  end
+  local rows = M.display_rows(s, entry)
+  local chart = require("dbgrid.ui.chart")
+  local value, label
+  if spec then
+    value, label = chart.from_directive(spec, entry.set.columns, rows)
+  else
+    value, label = chart.pick_columns(entry.set.columns, rows, c and c.col or nil)
+  end
+  if not value then
+    return util.notify("no numeric column to chart")
+  end
+  s.view.chart = { set = entry.stmt_index, value = value, label = label }
+  s.view.mode = "chart"
+  M.render(s, true)
+end
+
 ---Decoration provider: ephemeral highlights for visible lines only.
+---The results pane and every pin buffer resolve to their own view.
 local provider_set = false
 local function ensure_provider()
   if provider_set then
     return
   end
   provider_set = true
+  local function view_of(buf)
+    local s = state_mod.by_results_buf(buf)
+    if s then
+      return s.view
+    end
+    local _, pin = state_mod.pin_of(buf)
+    return pin and pin.view
+  end
   vim.api.nvim_set_decoration_provider(M.ns, {
     on_win = function(_, _, buf)
-      local s = state_mod.by_results_buf(buf)
-      return s ~= nil and s.view ~= nil
+      return view_of(buf) ~= nil
     end,
     on_line = function(_, _, buf, row)
-      local s = state_mod.by_results_buf(buf)
-      if not s or not s.view then
+      local view = view_of(buf)
+      if not view then
         return
       end
       local lnum = row + 1
-      local layout = s.view.rows_layout and s.view.rows_layout[lnum]
-      if layout and s.view.cursor_col and not layout.record and layout.starts[s.view.cursor_col] then
-        pcall(vim.api.nvim_buf_set_extmark, buf, M.ns, row, layout.starts[s.view.cursor_col], {
-          end_col = layout.ends[s.view.cursor_col],
+      local layout = view.rows_layout and view.rows_layout[lnum]
+      if layout and view.cursor_col and not layout.record and layout.starts[view.cursor_col] then
+        pcall(vim.api.nvim_buf_set_extmark, buf, M.ns, row, layout.starts[view.cursor_col], {
+          end_col = layout.ends[view.cursor_col],
           hl_group = "DbgridCurrentColumn",
           ephemeral = true,
           priority = 90,
           hl_mode = "combine",
         })
       end
-      local hls = s.view.line_hl and s.view.line_hl[lnum]
+      local hls = view.line_hl and view.line_hl[lnum]
       if hls then
         for _, h in ipairs(hls) do
           pcall(vim.api.nvim_buf_set_extmark, buf, M.ns, row, h[1], {
@@ -1777,9 +2391,38 @@ function M.attach(s)
   map(buf, k.diff, function()
     M.diff_previous(s)
   end, "diff against the previous run")
+  map(buf, k.pin, function()
+    require("dbgrid.ui.pins").toggle(s)
+  end, "pin this result in its own window")
   map(buf, k.history, function()
     M.sparkline(s)
   end, "sparkline of the column across live ticks")
+  map(buf, k.follow, function()
+    M.follow(s)
+  end, "follow the foreign key of the value")
+  map(buf, k.follow_cell, function()
+    if not M.keep_result(s) then
+      M.follow(s, nil, { cell = true })
+    end
+  end, "follow the foreign key into a new cell")
+  map(buf, k.more, function()
+    M.load_more(s)
+  end, "load the next page of rows")
+  map(buf, k.edit, function()
+    M.edit_value(s)
+  end, "edit the value (writes an UPDATE cell)")
+  map(buf, k.backend, function()
+    M.signal_backend(s)
+  end, "cancel or terminate the backend of this row")
+  map(buf, k.hide_column, function()
+    M.hide_column(s)
+  end, "hide the column")
+  map(buf, k.show_columns, function()
+    M.show_columns(s)
+  end, "show hidden columns")
+  map(buf, k.chart, function()
+    M.toggle_chart(s)
+  end, "toggle the bar chart")
   map(buf, k.yank_plan, function()
     M.yank_plan(s)
   end, "yank the plan JSON")

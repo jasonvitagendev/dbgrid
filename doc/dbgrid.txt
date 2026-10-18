@@ -20,6 +20,7 @@ CONTENTS                                                     *dbgrid-contents*
  15. AWS RDS and tunnels ................. |dbgrid-aws|
  16. Schema and completion ............... |dbgrid-schema|
  17. Adapters (PostgreSQL, SQLite) ....... |dbgrid-adapters|
+ 18. Acting on a result .................. |dbgrid-actions|
 
 ==============================================================================
 1. INTRODUCTION                                                 *dbgrid-intro*
@@ -149,6 +150,18 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid live [interval|stop]   start or stop the live loop of the cell
 :Dbgrid diff [connection]      diff against the previous run, or against the
                                same cell run on another connection
+:Dbgrid pin                    pin the shown result in its own window (toggle)
+:Dbgrid follow [cell]          follow the foreign key of the value under the
+                               cursor (|dbgrid-actions|)
+:Dbgrid more                   load the next page of the shown result
+:Dbgrid edit                   write the UPDATE for the value as a cell
+:Dbgrid backend [cancel|terminate] [pid]
+                               signal the backend of the row under the cursor
+:Dbgrid columns [hide {c}|show {c}|all]
+                               hide or show columns of the shown result
+:Dbgrid chart [value [by label]]
+                               toggle the bar chart of the shown result
+:Dbgrid import {file} [table]  load a CSV / TSV into a table
 :Dbgrid schema diff [a] [b]    compare two schemas
 :Dbgrid settings diff [a] [b]  compare pg_settings of two connections
 :Dbgrid history                pick a statement from the project history
@@ -192,6 +205,12 @@ Results pane ~
               document, else the table the cell reads)
   <Tab> <S-Tab>     next / previous column (row in record view)
   ]c  [c      next / previous cell   \<Tab>      focus query pane
+  \P          pin the shown result in its own window (toggle)
+  gf  gF      follow the foreign key of the value (pane / new cell)
+  \m          load the next page     \e          edit value (UPDATE cell)
+  \x          cancel / terminate the backend of the row (pid)
+  \c  \C      hide column / show hidden columns
+  \g          bar chart              (|dbgrid-actions|)
   \z          zoom pane              q           close notebook
 
 Schema document ~
@@ -249,6 +268,11 @@ Cancel          `\x` sends SIGINT to the client. When the query is still
                 the client-only behaviour.
 Errors          shown in the results pane and as a diagnostic on the
                 offending line of the cell.
+Pins            `\P` in the results pane (or `:Dbgrid pin`) keeps the shown
+                result in its own small window while the pane follows the
+                cursor and new runs; a pin re-renders when its cell re-runs
+                (live ticks included) and closes with `q`, a second `\P`, or
+                the notebook.
 
 ==============================================================================
 7. PARAMETERS AND REFERENCES                                   *dbgrid-params*
@@ -488,5 +512,49 @@ PostgreSQL (`psql`) and SQLite (`sqlite3`) are built in.
 `lua/dbgrid/adapters/postgres.lua` and `sqlite.lua` for the interface
 (`run`, `explain`, `explain_text`, `explain_json`, `schema`, `test`,
 `cancel(job, conn)`, `keywords`, `functions`, `dialect`, `analyze`).
+
+==============================================================================
+18. ACTING ON A RESULT                                       *dbgrid-actions*
+
+All of these work on the row and column under the cursor in the results pane.
+
+Follow        `gf` follows the foreign key of the value: on `user_id = 42` the
+              pane shows `SELECT * FROM users WHERE id = 42`; on a primary
+              key it shows the rows that reference it (a picker when several
+              tables do). Keys from the schema cache come first; without one,
+              `user_id` → `users.id` and `users.id` ← `*.user_id` are
+              guessed by name. The lookup belongs to no cell: `gf` again
+              follows further, `gF` keeps it as a cell, `]c` or a run brings
+              the pane back. `gF` on an ordinary result follows into a new
+              cell.
+Next page     `\m` (`:Dbgrid more`) re-runs a statement whose LIMIT dbgrid
+              added, with an OFFSET, and appends the rows; the footer counts
+              the pages. Without ORDER BY pages may overlap. Every row stays
+              in memory; the disk cache keeps `storage.cache_rows` of them.
+Edit          `\e` asks for a SQL expression (prefilled with the value as a
+              literal) and writes `UPDATE t SET col = … WHERE pk = …` as a
+              new cell below the current one. The table's primary key has
+              to be in the result. Nothing runs until you run the cell.
+Backends      `\x` on a row with a pid column (`pid`, `blocking_pid`,
+              `blocked_pid`, or the column under the cursor when its name
+              ends in `pid`) offers pg_cancel_backend / pg_terminate_backend
+              and re-runs the cell. PostgreSQL only.
+Columns       `\c` hides the column under the cursor, `\C` shows hidden
+              ones again (a picker; `:Dbgrid columns show all`). Remembered
+              per cell; `\ya` yanks the visible columns.
+Chart         `\g` draws the numeric column under the cursor (else the
+              first numeric one) by the first text column as horizontal
+              bars; sort and filter apply. `:Dbgrid chart value by label`
+              names the columns; `-- @chart value by label` in a cell shows
+              the chart whenever the cell runs. `results.chart_width` fixes
+              the bar width. Groups: |hl-DbgridChartBar|,
+              `DbgridChartBarNeg`, `DbgridChartLabel`.
+Import        `:Dbgrid import {file} [table]` reads the header of a CSV /
+              TSV (delimiter detected), checks the columns against the
+              table, confirms, then loads it: psql's `\copy` on PostgreSQL
+              (the file is read locally), `.import` on SQLite. Without a
+              table a picker lists them, plus a new table created from the
+              header (text columns). Afterwards the table is shown in the
+              results pane.
 
 vim:tw=78:ts=8:ft=help:norl:

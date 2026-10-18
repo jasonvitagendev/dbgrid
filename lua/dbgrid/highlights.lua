@@ -50,6 +50,9 @@ local groups = {
   DbgridDiffDelete = { link = "DiffDelete" },
   DbgridDiffChange = { link = "DiffText" },
   DbgridLive = { link = "DiagnosticInfo" },
+  DbgridChartLabel = { link = "Identifier" },
+  DbgridChartBar = { link = "Function" },
+  DbgridChartBarNeg = { link = "DiagnosticError" },
 }
 
 function M.setup()

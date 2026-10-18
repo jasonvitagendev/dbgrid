@@ -790,6 +790,55 @@ function M.run(conn, statements, opts, cb)
   end)
 end
 
+---Load a delimited file into a table with `\copy`: the file is read by psql
+---on this machine, so it needs no access from the server. A CREATE TABLE
+---(`opts.create_sql`) runs first, in the same transaction.
+---@param conn dbgrid.Connection
+---@param opts { path: string, table: string, columns: string[], delimiter: string, header?: boolean,
+---  create_sql?: string, timeout_ms?: integer }
+---@param cb fun(ok: boolean, message: string, rows?: integer)
+---@return dbgrid.Job
+function M.import(conn, opts, cb)
+  local lines = { "BEGIN;" }
+  if opts.create_sql then
+    lines[#lines + 1] = opts.create_sql
+  end
+  local cols = ""
+  if #(opts.columns or {}) > 0 then
+    cols = " (" .. table.concat(vim.tbl_map(util.sql_ident, opts.columns), ", ") .. ")"
+  end
+  local delim = opts.delimiter == "\t" and "E'\\t'" or util.sql_literal(opts.delimiter or ",")
+  lines[#lines + 1] = string.format(
+    "\\copy %s%s from %s with (format csv, header %s, delimiter %s)",
+    opts.table,
+    cols,
+    util.sql_literal(opts.path),
+    opts.header ~= false and "true" or "false",
+    delim
+  )
+  lines[#lines + 1] = "COMMIT;"
+  local fresh = vim.deepcopy(conn)
+  fresh.session = false
+  return spawn(
+    fresh,
+    table.concat(lines, "\n") .. "\n",
+    { stop_on_error = true, timeout_ms = opts.timeout_ms or 600000, appname = "dbgrid.nvim:import" },
+    function(out)
+      local rows = tonumber((out.stdout or ""):match("COPY (%d+)"))
+      if out.code ~= 0 or not rows then
+        local _, err = parse_stderr(out.stderr or "", {}, {})
+        cb(
+          false,
+          err and err.message
+            or util.trim(out.stderr ~= "" and out.stderr or ("psql exited with " .. tostring(out.code)))
+        )
+        return
+      end
+      cb(true, "COPY " .. rows, rows)
+    end
+  )
+end
+
 ---Did the run fail before reaching the server? True for libpq's connection
 ---errors when no statement produced output, so the run can be repeated safely.
 ---@param res table   result handed to M.run's callback
