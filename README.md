@@ -107,6 +107,10 @@ the cache, so moving between cells never re-runs anything.
 - **Safety for writes.** The confirmation says how many rows an UPDATE or
   DELETE touches, `-- @dryrun` runs a write with RETURNING * inside a rolled
   back transaction, and DDL that takes heavy locks is called out.
+- **Undo.** Before an `UPDATE` or `DELETE` runs, the rows it is about to
+  touch are read by primary key and kept with the result; `\u` afterwards
+  writes the statements that put them back (`INSERT` of the deleted rows,
+  `UPDATE` per row of the old values) as a cell to review and run.
 - **Parameters, history, export.** `:name` placeholders with `-- @param`,
   every statement logged to a per-project history, notebooks exported as
   markdown with their results.
@@ -459,6 +463,7 @@ Query pane:
 | `\m` | rename the cell |
 | `\D` | clone the cell below itself |
 | `\l` | show the last error (message, position, detail, hint; `y` yanks) |
+| `\u` | write the undo of the cell's last `UPDATE` / `DELETE` as a cell |
 | `\=` | format the cell's SQL |
 | `\p` | edit parameter values |
 | `\g` | generate SQL from the `-- ?` prompt (asks for one when missing) |
@@ -496,6 +501,7 @@ Results pane:
 | `gf` / `gF` | follow the foreign key of the value (into the pane / into a new cell; `gF` on a followed result keeps it as a cell) |
 | `\m` | load the next page of rows (when the added `LIMIT` was hit) |
 | `\e` | edit the value: writes the `UPDATE` as a cell to review |
+| `\u` | write the undo of this cell's `UPDATE` / `DELETE` as a cell to review |
 | `\x` | cancel or terminate the backend on this row (`pid` column) |
 | `\c` / `\C` | hide the column under the cursor / show hidden columns |
 | `\g` | toggle the bar chart of the result |
@@ -534,6 +540,7 @@ one confirmation. Subcommands (with completion):
 | `diff [connection]` | diff against the previous run, or run the cell on another connection and diff |
 | `pin` | pin the shown result in its own window (toggle) |
 | `follow [cell]` / `more` / `edit` | follow the foreign key under the cursor / load the next page / write the UPDATE for the value |
+| `undo` | write the statements that reverse the cell's last `UPDATE` / `DELETE` as a cell |
 | `backend [cancel\|terminate] [pid]` | signal the backend of the row under the cursor (asks when no action is given) |
 | `columns [hide col \| show col\|all]` | hide or show columns of the shown result |
 | `chart [value [by label]]` | toggle the bar chart of the shown result |
@@ -586,6 +593,22 @@ diagnostic in the query buffer. Notices (`RAISE NOTICE`) show above the grid.
 - **Dry run:** `-- @dryrun` (or `query.dry_run = true`) runs a write with
   `RETURNING *` inside a transaction that is rolled back, so you see the rows
   first. It is allowed on read-only connections.
+- **Undo:** right before an `UPDATE` or `DELETE` with a `WHERE` runs, the
+  rows it touches are read with the same `WHERE` (the primary key plus the
+  assigned columns for an `UPDATE`, every column for a `DELETE`) and kept with
+  the cell's result, up to `query.undo_rows` (1000) per statement. The footer
+  says `2 rows of users kept before the UPDATE`; `\u` (`:Dbgrid undo`) then
+  writes a cell below with the reverse: an `INSERT` of the deleted rows (with
+  `OVERRIDING SYSTEM VALUE` when an identity column is among them), or one
+  `UPDATE … WHERE pk = …` per row restoring the old values, literals typed by
+  the column (`'00123'` stays text). A multi-statement cell is reversed last
+  statement first, and a cell that ran on another connection gets a `-- @conn`
+  line. Nothing runs until you run that cell, with the usual confirmation; the
+  undo cell keeps its own rows, so it can be undone again. The footer says
+  why nothing was kept: no `WHERE`, no primary key, a view, more rows than
+  the cap, or a table the schema cache does not know (`\s` refreshes it).
+  Generated columns are left out; dry runs keep nothing. `query.undo_rows = 0`
+  turns the capture off.
 - **DDL warnings:** `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` on a
   big table, `ALTER TABLE` (with specifics for type changes, `SET NOT NULL`,
   constraints without `NOT VALID`, volatile defaults), `TRUNCATE`,
@@ -709,6 +732,10 @@ cursor.
   The `UPDATE table SET col = … WHERE pk = …` lands in a new cell below the
   current one, keyed by the table's primary key (which has to be in the
   result), and nothing runs until you run it, with the usual confirmation.
+- **Undo a write (`\u`).** After the cell's `UPDATE` or `DELETE` ran, `\u`
+  (in either pane, or `:Dbgrid undo`) writes the statements that restore the
+  rows as they were right before it into a new cell below; see Undo under
+  Running queries for what is kept and when nothing is.
 - **Backends (`\x`).** On a row of the diagnostics notebook (any column
   ending in `pid`, or the row's `pid` / `blocking_pid` / `blocked_pid`),
   choose between `pg_cancel_backend` and `pg_terminate_backend`; the cell
@@ -925,7 +952,7 @@ Defaults (`require("dbgrid").setup({...})` deep-merges):
   storage = { mode = "auto", project_dir = ".dbgrid", data_dir = vim.fn.stdpath("data") .. "/dbgrid", cache_rows = 500 },
   layout = { results = "left", size = 0.5, tab = true, number = false },   -- results: "left" | "right" | "bottom"; number: true | "relative"
   query = { limit = 500, confirm_writes = true, preview_writes = true, dry_run = false, ddl_warnings = true,
-            transaction_per_cell = true, timeout_ms = nil, session = false,
+            undo_rows = 1000, transaction_per_cell = true, timeout_ms = nil, session = false,
             server_cancel = true, cancel_grace_ms = 1500 },
   format = { on_save = false, formatter = "auto", keyword_case = "keep", width = 100, indent = 2,
              order = { "pg_format", "sql-formatter", "sqlfluff", "sqlformat" }, commands = { ... } },

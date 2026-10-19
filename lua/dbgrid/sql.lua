@@ -930,11 +930,13 @@ local function top_level_index(stmt, words, from)
   end
 end
 
----`SELECT count(*) ...` over the rows an UPDATE / DELETE with a WHERE clause
----would touch, or nil when the statement is not one (or too unusual to be sure).
+---The pieces of an UPDATE / DELETE that a SELECT over the same rows needs:
+---the target table (as written, with its alias), the extra FROM / USING list
+---and the WHERE clause (without a trailing RETURNING). Nil when the statement
+---is not an UPDATE / DELETE with a WHERE clause, or too unusual to be sure.
 ---@param stmt dbgrid.Statement
----@return string?
-function M.preview_count(stmt)
+---@return { target: {name:string, alias?:string}, from: string, extra: string, where: string }?
+function M.preview_from(stmt)
   if stmt.kind ~= "update" and stmt.kind ~= "delete" then
     return nil
   end
@@ -978,7 +980,92 @@ function M.preview_count(stmt)
     end_rel = tokens[returning_idx].s - stmt.s
   end
   local where_text = trim(stmt.sql:sub(where.s - stmt.s + 1, end_rel))
-  return string.format("SELECT count(*) FROM %s%s %s", from, extra, where_text)
+  return { target = target, from = from, extra = extra, where = where_text }
+end
+
+---`SELECT <list> FROM ... WHERE ...` over the rows an UPDATE / DELETE with a
+---WHERE clause would touch, or nil when the statement is not one.
+---@param stmt dbgrid.Statement
+---@param list string   the select list
+---@return string?
+function M.preview_select(stmt, list)
+  local parts = M.preview_from(stmt)
+  if not parts then
+    return nil
+  end
+  return string.format("SELECT %s FROM %s%s %s", list, parts.from, parts.extra, parts.where)
+end
+
+---`SELECT count(*) ...` over the rows an UPDATE / DELETE with a WHERE clause
+---would touch, or nil when the statement is not one (or too unusual to be sure).
+---@param stmt dbgrid.Statement
+---@return string?
+function M.preview_count(stmt)
+  return M.preview_select(stmt, "count(*)")
+end
+
+---Columns an UPDATE assigns in its SET clause: `SET a = 1, b = 2` and the
+---row form `SET (a, b) = (1, 2)` / `SET (a, b) = (SELECT ...)`. Nil when the
+---statement is not an UPDATE or the clause has a shape this does not read.
+---@param stmt dbgrid.Statement
+---@return string[]?
+function M.set_columns(stmt)
+  if stmt.kind ~= "update" then
+    return nil
+  end
+  local tokens = stmt.tokens
+  local set_idx = top_level_index(stmt, { set = true })
+  if not set_idx then
+    return nil
+  end
+  local STOP = { from = true, where = true, returning = true }
+  local names = {}
+  local k = set_idx + 1
+  while tokens[k] and not (tokens[k].depth == 0 and tokens[k].type == "word" and STOP[tokens[k].lower]) do
+    local t = tokens[k]
+    if t.type == "punct" and t.value == "(" and t.depth == 0 then
+      -- (a, b) = ...
+      k = k + 1
+      while tokens[k] and not (tokens[k].type == "punct" and tokens[k].value == ")" and tokens[k].depth == 0) do
+        local c = tokens[k]
+        if c.type == "word" or c.type == "ident" then
+          names[#names + 1] = c.value
+        elseif not (c.type == "punct" and c.value == ",") then
+          return nil
+        end
+        k = k + 1
+      end
+      if not tokens[k] then
+        return nil
+      end
+      k = k + 1
+    elseif t.type == "word" or t.type == "ident" then
+      names[#names + 1] = t.value
+      k = k + 1
+    else
+      return nil
+    end
+    -- `= expr` up to the next top-level comma
+    local eq = tokens[k]
+    if not eq or eq.type ~= "op" or eq.value ~= "=" then
+      return nil
+    end
+    k = k + 1
+    while tokens[k] do
+      local c = tokens[k]
+      if c.depth == 0 and ((c.type == "punct" and c.value == ",") or (c.type == "word" and STOP[c.lower])) then
+        break
+      end
+      k = k + 1
+    end
+    if tokens[k] and tokens[k].type == "punct" and tokens[k].value == "," then
+      k = k + 1
+    end
+  end
+  if #names == 0 then
+    return nil
+  end
+  return names
 end
 
 local RETURNING_KINDS = { insert = true, update = true, delete = true, merge = true }

@@ -155,6 +155,8 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
                                cursor (|dbgrid-actions|)
 :Dbgrid more                   load the next page of the shown result
 :Dbgrid edit                   write the UPDATE for the value as a cell
+:Dbgrid undo                   write the reverse of the cell's last UPDATE /
+                               DELETE as a cell (|dbgrid-undo|)
 :Dbgrid backend [cancel|terminate] [pid]
                                signal the backend of the row under the cursor
 :Dbgrid columns [hide {c}|show {c}|all]
@@ -182,6 +184,7 @@ Query pane ~
   \d          delete cell            \y          yank cell
   \m          rename cell            \=          format the cell
   \D          clone cell             \l          show last error
+  \u          undo the last write as a cell (|dbgrid-undo|)
   \p          edit parameters        \g          generate SQL from prompt
   \a          pick the agent         \A          analyze plan (agent)
   \!          explain error (agent)  \i          try suggested index
@@ -208,6 +211,7 @@ Results pane ~
   \P          pin the shown result in its own window (toggle)
   gf  gF      follow the foreign key of the value (pane / new cell)
   \m          load the next page     \e          edit value (UPDATE cell)
+  \u          undo the cell's write as a cell (|dbgrid-undo|)
   \x          cancel / terminate the backend of the row (pid)
   \c  \C      hide column / show hidden columns
   \g          bar chart              (|dbgrid-actions|)
@@ -243,6 +247,24 @@ Cascades        the prompt for a DELETE lists the tables that lose rows
 Dry run         `-- @dryrun` or `query.dry_run`: the write runs with
                 RETURNING * inside a transaction that is rolled back, also
                 on read-only connections.
+Undo                                                           *dbgrid-undo*
+                Right before an UPDATE or DELETE with a WHERE runs, the rows
+                it touches are read with the same WHERE (the primary key and
+                the assigned columns for an UPDATE, every column for a
+                DELETE) and kept with the result, up to `query.undo_rows`
+                (1000) per statement; the footer says so. `\u` in either
+                pane (`:Dbgrid undo`) then writes a cell below with the
+                reverse: an INSERT of the deleted rows (OVERRIDING SYSTEM
+                VALUE when an identity column is among them) or one
+                `UPDATE ... WHERE pk = ...` per row with the old values,
+                literals typed by the column. Several statements are
+                reversed last first; a cell run on another connection gets a
+                `-- @conn` line. Nothing runs until you run that cell, which
+                keeps its own rows, so it can be undone in turn. The footer
+                says why nothing was kept: no WHERE, no primary key, a view,
+                more rows than the cap, or a table missing from the schema
+                cache. Generated columns are left out; dry runs keep
+                nothing. `query.undo_rows = 0` turns the capture off.
 DDL warnings    CREATE/DROP INDEX without CONCURRENTLY on a big table,
                 ALTER TABLE (type changes, SET NOT NULL, constraints without
                 NOT VALID, volatile defaults), TRUNCATE, VACUUM FULL,
@@ -535,6 +557,9 @@ Edit          `\e` asks for a SQL expression (prefilled with the value as a
               literal) and writes `UPDATE t SET col = … WHERE pk = …` as a
               new cell below the current one. The table's primary key has
               to be in the result. Nothing runs until you run the cell.
+Undo          `\u` (`:Dbgrid undo`) writes the statements that put the rows
+              of the cell's last UPDATE / DELETE back as they were right
+              before it ran, as a new cell below. See |dbgrid-undo|.
 Backends      `\x` on a row with a pid column (`pid`, `blocking_pid`,
               `blocked_pid`, or the column under the cursor when its name
               ends in `pid`) offers pg_cancel_backend / pg_terminate_backend

@@ -189,6 +189,15 @@ M.subcommands = {
       require("dbgrid.ui.results").edit_value(s)
     end
   end,
+  undo = function()
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    -- from the query pane: the cell under the cursor; from the results pane: the shown cell
+    local cell = vim.api.nvim_get_current_buf() == s.buf and current_cell(s) or nil
+    require("dbgrid.undo").write_cell(s, cell)
+  end,
   backend = function(args)
     local s = current_or_warn()
     if not s then

@@ -318,6 +318,8 @@ local function slim(result)
     params = result.params,
     refs = result.refs,
     title = result.title,
+    undo = result.undo,
+    undo_skipped = result.undo_skipped,
     statements = {},
   }
   for i, st in ipairs(result.statements or {}) do

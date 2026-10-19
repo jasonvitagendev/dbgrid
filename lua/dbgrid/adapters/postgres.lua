@@ -1008,7 +1008,8 @@ select json_build_object(
            obj_description(c.oid, 'pg_class') as comment,
            (select coalesce(json_agg(json_build_object(
                      'name', a.attname, 'type', format_type(a.atttypid, a.atttypmod), 'notnull', a.attnotnull,
-                     'default', pg_get_expr(d.adbin, d.adrelid), 'comment', col_description(c.oid, a.attnum)) order by a.attnum), '[]')
+                     'default', pg_get_expr(d.adbin, d.adrelid), 'comment', col_description(c.oid, a.attnum),
+                     'identity', nullif(to_jsonb(a)->>'attidentity', ''), 'generated', nullif(to_jsonb(a)->>'attgenerated', '')) order by a.attnum), '[]')
               from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
               where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped) as columns,
            (select coalesce(json_agg(json_build_object(

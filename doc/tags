@@ -21,4 +21,5 @@ dbgrid-run	dbgrid.txt	/*dbgrid-run*
 dbgrid-schema	dbgrid.txt	/*dbgrid-schema*
 dbgrid-setup	dbgrid.txt	/*dbgrid-setup*
 dbgrid-templates	dbgrid.txt	/*dbgrid-templates*
+dbgrid-undo	dbgrid.txt	/*dbgrid-undo*
 dbgrid.txt	dbgrid.txt	/*dbgrid.txt*

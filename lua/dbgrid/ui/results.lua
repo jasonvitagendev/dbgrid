@@ -417,6 +417,12 @@ local function render_footer(s, result, ctx)
     end
     add(" inlines " .. table.concat(util.uniq(names), ", "), "DbgridFooter")
   end
+  if (result.undo or result.undo_skipped) and ctx.cell_id then
+    local text, warn = require("dbgrid.undo").footer(result, key_label(config.get().keymaps.results.undo))
+    if text then
+      add(text, warn and "DbgridWarn" or "DbgridFooter")
+    end
+  end
   if result.truncated then
     local more = key_label(config.get().keymaps.results.more)
     add(
@@ -2411,6 +2417,9 @@ function M.attach(s)
   map(buf, k.edit, function()
     M.edit_value(s)
   end, "edit the value (writes an UPDATE cell)")
+  map(buf, k.undo, function()
+    require("dbgrid.undo").write_cell(s)
+  end, "write the undo of this cell's write as a cell")
   map(buf, k.backend, function()
     M.signal_backend(s)
   end, "cancel or terminate the backend of this row")

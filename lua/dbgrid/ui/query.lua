@@ -17,6 +17,7 @@ local RUNNING_LABEL = {
   analyze = "asking the agent",
   ai = "generating",
   review = "asking",
+  undo = "reading rows for undo",
 }
 
 ---What a running job is doing, for status lines.
@@ -879,6 +880,9 @@ function M.attach(s)
   map(buf, "n", k.last_error, function()
     M.show_error(s)
   end, "show the last error")
+  map(buf, "n", k.undo, function()
+    require("dbgrid.undo").write_cell(s, M.current_cell(s))
+  end, "write the undo of the cell's last write as a cell")
   map(buf, "n", k.generate, function()
     local cell = M.current_cell(s)
     if cell then

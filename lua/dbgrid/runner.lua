@@ -396,7 +396,7 @@ local execute_done
 ---@param adapter dbgrid.Adapter
 ---@param run_stmts dbgrid.RunStatement[]
 ---@param extra { warnings: table[], plans: table[], transaction: boolean, dry_run?: boolean, live?: boolean,
----  sql: string, params?: table, refs?: string[] }
+---  sql: string, params?: table, refs?: string[], undo?: dbgrid.UndoEntry[], undo_skipped?: string }
 local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
   local cfg = config.get()
   local started = util.now()
@@ -470,6 +470,8 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
     dry_run = extra.dry_run or nil,
     params = extra.params,
     refs = extra.refs,
+    undo = require("dbgrid.undo").applied(extra.undo, res, extra.transaction),
+    undo_skipped = extra.undo_skipped,
   }
   local live = state.live and state.live[fresh.id]
   if extra.live and live then
@@ -891,13 +893,43 @@ function M.run_cell(state, cell, opts)
           params = next(params or {}) and params or nil,
           refs = exp.cells,
         }
-        local function go()
+        local function run_now()
           execute(state, cell, conn, adapter, run_stmts, extra, function(result)
             if every and result.ok and not opts.live and not state.live[cell.id] then
               M.start_live(state, cell, every)
             end
             if opts.cb then
               opts.cb(result)
+            end
+          end)
+        end
+        local function go()
+          -- keep the rows an UPDATE / DELETE is about to touch, so the undo can be written later
+          if not has_write or dry_run or opts.live or (cfg.query.undo_rows or 0) <= 0 then
+            return run_now()
+          end
+          local undo = require("dbgrid.undo")
+          schema.get(conn, function(sch)
+            if not vim.api.nvim_buf_is_valid(state.buf) then
+              return
+            end
+            state.running[cell.id] = { started = util.now(), kind = "undo", conn = conn, adapter = adapter }
+            ui_query().start_spinner(state)
+            local job = undo.capture(conn, adapter, sch, stmts, function(entries, note, cancelled)
+              state.running[cell.id] = nil
+              if cancelled then
+                -- `\x` while the rows were being read: the write does not run either
+                set_runtime(state, cell, "idle")
+                ui_query().render(state)
+                util.notify("cancelled before the write ran")
+                return
+              end
+              extra.undo = entries
+              extra.undo_skipped = note
+              run_now()
+            end)
+            if job and state.running[cell.id] then
+              state.running[cell.id].job = job
             end
           end)
         end

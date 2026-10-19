@@ -64,6 +64,10 @@ M.defaults = {
     preview_writes = true,
     -- Run writes inside a transaction that is rolled back, showing RETURNING * (also `-- @dryrun` per cell).
     dry_run = false,
+    -- Before an UPDATE / DELETE with a WHERE runs, read the rows it touches (by primary key) and keep
+    -- them with the result, so the reverse statements can be written as a cell afterwards (`\u`).
+    -- The number caps the rows kept per statement; 0 turns the capture off.
+    undo_rows = 1000,
     -- Warn about DDL that takes heavy locks (CREATE INDEX without CONCURRENTLY, ALTER TABLE, ...).
     ddl_warnings = true,
     -- Wrap multi-statement cells in a single transaction.
@@ -261,6 +265,7 @@ M.defaults = {
       rename_cell = "<localleader>m",
       clone_cell = "<localleader>D",
       last_error = "<localleader>l",
+      undo = "<localleader>u",
       generate = "<localleader>g",
       ask = "<localleader>?",
       tags = "<localleader>t",
@@ -299,6 +304,7 @@ M.defaults = {
       follow_cell = "gF",
       more = "<localleader>m",
       edit = "<localleader>e",
+      undo = "<localleader>u",
       backend = "<localleader>x",
       hide_column = "<localleader>c",
       show_columns = "<localleader>C",
@@ -338,6 +344,7 @@ M.defaults = {
     changed = "Δ",
     pin = "📌",
     follow = "↳",
+    undo = "↶",
   },
 }
 
