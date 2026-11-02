@@ -93,8 +93,9 @@ local function build_env(conn, appname)
   for k, v in pairs(conn.env or {}) do
     env[k] = v
   end
-  -- vim.system replaces the environment when `env` is given unless clear_env=false;
-  -- merge the parent's so PATH/HOME/PGPASSFILE survive.
+  -- Merge the parent's environment ourselves so PATH/HOME/PGPASSFILE survive,
+  -- and never pass clear_env: on Neovim 0.10 that flag drops `env` as well,
+  -- and psql ran without PGAPPNAME or PGPASSWORD.
   for k, v in pairs(vim.fn.environ()) do
     if env[k] == nil then
       env[k] = v
@@ -512,7 +513,6 @@ local function session_get(conn)
   sess.job = vim.system(args, {
     stdin = true,
     env = build_env(conn),
-    clear_env = true,
     text = true,
     stdout = function(_, data)
       if data then
@@ -657,7 +657,6 @@ local function spawn(conn, script, opts, cb)
   local ok, proc = pcall(vim.system, argv(conn, opts.stop_on_error ~= false), {
     stdin = script,
     env = build_env(conn, appname),
-    clear_env = true,
     timeout = opts.timeout_ms,
     text = true,
   }, function(out)
