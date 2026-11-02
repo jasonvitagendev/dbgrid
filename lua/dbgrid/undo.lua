@@ -497,7 +497,12 @@ function M.write_cell(s, cell)
     n = n + #e.rows
   end
   util.notify(
-    string.format("undo written as cell %s (%s %s): review it and run it", id, util.fmt_int(n), n == 1 and "row" or "rows")
+    string.format(
+      "undo written as cell %s (%s %s): review it and run it",
+      id,
+      util.fmt_int(n),
+      n == 1 and "row" or "rows"
+    )
   )
   return id
 end

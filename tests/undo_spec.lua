@@ -46,12 +46,32 @@ local function fake_schema()
       name = "memberships",
       kind = "r",
       rows = 5,
-      columns = { { name = "user_id", type = "integer" }, { name = "team_id", type = "integer" }, { name = "role", type = "text" } },
+      columns = {
+        { name = "user_id", type = "integer" },
+        { name = "team_id", type = "integer" },
+        { name = "role", type = "text" },
+      },
       indexes = {},
       constraints = { { name = "memberships_pkey", type = "p", columns = { "user_id", "team_id" } } },
     },
-    { schema = "public", name = "logs", kind = "r", rows = 5, columns = { { name = "msg", type = "text" } }, indexes = {}, constraints = {} },
-    { schema = "public", name = "user_view", kind = "v", rows = 0, columns = { { name = "id", type = "integer" } }, indexes = {}, constraints = {} },
+    {
+      schema = "public",
+      name = "logs",
+      kind = "r",
+      rows = 5,
+      columns = { { name = "msg", type = "text" } },
+      indexes = {},
+      constraints = {},
+    },
+    {
+      schema = "public",
+      name = "user_view",
+      kind = "v",
+      rows = 0,
+      columns = { { name = "id", type = "integer" } },
+      indexes = {},
+      constraints = {},
+    },
   }
   local by_name = {}
   for _, t in ipairs(tables) do
@@ -70,11 +90,18 @@ H.describe("sql.set_columns", function()
       sqlmod.set_columns(stmt("update users u set (email, plan_id) = ('x', 2) from plans p where u.plan_id = p.id")),
       { "email", "plan_id" }
     )
-    H.eq(sqlmod.set_columns(stmt('update users set "Weird Name" = 1, zip = \'02134\' where id = 1')), { '"Weird Name"', "zip" })
+    H.eq(
+      sqlmod.set_columns(stmt("update users set \"Weird Name\" = 1, zip = '02134' where id = 1")),
+      { '"Weird Name"', "zip" }
+    )
   end)
   H.it("skips over subqueries and function calls in the expressions", function()
     H.eq(
-      sqlmod.set_columns(stmt("update users set email = (select max(email) from users where id > 1), plan_id = coalesce(plan_id, 1) where id = 1")),
+      sqlmod.set_columns(
+        stmt(
+          "update users set email = (select max(email) from users where id > 1), plan_id = coalesce(plan_id, 1) where id = 1"
+        )
+      ),
       { "email", "plan_id" }
     )
   end)
@@ -87,10 +114,16 @@ end)
 H.describe("sql.preview_select", function()
   H.it("selects over the rows a DELETE ... USING touches, without RETURNING", function()
     H.eq(
-      sqlmod.preview_select(stmt("delete from invoices i using users u where u.id = i.user_id and u.id = 1 returning *"), "i.id"),
+      sqlmod.preview_select(
+        stmt("delete from invoices i using users u where u.id = i.user_id and u.id = 1 returning *"),
+        "i.id"
+      ),
       "SELECT i.id FROM invoices i, users u where u.id = i.user_id and u.id = 1"
     )
-    H.eq(sqlmod.preview_count(stmt("update users set email = 'x' where id = 1")), "SELECT count(*) FROM users where id = 1")
+    H.eq(
+      sqlmod.preview_count(stmt("update users set email = 'x' where id = 1")),
+      "SELECT count(*) FROM users where id = 1"
+    )
     H.eq(sqlmod.preview_select(stmt("update users set email = 'x'"), "id"), nil)
   end)
 end)
@@ -98,17 +131,28 @@ end)
 H.describe("undo.plan", function()
   local sch = fake_schema()
   H.it("keeps the key and the assigned columns of an UPDATE", function()
-    local plans, skipped = undo.plan(sch, sqlmod.split("update users set email = 'x' where id <= 2"), { max_rows = 1000 })
+    local plans, skipped =
+      undo.plan(sch, sqlmod.split("update users set email = 'x' where id <= 2"), { max_rows = 1000 })
     H.eq(skipped, {})
     H.eq(#plans, 1)
     H.eq(plans[1].kind, "update")
-    H.eq(vim.tbl_map(function(c) return c.name end, plans[1].columns), { "id", "email" })
+    H.eq(
+      vim.tbl_map(function(c)
+        return c.name
+      end, plans[1].columns),
+      { "id", "email" }
+    )
     H.eq(plans[1].key, { 1 })
     H.eq(plans[1].sql, "SELECT users.id, users.email FROM users where id <= 2 LIMIT 1001")
   end)
   H.it("keeps every column of a DELETE except generated ones, through the alias", function()
     local plans = undo.plan(sch, sqlmod.split("delete from users u where u.plan_id = 2"), {})
-    H.eq(vim.tbl_map(function(c) return c.name end, plans[1].columns), { "id", "email", "plan_id", "zip" })
+    H.eq(
+      vim.tbl_map(function(c)
+        return c.name
+      end, plans[1].columns),
+      { "id", "email", "plan_id", "zip" }
+    )
     H.eq(plans[1].sql, "SELECT u.id, u.email, u.plan_id, u.zip FROM users u where u.plan_id = 2")
   end)
   H.it("falls back to every column when the SET clause is unreadable, and flags key changes", function()
@@ -116,11 +160,21 @@ H.describe("undo.plan", function()
     H.eq(#plans[1].columns, 4)
     local plans2 = undo.plan(sch, sqlmod.split("update users set id = id + 100, email = 'x' where id = 1"), {})
     H.eq(plans2[1].key_changed, true)
-    H.eq(vim.tbl_map(function(c) return c.name end, plans2[1].columns), { "id", "email" })
+    H.eq(
+      vim.tbl_map(function(c)
+        return c.name
+      end, plans2[1].columns),
+      { "id", "email" }
+    )
   end)
   H.it("handles composite keys", function()
     local plans = undo.plan(sch, sqlmod.split("update memberships set role = 'admin' where team_id = 3"), {})
-    H.eq(vim.tbl_map(function(c) return c.name end, plans[1].columns), { "user_id", "team_id", "role" })
+    H.eq(
+      vim.tbl_map(function(c)
+        return c.name
+      end, plans[1].columns),
+      { "user_id", "team_id", "role" }
+    )
     H.eq(plans[1].key, { 1, 2 })
   end)
   H.it("says why a statement cannot be undone", function()
@@ -220,7 +274,10 @@ H.describe("undo.capture and reverse", function()
 
   H.it("deduplicates rows a join repeated and handles composite keys", function()
     local entries = capture("update memberships m set role = 'x' from users u where u.id = m.user_id", {
-      { columns = { "user_id", "team_id", "role" }, rows = { { "1", "2", "admin" }, { "1", "2", "admin" }, { "1", "3", "member" } } },
+      {
+        columns = { "user_id", "team_id", "role" },
+        rows = { { "1", "2", "admin" }, { "1", "2", "admin" }, { "1", "3", "member" } },
+      },
     })
     H.eq(#entries[1].rows, 2)
     H.eq(undo.reverse_lines(entries[1]), {
@@ -297,7 +354,10 @@ H.describe("undo.capture and reverse", function()
     local none, err = undo.cell_body({ undo = {} })
     H.eq(none, nil)
     H.matches(err, "no rows were kept")
-    H.matches(undo.footer(result, "\\u"), "1 row of users, 1 row of invoices kept before the UPDATE; \\u writes the undo as a cell")
+    H.matches(
+      undo.footer(result, "\\u"),
+      "1 row of users, 1 row of invoices kept before the UPDATE; \\u writes the undo as a cell"
+    )
     local skipped, warn = undo.footer({ undo_skipped = "no undo: logs has no primary key" }, "\\u")
     H.matches(skipped, "no undo: logs has no primary key")
     H.eq(warn, true)
@@ -393,7 +453,10 @@ H.describe("undo against sqlite", function()
     H.falsy(body:find("@conn", 1, true))
     local r2 = run_and_wait(2)
     H.eq(r2.ok, true, vim.inspect(r2.error))
-    H.eq(sqlite("select email || '/' || zip from users where id <= 2 order by id"), "user1@example.com/01\nuser2@example.com/02")
+    H.eq(
+      sqlite("select email || '/' || zip from users where id <= 2 order by id"),
+      "user1@example.com/01\nuser2@example.com/02"
+    )
     -- the undo cell itself kept rows too (one entry per UPDATE statement), so it can be undone again
     H.eq(#r2.undo, 2)
     H.eq(r2.undo[1].rows, { { "1", "changed", "9" } })
@@ -415,7 +478,12 @@ H.describe("undo against sqlite", function()
     H.matches(body, "%(2, 1, 20.5, NULL%);")
     local r2 = run_and_wait(2)
     H.eq(r2.ok, true, vim.inspect(r2.error))
-    H.eq(sqlite("select id || ':' || typeof(amount) || ':' || amount || ':' || coalesce(note, 'null') from invoices order by id"), "1:real:10.0:a\n2:real:20.5:null\n3:real:5.0:c")
+    H.eq(
+      sqlite(
+        "select id || ':' || typeof(amount) || ':' || amount || ':' || coalesce(note, 'null') from invoices order by id"
+      ),
+      "1:real:10.0:a\n2:real:20.5:null\n3:real:5.0:c"
+    )
   end)
 
   H.it("says why there is no undo, and skips dry runs", function()
