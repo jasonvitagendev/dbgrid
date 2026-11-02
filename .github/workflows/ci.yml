@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: tests (neovim ${{ matrix.neovim }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.10 is the documented minimum; stable and nightly catch what changes next.
+        neovim: [v0.10.4, stable, nightly]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dbgrid
+          POSTGRES_PASSWORD: dbgrid
+          POSTGRES_DB: dbgrid_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dbgrid"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DBGRID_TEST_URL: postgres://dbgrid:dbgrid@localhost:5432/dbgrid_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim }}
+      - name: Show versions
+        run: |
+          nvim --version | head -1
+          psql --version
+          sqlite3 --version
+          python3 --version
+      - name: Seed the test database
+        run: psql "$DBGRID_TEST_URL" -v ON_ERROR_STOP=1 -q -f tests/seed.sql
+      - name: Run the test suite
+        run: tests/run.sh
+
+  stylua:
+    name: stylua
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v2.6.0
+          args: --check lua tests

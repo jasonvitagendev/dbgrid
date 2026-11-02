@@ -345,13 +345,16 @@ them.
 ## Notebooks
 
 A notebook is a `.sql` file plus a small `.json` (title, tags, connection,
-agent, parameter values, per-cell run info) and a `.cache.json` (last results,
+agent, per-cell run info: hash, timing, row count, status) and a
+`.cache.json` (last results and the parameter values you typed in,
 disposable). They live per project:
 
 - `~/.local/share/nvim/dbgrid/projects/<repo>-<hash>/` by default
 - `<repo>/.dbgrid/` when that directory exists (or with
-  `storage.mode = "project"`); a `.gitignore` for the cache is created, so the
-  `.sql` and `.json` files can be committed and shared.
+  `storage.mode = "project"`); a `.gitignore` for the cache and the query
+  history is created, so the `.sql` and `.json` files can be committed and
+  shared. Nothing you typed at a prompt and no row from a result goes into
+  those two files.
 
 The project is the git root of the current working directory.
 
@@ -878,8 +881,11 @@ they are, since they are what the question is about.
 
 Every statement run is appended to `<store>/history.jsonl` (connection,
 notebook, cell, SQL, rows, timing, error; `history.max_entries` caps the
-file). `\H` / `:Dbgrid history` picks an entry into a new cell below the
-cursor, `<C-y>` yanks it. `:Dbgrid export md [path]` writes the notebook as
+file, `history.enabled = false` turns it off). The SQL is logged as it ran,
+after parameters and cell references were substituted, so the file holds the
+values you typed in; in a project store it is gitignored. `\H` /
+`:Dbgrid history` picks an entry into a new cell below the cursor, `<C-y>`
+yanks it. `:Dbgrid export md [path]` writes the notebook as
 markdown with every cell's SQL, its last result as a table and its analysis.
 
 ## Schema, indexes, completion
@@ -981,6 +987,61 @@ Highlight groups (`DbgridCellHeader`, `DbgridCellHeaderActive`, `DbgridNull`,
 `DbgridDiffDelete`, `DbgridDiffChange`, `DbgridLive`, `DbgridChartBar`, …) link to standard
 groups and can be overridden.
 
+## What leaves your machine, what is written to disk
+
+Nothing is sent anywhere unless you ask for an agent feature, and nothing is
+phoned home. The complete list:
+
+**To the agent CLI** (`claude`, `kimi`, `codex`, or whatever `ai.agents`
+names; it runs locally, but it talks to its own provider), only when you run
+one of these:
+
+- **Prompt to SQL** (`-- ?` cells, `\!` on an error): the prompt, the cell's
+  current SQL, the error text, and the definitions of up to `ai.max_tables`
+  tables that look relevant (names, columns, types, keys, enums). No rows.
+- **Plan analysis** (`\A`): the SQL, the `EXPLAIN ANALYZE` plan, and the
+  tables' columns, indexes and `pg_stat_user_tables` counters. No rows, but
+  the plan carries the literals from the SQL.
+- **Ask about a result** (`\a`, `\?`, `:Dbgrid review`): the SQL, up to
+  `ai.max_result_rows` (100) rows **exactly as displayed**, the plan, the
+  notices and warnings, the table definitions, and your earlier questions
+  about the same result.
+
+`ai.redact_literals = true` replaces string and numeric literals in the SQL
+and the plan before they are sent. It does **not** touch result rows, since
+they are what "ask about a result" is about: do not ask about a result you
+would not paste into a chat. `ai = false` on a connection turns every agent
+feature off for it. `ai.investigate = true` additionally lets the agent run
+its own read-only queries on the connection through `dbgrid-query`.
+
+**To AWS**, only for connections with an `aws` block: the `aws` CLI is
+called with your profile for RDS metadata, Secrets Manager, IAM tokens and
+SSM port forwarding. Nothing else is sent.
+
+**Written to disk**, all under the store directory
+(`~/.local/share/nvim/dbgrid/` by default, see Notebooks):
+
+- `<notebook>.cache.json`: the last `storage.cache_rows` (500) rows of every
+  cell's result and the parameter values you typed in. Real data; gitignored
+  in a project store. `storage.cache_rows = 0` keeps no rows at all.
+- `history.jsonl`: every statement as it ran, with parameter values
+  substituted. Gitignored in a project store; `history.enabled = false`
+  stops it.
+- `schema/<connection>.json`: table, column and index names of each
+  connection, so completion and the agent prompts work offline.
+- `connections.json`: connections you saved with `:Dbgrid connections`,
+  including their URLs. Prefer `$VAR` in the URL over a literal password.
+- `<notebook>.sql` and `<notebook>.json`: your queries and their run
+  metadata. These are the files meant for committing.
+
+**Read from disk** without asking: `DATABASE_URL` and friends from the
+environment and from `.env`, `.env.local`, `.env.development` and
+`.env.development.local` in the project root (`env_files`, `env_vars`), and
+`config/database.yml` in a Rails project (`rails.enabled`). A URL found this
+way is only ever used to connect; it is not copied anywhere.
+
+Security problems: see [SECURITY.md](SECURITY.md).
+
 ## Other databases
 
 SQLite ships next to PostgreSQL: point a connection at the file
@@ -1031,9 +1092,10 @@ DBGRID_TEST_URL=... nvim -u tests/minimal_init.lua -c 'luafile tests/demo.lua'  
 ```
 
 The Postgres tests expect `tests/seed.sql` loaded into the database
-(`users`, `plans`, `invoices`) and `pg_stat_statements` available. The AWS
-and agent features are tested against a fake `aws` CLI and a fake agent in
-`tests/fixtures`, so no account and no model are needed.
+(`users`, `plans`, `invoices`, `sessions`). The AWS and agent features are
+tested against a fake `aws` CLI and a fake agent in `tests/fixtures`, so no
+account and no model are needed. CI runs the suite on Neovim 0.10, stable
+and nightly against a Postgres 16 service, plus `stylua --check`.
 
 ## Ideas not built yet
 

@@ -589,7 +589,8 @@ H.describe("aws views", function()
     H.eq(by_name.AuroraReplicaLag, { "AuroraReplicaLag", "20 ms", "18 ms", "25 ms" })
     H.eq(log_count("describe-pending-maintenance-actions --resource-identifier arn:aws:rds:"), 1)
     H.eq(log_count("cloudwatch get-metric-data"), 1)
-    H.matches(util.read_file(log), '"Namespace":"AWS/RDS"')
+    -- Neovim 0.10 escapes "/" in JSON, later versions do not; both are valid
+    H.matches(util.read_file(log), '"Namespace":"AWS\\?/RDS"')
     -- vim.json.encode does not order keys, so check the dimension name and value separately
     H.matches(util.read_file(log), '"Name":"DBClusterIdentifier"')
     H.matches(util.read_file(log), '"Value":"app%-prod"')

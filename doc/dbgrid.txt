@@ -66,8 +66,10 @@ SQLite urls: `sqlite:path/to.db` (relative to the project root),
 `sqlite:///abs/path.db`, `~/x.db`, or a bare path ending in .sqlite3 / .db.
 
 Storage: `storage.mode` is "auto" (use `<root>/.dbgrid` when it exists, else
-the data directory), "project" or "data". Result caches keep
-`storage.cache_rows` rows per cell.
+the data directory), "project" or "data". The `.sql` and `.json` of a
+notebook are made to be committed; the `.cache.json` (the last
+`storage.cache_rows` rows per cell and the parameter values typed in) and
+`history.jsonl` hold data and are gitignored in a project store.
 
 See `lua/dbgrid/config.lua` for every default, including all keymaps.
 
@@ -434,9 +436,10 @@ by the table's primary key (or an `id` column, or whole rows).
 `:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` open a scratch
 buffer (`]c` / `[c` jump between tables, `q` closes).
 
-Every statement is appended to `<store>/history.jsonl` (`history.enabled`,
-`history.max_entries`); `\H` / `:Dbgrid history` inserts an entry as a new
-cell, <C-y> yanks it. `:Dbgrid export md [path]` writes the notebook as
+Every statement is appended to `<store>/history.jsonl` as it ran, with
+parameter values substituted (`history.enabled`, `history.max_entries`;
+gitignored in a project store); `\H` / `:Dbgrid history` inserts an entry
+as a new cell, <C-y> yanks it. `:Dbgrid export md [path]` writes the notebook as
 markdown with SQL, results and analyses.
 
 ==============================================================================
