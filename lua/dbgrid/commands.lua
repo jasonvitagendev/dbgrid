@@ -513,7 +513,7 @@ M.subcommands = {
     local name = args[1]:gsub("^:", "")
     local value = table.concat(vim.list_slice(args, 2), " ")
     if value == "" then
-      local v = s.nb.meta.params and s.nb.meta.params[name]
+      local v = require("dbgrid.notebook").params(s.nb)[name]
       return util.notify(":" .. name .. " = " .. (v and tostring(v) or "(not set)"))
     end
     require("dbgrid.notebook").set_param(s.nb, name, value)

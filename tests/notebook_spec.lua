@@ -62,6 +62,113 @@ H.describe("notebook storage", function()
     H.eq(reloaded.meta.cells.abcd, nil)
     H.eq(notebook.result_of(reloaded, "abcd"), nil)
   end)
+
+  H.it("keeps parameter values in the cache file, never in the shareable json", function()
+    local util = require("dbgrid.util")
+    local nb = notebook.create("params test")
+    notebook.set_param(nb, "since", "'2026-01-01'")
+    notebook.set_param(nb, "customer", "'alice@example.com'")
+    -- written straight away, and only to the cache
+    H.eq(util.read_json(nb.cache_path)._params, { since = "'2026-01-01'", customer = "'alice@example.com'" })
+    H.eq(util.read_json(nb.meta_path).params, nil)
+    H.falsy(util.read_file(nb.meta_path):find("alice", 1, true))
+    local reloaded = notebook.load(nb.name)
+    H.eq(notebook.params(reloaded).customer, "'alice@example.com'")
+    notebook.set_param(reloaded, "customer", nil)
+    H.eq(notebook.params(notebook.load(nb.name)), { since = "'2026-01-01'" })
+    -- pruning cells leaves the values alone; a result for a cell still works
+    notebook.prune(reloaded, {})
+    H.eq(notebook.params(reloaded), { since = "'2026-01-01'" })
+    H.eq(notebook.result_of(reloaded, "_params"), { since = "'2026-01-01'" })
+  end)
+
+  H.it("moves parameter values out of an old notebook's json", function()
+    local util = require("dbgrid.util")
+    local nb = notebook.create("old params")
+    local meta = util.read_json(nb.meta_path)
+    meta.params = { top = "5", secret = "'s3cr3t'" }
+    util.write_json(nb.meta_path, meta)
+    util.write_json(nb.cache_path, { _params = { top = "9" } })
+    local old = notebook.load(nb.name)
+    H.eq(old.meta.params, { top = "5", secret = "'s3cr3t'" }, "still in the meta until the cache is touched")
+    H.eq(notebook.params(old), { top = "9", secret = "'s3cr3t'" }, "cache values win")
+    H.eq(old.meta.params, nil)
+    H.eq(util.read_json(nb.meta_path).params, nil, "the json was rewritten without them")
+    H.truthy(H.wait(2000, function()
+      local c = util.read_json(nb.cache_path)
+      return c and c._params and c._params.secret == "'s3cr3t'"
+    end))
+  end)
+
+  H.it("writes parameter values even when results are not cached on disk", function()
+    local util = require("dbgrid.util")
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data", cache_rows = 0 } })
+    local nb = notebook.create("no cache")
+    local cell = { id = "abcd", title = "t", lines = { "select 1" }, first = 2, last = 2 }
+    notebook.set_result(nb, cell, {
+      ok = true,
+      ran_at = os.time(),
+      sql_hash = "x",
+      statements = {
+        { sql = "select 1", kind = "select", class = "read", sets = { { columns = { "a" }, rows = { { "1" } } } } },
+      },
+    })
+    notebook.set_param(nb, "n", "1")
+    H.eq(util.read_json(nb.cache_path), { _params = { n = "1" } })
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data" } })
+  end)
+end)
+
+H.describe("project store .gitignore", function()
+  local util = require("dbgrid.util")
+  local project = require("dbgrid.project")
+  local function lines(path)
+    return vim.split(util.read_file(path) or "", "\n", { trimempty = true })
+  end
+
+  H.it("ignores result caches and the history in a new store", function()
+    local root = tmp .. "/proj-new"
+    vim.fn.mkdir(root, "p")
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "project" } })
+    local nb = notebook.create("in repo", { root = root })
+    H.eq(vim.fs.dirname(nb.path), root .. "/.dbgrid")
+    H.eq(lines(root .. "/.dbgrid/.gitignore"), { "*.cache.json", "history.jsonl" })
+  end)
+
+  H.it("adds the history line to a store that only ignored the cache", function()
+    local root = tmp .. "/proj-old"
+    vim.fn.mkdir(root .. "/.dbgrid", "p")
+    util.write_file(root .. "/.dbgrid/.gitignore", "*.cache.json")
+    util.write_file(root .. "/.dbgrid/notes.sql", "-- %% [ab12]\nselect 1\n")
+    project.ensure_ignores(root)
+    H.eq(lines(root .. "/.dbgrid/.gitignore"), { "*.cache.json", "history.jsonl" })
+    -- idempotent, and a user's own lines are kept
+    util.write_file(root .. "/.dbgrid/.gitignore", "scratch/\n*.cache.json\nhistory.jsonl\n")
+    project.ensure_ignores(root)
+    H.eq(lines(root .. "/.dbgrid/.gitignore"), { "scratch/", "*.cache.json", "history.jsonl" })
+  end)
+
+  H.it("is written by the history logger too, and never in the data directory", function()
+    local root = tmp .. "/proj-hist"
+    vim.fn.mkdir(root, "p")
+    local cwd = vim.fn.getcwd()
+    vim.cmd.cd(root)
+    require("dbgrid.history").append({
+      ts = 1,
+      connection = "c",
+      notebook = "n",
+      cell = "x",
+      sql = "select 1",
+      ok = true,
+    })
+    vim.cmd.cd(cwd)
+    H.eq(lines(root .. "/.dbgrid/.gitignore"), { "*.cache.json", "history.jsonl" })
+    H.matches(util.read_file(root .. "/.dbgrid/history.jsonl"), "select 1")
+
+    require("dbgrid.config").setup({ storage = { data_dir = tmp .. "/data", mode = "data" } })
+    local nb = notebook.create("in data dir", { root = tmp .. "/proj-data" })
+    H.eq(util.exists(vim.fs.dirname(nb.path) .. "/.gitignore"), false)
+  end)
 end)
 
 H.describe("connections", function()
@@ -603,16 +710,13 @@ H.describe("completion", function()
     H.eq(value_map(items("select * from orders where status in ('paid', '")), order_values)
     H.eq(value_map(items("update orders set status = '")), order_values)
     -- unambiguous column name used by two referenced tables: union of both enums
-    H.eq(
-      value_map(items("select * from orders join tickets on tickets.id = orders.id where status = '")),
-      {
-        pending = "order_status",
-        paid = "order_status",
-        shipped = "order_status",
-        open = "ticket_status",
-        closed = "ticket_status",
-      }
-    )
+    H.eq(value_map(items("select * from orders join tickets on tickets.id = orders.id where status = '")), {
+      pending = "order_status",
+      paid = "order_status",
+      shipped = "order_status",
+      open = "ticket_status",
+      closed = "ticket_status",
+    })
     -- an escaped quote does not close the string
     H.eq(value_map(items("select * from orders where status = 'it''s")), order_values)
     -- a text column keeps the ordinary items, and a closed string offers no values

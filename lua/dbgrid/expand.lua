@@ -106,7 +106,7 @@ function M.prepare(s, cell, opts, cb)
   end
   local names, refs = M.parameter_names(text)
   local values, source, missing = {}, {}, {}
-  local meta_params = s.nb.meta.params or {}
+  local meta_params = notebook.params(s.nb)
   for _, name in ipairs(names) do
     local v = opts.values and opts.values[name]
     if v and v ~= "" then
@@ -166,7 +166,7 @@ end
 function M.notebook_params(s)
   local list = cells.parse(s.buf)
   local by_name, order = {}, {}
-  local meta_params = s.nb.meta.params or {}
+  local meta_params = notebook.params(s.nb)
   for _, cell in ipairs(list) do
     local declared = {}
     for _, p in ipairs(cells.params(cell)) do

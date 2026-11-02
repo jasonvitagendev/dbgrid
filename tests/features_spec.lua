@@ -194,7 +194,7 @@ H.describe("running features", function()
     H.eq(r2.ok, true, vim.inspect(r2.error))
     H.eq(#r2.statements[1].sets[1].rows, 2)
     H.eq(asked, 1)
-    H.eq(nb.meta.params.top, "2")
+    H.eq(notebook.params(nb).top, "2")
     -- remembered: no prompt the second time
     vim.ui.input = function()
       error("should not prompt")

@@ -48,6 +48,40 @@ function M.store_dir(root)
   return st.data_dir .. "/projects/" .. M.slug(root), "data"
 end
 
+---Files a project store writes that must not be committed: result caches
+---(rows) and the query history (SQL after parameter substitution, so it can
+---hold the values that were typed in).
+M.IGNORED = { "*.cache.json", "history.jsonl" }
+
+local ignores_done = {}
+
+---Make sure `<root>/<project_dir>/.gitignore` lists every private file. Only
+---stores inside the repository get one; the data directory is never committed.
+---Older stores that only ignored the cache get the missing lines appended.
+---@param root? string
+function M.ensure_ignores(root)
+  local dir, mode = M.store_dir(root)
+  if mode ~= "project" or ignores_done[dir] then
+    return
+  end
+  local path = dir .. "/.gitignore"
+  local text = util.read_file(path) or ""
+  local missing = {}
+  for _, pat in ipairs(M.IGNORED) do
+    if not vim.tbl_contains(vim.split(text, "\n", { trimempty = true }), pat) then
+      missing[#missing + 1] = pat
+    end
+  end
+  if #missing > 0 then
+    util.mkdirp(dir)
+    if text ~= "" and not text:match("\n$") then
+      text = text .. "\n"
+    end
+    util.write_file(path, text .. table.concat(missing, "\n") .. "\n")
+  end
+  ignores_done[dir] = true
+end
+
 ---Global data directory (schema cache, connections).
 function M.data_dir()
   return config.get().storage.data_dir

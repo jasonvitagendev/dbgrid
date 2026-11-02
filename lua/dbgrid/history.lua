@@ -30,6 +30,7 @@ function M.append(entry)
   end
   local path = M.path()
   util.mkdirp(vim.fs.dirname(path))
+  project.ensure_ignores()
   local uv = vim.uv or vim.loop
   local fd = uv.fs_open(path, "a", 420)
   if not fd then

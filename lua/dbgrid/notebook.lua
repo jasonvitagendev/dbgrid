@@ -1,6 +1,7 @@
 -- Notebooks: one `.sql` file of cells plus a small `.json` (tags, connection,
--- per-cell run info) and a disposable `.cache.json` (last results), stored per
--- project.
+-- per-cell run info) and a disposable `.cache.json` (last results and the
+-- parameter values typed in), stored per project. The `.sql` and `.json` are
+-- made to be committed; the cache holds data and never is.
 local util = require("dbgrid.util")
 local config = require("dbgrid.config")
 local project = require("dbgrid.project")
@@ -23,7 +24,7 @@ local M = {}
 ---@field tags string[]
 ---@field connection string?
 ---@field agent string?            coding agent used for prompts (overrides ai.agent)
----@field params table<string,string>  parameter values entered for this notebook
+---@field params table<string,string>?  (old notebooks only) moved to the cache on first use
 ---@field created_at integer
 ---@field updated_at integer
 ---@field cells table<string, dbgrid.CellMeta>
@@ -35,8 +36,11 @@ local M = {}
 ---@field meta_path string
 ---@field cache_path string
 ---@field meta dbgrid.NotebookMeta
----@field cache table<string, table>?
+---@field cache table<string, table>?  results by cell id, plus `_params`
 ---@field root string
+
+-- Key of the parameter values inside the cache (cell ids are 4 characters, so it cannot clash).
+local PARAMS_KEY = "_params"
 
 local cache_writers = {} ---@type table<string, fun()>
 
@@ -61,9 +65,8 @@ local function load_meta(nb)
   meta.title = meta.title or nb.name
   meta.tags = meta.tags or {}
   meta.cells = meta.cells or {}
-  meta.params = meta.params or {}
-  if meta.params == vim.NIL then
-    meta.params = {}
+  if meta.params == vim.NIL or (type(meta.params) == "table" and next(meta.params) == nil) then
+    meta.params = nil
   end
   if meta.agent == vim.NIL then
     meta.agent = nil
@@ -144,13 +147,7 @@ function M.create(title, opts)
   local root = opts.root or project.root()
   local dir = project.store_dir(root)
   util.mkdirp(dir)
-  if project.store_dir(root) == root .. "/" .. config.get().storage.project_dir then
-    -- keep result caches out of the repository
-    local gi = dir .. "/.gitignore"
-    if not util.exists(gi) then
-      util.write_file(gi, "*.cache.json\n")
-    end
-  end
+  project.ensure_ignores(root)
   title = util.trim(title or "")
   if title == "" then
     title = "untitled " .. os.date("%Y-%m-%d %H%M")
@@ -170,7 +167,6 @@ function M.create(title, opts)
     created_at = util.epoch(),
     updated_at = util.epoch(),
     cells = {},
-    params = {},
   }
   if opts.body then
     util.write_file(nb.path, opts.body:gsub("\n?$", "\n"))
@@ -276,12 +272,37 @@ function M.delete(nb)
   end
 end
 
+local schedule_cache_write
+
 ---@param nb dbgrid.Notebook
 local function ensure_cache(nb)
   if not nb.cache then
     nb.cache = util.read_json(nb.cache_path) or {}
+    if nb.cache[PARAMS_KEY] == vim.NIL or type(nb.cache[PARAMS_KEY]) ~= "table" then
+      nb.cache[PARAMS_KEY] = nil
+    end
+    -- Notebooks written before parameter values moved out of the shareable
+    -- `.json`: carry them over and drop them from the meta file.
+    if type(nb.meta.params) == "table" and next(nb.meta.params) then
+      local params = nb.cache[PARAMS_KEY] or {}
+      for name, value in pairs(nb.meta.params) do
+        if params[name] == nil and type(value) == "string" then
+          params[name] = value
+        end
+      end
+      nb.cache[PARAMS_KEY] = params
+      nb.meta.params = nil
+      M.save_meta(nb)
+      schedule_cache_write(nb)
+    end
   end
   return nb.cache
+end
+
+---Whether a cache entry is a cell's result (and not the parameter table).
+---@param id string
+local function is_result(id)
+  return id ~= PARAMS_KEY
 end
 
 ---Last result of a cell (nil when never run or evicted).
@@ -347,41 +368,55 @@ local function slim(result)
 end
 
 ---The cache as written to disk: result sets capped at `storage.cache_rows`
----rows (marked `evicted` so the footer can say so after a reload).
+---rows (marked `evicted` so the footer can say so after a reload; 0 keeps no
+---results at all). Parameter values are always kept.
 ---@param cache table<string, table>
 ---@return table<string, table>
 local function for_disk(cache)
   local max_rows = config.get().storage.cache_rows or 500
   local out = {}
+  if cache[PARAMS_KEY] and next(cache[PARAMS_KEY]) then
+    out[PARAMS_KEY] = cache[PARAMS_KEY]
+  end
+  if max_rows <= 0 then
+    return out
+  end
   for id, r in pairs(cache) do
-    local copy = r
-    if r ~= vim.NIL and type(r) == "table" then
-      for i, st in ipairs(r.statements or {}) do
-        for j, set in ipairs(st.sets or {}) do
-          if #set.rows > max_rows then
-            if copy == r then
-              copy = vim.deepcopy(r)
+    if is_result(id) then
+      local copy = r
+      if r ~= vim.NIL and type(r) == "table" then
+        for i, st in ipairs(r.statements or {}) do
+          for j, set in ipairs(st.sets or {}) do
+            if #set.rows > max_rows then
+              if copy == r then
+                copy = vim.deepcopy(r)
+              end
+              local cs = copy.statements[i].sets[j]
+              cs.rows = vim.list_slice(set.rows, 1, max_rows)
+              cs.evicted = true
             end
-            local cs = copy.statements[i].sets[j]
-            cs.rows = vim.list_slice(set.rows, 1, max_rows)
-            cs.evicted = true
           end
         end
       end
+      out[id] = copy
     end
-    out[id] = copy
   end
   return out
 end
 
 ---@param nb dbgrid.Notebook
-local function schedule_cache_write(nb)
+local function write_cache(nb)
+  if nb.cache then
+    pcall(util.write_json, nb.cache_path, for_disk(nb.cache))
+  end
+end
+
+---@param nb dbgrid.Notebook
+schedule_cache_write = function(nb)
   local key = nb.cache_path
   if not cache_writers[key] then
     cache_writers[key] = util.debounce(500, function()
-      if nb.cache and (config.get().storage.cache_rows or 0) > 0 then
-        pcall(util.write_json, nb.cache_path, for_disk(nb.cache))
-      end
+      write_cache(nb)
     end)
   end
   cache_writers[key]()
@@ -451,7 +486,7 @@ function M.prune(nb, live_ids)
   end
   local cache = ensure_cache(nb)
   for id in pairs(cache) do
-    if not live[id] then
+    if is_result(id) and not live[id] then
       cache[id] = nil
       changed = true
     end
@@ -462,14 +497,25 @@ function M.prune(nb, live_ids)
   end
 end
 
----Remember a parameter value (nil forgets it).
+---Parameter values the notebook remembers (typed at a prompt or set with
+---`:Dbgrid param`). They live in the cache file, not in the shareable `.json`,
+---because they are data: ids, emails, dates someone looked up.
+---@param nb dbgrid.Notebook
+---@return table<string, string>
+function M.params(nb)
+  local cache = ensure_cache(nb)
+  cache[PARAMS_KEY] = cache[PARAMS_KEY] or {}
+  return cache[PARAMS_KEY]
+end
+
+---Remember a parameter value (nil forgets it). Written straight away: a value
+---just typed in must survive whatever happens next.
 ---@param nb dbgrid.Notebook
 ---@param name string
 ---@param value string?
 function M.set_param(nb, name, value)
-  nb.meta.params = nb.meta.params or {}
-  nb.meta.params[name] = value
-  M.save_meta(nb)
+  M.params(nb)[name] = value
+  write_cache(nb)
 end
 
 ---Coding agent for this notebook (nil = the configured default).
