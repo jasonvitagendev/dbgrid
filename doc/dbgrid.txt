@@ -363,6 +363,9 @@ about Rails naming conventions.
 
 Asking about a result ~
                                                               *dbgrid-review*
+Needs one of the agent CLIs (`claude`, `kimi`, `codex`, or one you add) on
+PATH; see |dbgrid-ai| for how agents are configured and picked.
+
 `\a` in the results pane, `\?` on a cell, or `:Dbgrid review [question]`
 sends the cell's SQL and its result together to the notebook's agent with
 your question (`ai = false` on the connection turns it off), and shows the answer

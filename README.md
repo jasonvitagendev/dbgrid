@@ -67,9 +67,9 @@ the cache, so moving between cells never re-runs anything.
   cost before and after.
 - **Ask about a result.** `\a` in the results pane (`\?` on a cell) sends the
   cell's SQL together with what came back (rows, error, notices, the plan
-  when there is one) to the agent with your question — "which of these is
-  blocking?", "why is this slow?" — and shows the answer over the grid.
-  Follow-ups keep the context.
+  when there is one) to the agent CLI (`claude`, `kimi` or `codex`) with
+  your question — "which of these is blocking?", "why is this slow?" — and
+  shows the answer over the grid. Follow-ups keep the context.
 - **Act on a result.** `gf` on a value follows its foreign key (the row a
   `user_id` points at, or the invoices that point back at a user's `id`);
   `\e` turns the value under the cursor into an `UPDATE … WHERE pk = …` cell
@@ -108,9 +108,10 @@ the cache, so moving between cells never re-runs anything.
   `bin` on `PATH`), `sqlite3` for SQLite
 - Optional: [snacks.nvim](https://github.com/folke/snacks.nvim) for pickers
   with previews (falls back to `vim.ui.select`), the `claude` / `kimi` /
-  `codex` CLI for prompt-to-SQL and plan analysis, a SQL formatter (see
-  Formatting), the `aws` CLI v2 plus the Session Manager plugin for RDS
-  connections, the `hypopg` extension on the server for `\i`.
+  `codex` CLI for prompt-to-SQL, plan analysis and asking about a result,
+  a SQL formatter (see Formatting), the `aws` CLI v2 plus the Session
+  Manager plugin for RDS connections, the `hypopg` extension on the server
+  for `\i`.
 
 ## Install
 
@@ -822,6 +823,10 @@ statement timeout) and, for the `claude` agent, allows exactly that command,
 so it can check statistics or try EXPLAIN variants before answering.
 
 ## Ask about a result
+
+Needs one of the agent CLIs (`claude`, `kimi`, `codex`, or one you add) on
+`PATH`; agents are configured and picked as described under
+[Prompt to SQL](#prompt-to-sql).
 
 Diagnostic queries (`pg_stat_activity`, lock waits, `pg_stat_user_tables`,
 an `EXPLAIN ANALYZE` that does not look right) are easier to read with a
