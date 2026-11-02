@@ -5,23 +5,7 @@ other, and the notebook is saved per project with tags so you can find it
 again. PostgreSQL and SQLite ship; other databases plug in through a small
 adapter interface.
 
-```
- ▸ q1 first users │ ✓ 6 rows · 43 ms │ grid          │ ⛁ local-dev │ #billing #users │ Overdue invoices  3 cells │ ✦ claude
- id │ email             │ plan_id │ balance │ created_at   │▎ ▸ first users  ✓ 6 rows · 43 ms · just now
-────┼───────────────────┼─────────┼─────────┼──────────────│▎ select id, email, plan_id, balance, created_at
-  1 │ user1@example.com │       2 │    1.50 │ 2026-09-26 … │▎ from users
-  2 │ user2@example.com │       3 │    3.00 │ 2026-09-26 … │▎ where id <= :max
-  3 │ user3@example.com │       1 │    4.50 │ 2026-09-26 … │▎ order by id
-  4 │ user4@example.com │       2 │    6.00 │ 2026-09-26 … │▎
-  5 │ user5@example.com │       3 │    7.50 │ 2026-09-26 … │  ─────────────────────────────────────────────────
-  6 │ user6@example.com │       1 │    9.00 │ 2026-09-26 … │  ▸ big scan  ⚠ seq scan ✓ 500 rows · 50 ms · 2m ago
-                                                           │  -- ? users whose balance is above 5, newest first
- 6 rows · 43 ms (server 1 ms) · LIMIT 500 added · 06:54:25 │  select * from users where balance > 5
- with :max = 6                                             │
-                                                           │  ─────────────────────────────────────────────────
-                                                           │  ▸ still to write  ? prompt — run to generate SQL
-                                                           │  -- ? count of users per plan, with the plan name
-```
+![dbgrid.nvim: a notebook of SQL cells on the right, the results grid of the current cell on the left](assets/demo.gif)
 
 The right pane is a plain `.sql` file. Every `-- %%` line starts a cell. The
 left pane shows the last result of the cell the cursor is in, straight from
@@ -135,6 +119,7 @@ lazy.nvim:
 ```lua
 {
   "jasonvitagendev/dbgrid",
+  version = "*", -- latest tagged release; drop this line to follow main
   cmd = "Dbgrid",
   keys = {
     { "<leader>DD", "<cmd>Dbgrid<cr>",             desc = "dbgrid: open notebook" },
@@ -1100,10 +1085,9 @@ tested against a fake `aws` CLI and a fake agent in `tests/fixtures`, so no
 account and no model are needed. CI runs the suite on Neovim 0.10, stable
 and nightly against a Postgres 16 service, plus `stylua --check`.
 
-## Ideas not built yet
+## Contributing and ideas
 
-- Result view in a floating window for one-off peeks from any buffer (`:Dbgrid run` on a visual selection)
-- Editing several values of a row at once (the record view as a form)
-- Column statistics popup (distinct count, min/max) on demand
-- Django awareness: read `settings.py` for connections
-- Adapters for MySQL (`mysql`), DuckDB
+Bug reports and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
+for how the project is run. Features that are not built yet live in the
+[issues labelled `idea`](https://github.com/jasonvitagendev/dbgrid/issues?q=is%3Aissue+is%3Aopen+label%3Aidea).
+Thumbs up the ones you want, or comment that you are taking one.

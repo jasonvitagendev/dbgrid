@@ -3,6 +3,11 @@ if vim.g.loaded_dbgrid then
 end
 vim.g.loaded_dbgrid = true
 
+if vim.fn.has("nvim-0.10") == 0 then
+  vim.notify("dbgrid.nvim needs Neovim 0.10 or newer", vim.log.levels.ERROR)
+  return
+end
+
 vim.api.nvim_create_user_command("Dbgrid", function(opts)
   require("dbgrid.commands").run(opts)
 end, {
