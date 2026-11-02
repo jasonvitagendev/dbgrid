@@ -587,19 +587,25 @@ H.describe("notebook ui", function()
     -- wait until the server shows the backend, then cancel it; both the cancel's
     -- own psql and the cancelled one must have reported before asserting.
     -- The poll re-arms itself from its callback: no vim.wait inside vim.wait.
-    local visible = false
+    local visible, polls, last = false, 0, nil
     local function poll()
+      polls = polls + 1
       pg.run(conn, {
         {
-          sql = "select count(*) from pg_stat_activity where application_name = '" .. job.appname .. "'",
+          sql = "select application_name, state, query from pg_stat_activity where application_name like 'dbgrid%'",
           kind = "select",
           class = "read",
           line = 1,
         },
       }, {}, function(r)
-        if r.ok and tonumber(r.statements[1].sets[1].rows[1][1]) > 0 then
-          visible = true
-        else
+        last = r
+        local rows = r.ok and r.statements[1].sets[1].rows or {}
+        for _, row in ipairs(rows) do
+          if row[1] == job.appname then
+            visible = true
+          end
+        end
+        if not visible then
           vim.defer_fn(poll, 200)
         end
       end)
@@ -609,7 +615,12 @@ H.describe("notebook ui", function()
       H.wait(10000, function()
         return visible
       end),
-      "backend never showed up in pg_stat_activity"
+      string.format(
+        "backend %s never showed up in pg_stat_activity after %d polls; last: %s",
+        job.appname,
+        polls,
+        vim.inspect(last and (last.ok and last.statements[1].sets[1].rows or last.error) or "no result")
+      )
     )
     local ok, msg
     pg.server_cancel(conn, job.appname, function(o, m)
