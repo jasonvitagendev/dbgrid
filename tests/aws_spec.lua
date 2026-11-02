@@ -1202,7 +1202,7 @@ H.describe("aws database name", function()
 end)
 
 H.describe("aws by host", function()
-  local vpce = "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com"
+  local vpce = "vpce-0123456789abcdef0.vpce-svc-0123456789abcdef0.us-west-1.vpce.amazonaws.com"
 
   H.it("takes host, read_host and port from the block without describing anything", function()
     local describes = log_count("rds describe-db-")

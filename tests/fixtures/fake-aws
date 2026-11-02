@@ -144,7 +144,7 @@ def main():
     if "%s %s" % (svc, cmd) in deny:
         op = "".join(part.capitalize() for part in cmd.split("-"))
         fail("An error occurred (AccessDeniedException) when calling the %s operation: User: "
-             "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Db_abc/jason is not authorized to perform: %s:%s"
+             "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Db_abc/someone is not authorized to perform: %s:%s"
              % (op, ACCOUNT, svc, op))
 
     if svc == "configure" and cmd == "list-profiles":
@@ -153,9 +153,9 @@ def main():
         sys.stdout.write(REGION + "\n")
     elif svc == "sts" and cmd == "get-caller-identity":
         out({
-            "UserId": "AROAEXAMPLE:jason",
+            "UserId": "AROAEXAMPLE:someone",
             "Account": ACCOUNT,
-            "Arn": "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Admin_abc/jason" % ACCOUNT,
+            "Arn": "arn:aws:sts::%s:assumed-role/AWSReservedSSO_Admin_abc/someone" % ACCOUNT,
         })
     elif svc == "ec2" and cmd == "describe-regions":
         out(["ap-southeast-1", "eu-west-1", "us-west-1"])
@@ -267,8 +267,8 @@ def main():
             secret = {"username": "postgres", "password": "x"}
         if "link" in sid:
             # a hand-written secret for a database behind a PrivateLink endpoint
-            secret = {"port": str(db_port()), "hostWrite": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
-                      "hostRead": "vpce-0123456789abcdef1.vpce-svc-0123456789abcdef1.us-west-1.vpce.amazonaws.com",
+            secret = {"port": str(db_port()), "hostWrite": "vpce-0123456789abcdef0.vpce-svc-0123456789abcdef0.us-west-1.vpce.amazonaws.com",
+                      "hostRead": "vpce-0123456789abcdef0.vpce-svc-0123456789abcdef0.us-west-1.vpce.amazonaws.com",
                       "password": "pw", "db": "jobs", "username": "je_next_user"}
         out({
             "ARN": sid if sid.startswith("arn:") else SECRET_ARN,
