@@ -17,19 +17,21 @@ jobs:
     services:
       postgres:
         image: postgres:16
+        # The integration tests connect as `postgres` to `dbgrid_test` without a
+        # password (tests/aws_spec.lua, tests/tunnel_spec.lua), so trust auth.
         env:
-          POSTGRES_USER: dbgrid
-          POSTGRES_PASSWORD: dbgrid
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: dbgrid_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U dbgrid"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      DBGRID_TEST_URL: postgres://dbgrid:dbgrid@localhost:5432/dbgrid_test
+      DBGRID_TEST_URL: postgres://postgres@localhost:5432/dbgrid_test
     steps:
       - uses: actions/checkout@v4
       - uses: rhysd/action-setup-vim@v1

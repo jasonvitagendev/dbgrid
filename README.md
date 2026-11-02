@@ -1092,7 +1092,10 @@ DBGRID_TEST_URL=... nvim -u tests/minimal_init.lua -c 'luafile tests/demo.lua'  
 ```
 
 The Postgres tests expect `tests/seed.sql` loaded into the database
-(`users`, `plans`, `invoices`, `sessions`). The AWS and agent features are
+(`users`, `plans`, `invoices`, `sessions`). The tunnel and AWS integration
+tests additionally assume the database is called `dbgrid_test` and accepts
+the `postgres` user without a password on the same port, as a local
+`postgres` with trust auth does (and as CI sets up). The AWS and agent features are
 tested against a fake `aws` CLI and a fake agent in `tests/fixtures`, so no
 account and no model are needed. CI runs the suite on Neovim 0.10, stable
 and nightly against a Postgres 16 service, plus `stylua --check`.

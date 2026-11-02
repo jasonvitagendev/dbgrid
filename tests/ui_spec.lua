@@ -584,14 +584,38 @@ H.describe("notebook ui", function()
         result = r
       end
     )
-    vim.wait(500)
+    -- wait until the server shows the backend, then cancel it; both the cancel's
+    -- own psql and the cancelled one must have reported before asserting
+    local function backends()
+      local n
+      pg.run(conn, {
+        {
+          sql = "select count(*) from pg_stat_activity where application_name = '" .. job.appname .. "'",
+          kind = "select",
+          class = "read",
+          line = 1,
+        },
+      }, {}, function(r)
+        n = r.ok and tonumber(r.statements[1].sets[1].rows[1][1]) or 0
+      end)
+      H.wait(5000, function()
+        return n ~= nil
+      end)
+      return n or 0
+    end
+    H.truthy(
+      H.wait(10000, function()
+        return backends() > 0
+      end),
+      "backend never showed up in pg_stat_activity"
+    )
     local ok, msg
     pg.server_cancel(conn, job.appname, function(o, m)
       ok, msg = o, m
     end)
     H.truthy(
       H.wait(10000, function()
-        return result ~= nil
+        return result ~= nil and ok ~= nil
       end),
       "server cancel timed out"
     )
