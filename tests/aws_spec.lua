@@ -888,6 +888,13 @@ H.describe("aws bastions", function()
     H.falsy(aws.is_instance_id("bastion-prod"))
     H.falsy(aws.is_instance_id("auto"))
     H.falsy(aws.is_instance_id(nil))
+    -- an ECS Exec target is passed to SSM as is, like an instance id
+    local ecs = "ecs:worker-debug-console_39d23bfd69694a4c95ff09da5de6f109_39d23bfd69694a4c95ff09da5de6f109-2953950646"
+    H.truthy(aws.is_ssm_target(ecs))
+    H.truthy(aws.is_ssm_target("i-0123456789abcdef0"))
+    H.falsy(aws.is_ssm_target("ecs:worker-debug-console"))
+    H.falsy(aws.is_ssm_target("bastion-prod"))
+    H.falsy(aws.is_ssm_target(nil))
   end)
 
   H.it("falls back to the running EC2 instances when the SSM listing is denied", function()
@@ -1012,6 +1019,13 @@ H.describe("aws bastions", function()
         aws.bastion_id({ profile = "prod", bastion = "i-0123456789abcdef0" }, {}, cb)
       end),
       "i-0123456789abcdef0"
+    )
+    local ecs = "ecs:app_0123456789abcdef0123456789abcdef_0123456789abcdef0123456789abcdef-1234567890"
+    H.eq(
+      sync(function(cb)
+        aws.bastion_id({ profile = "prod", bastion = ecs }, {}, cb)
+      end),
+      ecs
     )
     local _, nerr = sync(function(cb)
       aws.bastion_id({ profile = "prod", bastion = "nope" }, {}, cb)

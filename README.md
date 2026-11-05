@@ -267,7 +267,10 @@ tunnel is rebuilt and the cell runs once more. Tunnels die with Neovim;
 `aws tunnels` lists them with their age.
 
 The bastion is an instance id, the `Name` tag of an instance
-(`bastion = "bastion-prod"`) or `"auto"`. A name or `auto` is looked up among
+(`bastion = "bastion-prod"`) or `"auto"`. An account that runs on Fargate and
+has no instance can name a task with ECS Exec enabled instead
+(`ecs:<cluster>_<task id>_<runtime id>`, passed to SSM as is; the id changes
+when the task is replaced). A name or `auto` is looked up among
 the account's SSM-managed instances (`ssm describe-instance-information`, plus
 `ec2 describe-instances` for the tags and VPCs) when the tunnel is first
 started and cached with the endpoints, so a jumpbox replaced by its autoscaling
@@ -763,8 +766,8 @@ show the plan name"). The answer replaces the SQL under the prompt lines and
 the cell is marked *generated, not run* until you run it.
 
 Which agent answers is decided per cell (`-- @agent kimi`), then per
-notebook (`\a` or `:Dbgrid agent kimi`, remembered in the notebook and shown
-in the winbar), then by `ai.agent`. Agents are plain commands:
+notebook (`\a` or `:Dbgrid agent kimi`, remembered in the notebook), then by
+`ai.agent`. Agents are plain commands:
 
 ```lua
 ai = {

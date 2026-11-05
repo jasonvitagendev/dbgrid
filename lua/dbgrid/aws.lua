@@ -364,6 +364,15 @@ function M.is_instance_id(s)
   return type(s) == "string" and (s:match("^i%-%x+$") ~= nil or s:match("^mi%-%x+$") ~= nil)
 end
 
+---Is this something `ssm start-session --target` takes as is: an instance id,
+---or an ECS Exec target (`ecs:<cluster>_<task id>_<runtime id>`) for accounts
+---that run on Fargate and have no instance to jump through?
+---@param s any
+---@return boolean
+function M.is_ssm_target(s)
+  return M.is_instance_id(s) or (type(s) == "string" and s:match("^ecs:[^_].*_%x+_%x+%-%d+$") ~= nil)
+end
+
 ---Merge `ssm describe-instance-information` and `ec2 describe-instances` into
 ---the instances an SSM session can target, with their Name tag and VPC. Without
 ---the SSM listing (nil) every running EC2 instance is a candidate and `online`
@@ -612,7 +621,7 @@ end
 ---@param aws_cfg dbgrid.AwsConfig
 ---@return string?
 local function bastion_key(aws_cfg)
-  if type(aws_cfg.bastion) ~= "string" or M.is_instance_id(aws_cfg.bastion) then
+  if type(aws_cfg.bastion) ~= "string" or M.is_ssm_target(aws_cfg.bastion) then
     return nil
   end
   return "bastion|" .. profile_of(aws_cfg) .. "|" .. (aws_cfg.region or "") .. "|" .. aws_cfg.bastion:lower()
@@ -1279,7 +1288,7 @@ end
 ---@param cb fun(id?: string, err?: string)
 function M.bastion_id(aws_cfg, hints, cb)
   local want = aws_cfg.bastion
-  if type(want) ~= "string" or want == "" or M.is_instance_id(want) then
+  if type(want) ~= "string" or want == "" or M.is_ssm_target(want) then
     return cb(want)
   end
   local cached = M.cached_bastion(aws_cfg)

@@ -57,6 +57,7 @@ function M.adopt(buf, nb)
   if win ~= -1 and vim.api.nvim_win_get_config(win).relative == "" then
     s.query_win = win
     s.tab = vim.api.nvim_win_get_tabpage(win)
+    M.ensure_results(s)
     query.on_cursor(s, true)
   end
   return s
@@ -261,8 +262,6 @@ function M.winbar_query(buf)
   parts[#parts + 1] = "%#DbgridWinbarTitle# " .. esc(s.nb.meta.title) .. " "
   local n = #require("dbgrid.cells").parse(buf)
   parts[#parts + 1] = "%#DbgridWinbarDim#" .. n .. (n == 1 and " cell" or " cells")
-  local agent = require("dbgrid.ai").agent_name(s)
-  parts[#parts + 1] = " %#DbgridWinbarDim#│%#DbgridWinbarAgent# " .. esc(icons.agent) .. " " .. esc(agent) .. " "
   local live = 0
   for _ in pairs(s.live or {}) do
     live = live + 1

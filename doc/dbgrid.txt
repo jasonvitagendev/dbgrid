@@ -355,8 +355,8 @@ replaces the SQL under the prompt lines and the cell is marked "generated,
 not run". When the cell already has SQL the prompt is an edit request.
 
 The agent is chosen per cell (`-- @agent kimi`), per notebook (`\a`,
-`:Dbgrid agent kimi`, shown in the winbar) or by `ai.agent`. Agents
-(`ai.agents`) are argv lists; `{prompt}` and `{output}` are substituted,
+`:Dbgrid agent kimi`) or by `ai.agent`. Agents (`ai.agents`) are argv lists;
+`{prompt}` and `{output}` are substituted,
 `stdin = true` pipes the prompt. Defaults exist for `claude`, `kimi` and
 `codex`; add your own the same way. In a Rails project the agent is told
 about Rails naming conventions.
@@ -470,7 +470,9 @@ credentials run `aws.login_cmd` (`{profile}` substituted) in a terminal
 split and retry. Without `bastion` the connection is direct; `aws.document`
 and `aws.parameters` cover custom SSM documents.
 
-`bastion` is an instance id, the Name tag of an instance or "auto". A name
+`bastion` is an instance id, the Name tag of an instance or "auto". Without
+an instance (Fargate), an ECS Exec target works too:
+`ecs:<cluster>_<task id>_<runtime id>`, passed to SSM as is. A name
 or "auto" is looked up among the SSM-managed instances when the tunnel is
 first started (`ssm describe-instance-information` + `ec2 describe-instances`)
 and cached with the endpoints; a tunnel that fails to start, and `aws
