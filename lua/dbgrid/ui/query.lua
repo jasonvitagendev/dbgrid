@@ -103,6 +103,10 @@ function M.status_chunks(s, cell)
       "DbgridLive"
     )
   end
+  local alert = s.alerts and s.alerts[cell.id]
+  if alert and alert.firing then
+    add(" " .. icons.warn .. " alert: " .. util.truncate(tostring(alert.text), 60) .. " ", "DbgridStatusError")
+  end
   if rt.status == "generating" then
     add(" " .. icons.generated .. " generating… ", "DbgridStatusRunning")
     return chunks

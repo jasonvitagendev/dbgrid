@@ -209,4 +209,13 @@ H.describe("bundled templates", function()
       H.eq(st.class, "read", st.kind)
     end
   end)
+  H.it("logical-replication only reads", function()
+    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+    local text = require("dbgrid.util").read_file(root .. "/lua/dbgrid/templates/logical-replication.sql")
+    local stmts = sql.split(text)
+    H.truthy(#stmts > 20)
+    for _, st in ipairs(stmts) do
+      H.eq(st.class, "read", st.kind)
+    end
+  end)
 end)

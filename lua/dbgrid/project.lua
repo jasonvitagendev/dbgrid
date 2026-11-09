@@ -49,9 +49,10 @@ function M.store_dir(root)
 end
 
 ---Files a project store writes that must not be committed: result caches
----(rows) and the query history (SQL after parameter substitution, so it can
----hold the values that were typed in).
-M.IGNORED = { "*.cache.json", "history.jsonl" }
+---(rows), the query history (SQL after parameter substitution, so it can
+---hold the values that were typed in) and the recordings of `-- @record`
+---cells (rows again).
+M.IGNORED = { "*.cache.json", "history.jsonl", "recordings/" }
 
 local ignores_done = {}
 

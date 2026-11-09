@@ -309,6 +309,72 @@ function M.parse_metrics(json)
   return rows
 end
 
+---Column a metric is shown under and the factor its value is multiplied by:
+---byte counts become MiB and the latencies CloudWatch reports in seconds
+---become milliseconds, so every column of a `-- @metrics` cell is a plain
+---number with its unit in the name.
+---@param name string
+---@return string column, number factor
+function M.metric_column(name)
+  if
+    name:find("Memory")
+    or name:find("Storage")
+    or name:find("Bytes")
+    or name:find("DiskUsage")
+    or name:find("SlotLag")
+    or name == "SwapUsage"
+  then
+    return name .. "_MiB", 1 / 1024 ^ 2
+  elseif name == "ReadLatency" or name == "WriteLatency" then
+    return name .. "_ms", 1000
+  elseif name:find("Latency$") then
+    return name .. "_ms", 1
+  end
+  return name, 1
+end
+
+---@param v number
+---@return string
+local function plain_number(v)
+  if v == math.floor(v) then
+    return string.format("%d", v)
+  elseif math.abs(v) >= 100 then
+    return string.format("%.1f", v)
+  elseif math.abs(v) >= 1 then
+    return string.format("%.2f", v)
+  end
+  return (string.format("%.5f", v):gsub("0+$", ""))
+end
+
+---The newest datapoint of every metric as one row, for a `-- @metrics` cell.
+---@param json string|table   `aws cloudwatch get-metric-data` output (Values newest first)
+---@return { columns: string[], rows: any[][], row_count: integer }? set, string? err
+function M.parse_metric_row(json)
+  local data, err = decode(json)
+  if not data then
+    return nil, err
+  end
+  local columns, row, newest = { "datapoint_utc" }, { vim.NIL }, nil
+  for _, r in ipairs(nz(data.MetricDataResults) or {}) do
+    local name = tostring(nz(r.Label) or nz(r.Id) or "?")
+    local column, factor = M.metric_column(name)
+    local values = nz(r.Values) or {}
+    local stamps = nz(r.Timestamps) or {}
+    columns[#columns + 1] = column
+    row[#row + 1] = values[1] and plain_number(values[1] * factor) or vim.NIL
+    if stamps[1] and (not newest or tostring(stamps[1]) > newest) then
+      newest = tostring(stamps[1])
+    end
+  end
+  if #columns == 1 then
+    return nil, "CloudWatch returned no metrics"
+  end
+  if newest then
+    row[1] = (newest:gsub("T", " "):gsub("[%+Z].*$", ""))
+  end
+  return { columns = columns, rows = { row }, row_count = 1 }
+end
+
 ---@param json string|table   `aws rds describe-blue-green-deployments` output
 ---@return table? rows {deployment, status, source, target, member_status}[], string? err
 function M.parse_bluegreen(json)
@@ -1340,11 +1406,47 @@ local CLUSTER_METRICS = {
 }
 local INSTANCE_METRICS = { "CPUUtilization", "DatabaseConnections", "FreeableMemory", "FreeStorageSpace", "ReplicaLag" }
 
+---Metrics a `-- @metrics` cell samples when it names none: what a migration
+---loads (CPU, memory, I/O, storage) and what a replication slot costs the
+---publisher. A metric the engine does not publish comes back as NULL.
+M.LIVE_METRICS = {
+  instance = {
+    "CPUUtilization",
+    "DatabaseConnections",
+    "FreeableMemory",
+    "FreeStorageSpace",
+    "ReadIOPS",
+    "WriteIOPS",
+    "ReadLatency",
+    "WriteLatency",
+    "DiskQueueDepth",
+    "TransactionLogsDiskUsage",
+    "ReplicationSlotDiskUsage",
+    "OldestReplicationSlotLag",
+  },
+  cluster = {
+    "CPUUtilization",
+    "DatabaseConnections",
+    "FreeableMemory",
+    "ReadIOPS",
+    "WriteIOPS",
+    "CommitThroughput",
+    "CommitLatency",
+    "VolumeBytesUsed",
+    "VolumeReadIOPs",
+    "VolumeWriteIOPs",
+    "ReplicationSlotDiskUsage",
+    "OldestReplicationSlotLag",
+  },
+}
+
 ---@param aws_cfg dbgrid.AwsConfig
 ---@param info table
+---@param names? string[]   metric names (default: the ones of `aws status`)
+---@param window? integer   seconds to look back (default 300)
 ---@return string[] args
-local function metric_args(aws_cfg, info)
-  local names = aws_cfg.cluster and CLUSTER_METRICS or INSTANCE_METRICS
+local function metric_args(aws_cfg, info, names, window)
+  names = names or (aws_cfg.cluster and CLUSTER_METRICS or INSTANCE_METRICS)
   local dimension = aws_cfg.cluster and "DBClusterIdentifier" or "DBInstanceIdentifier"
   local queries = {}
   for i, name in ipairs(names) do
@@ -1370,13 +1472,14 @@ local function metric_args(aws_cfg, info)
     "--metric-data-queries",
     vim.json.encode(queries),
     "--start-time",
-    iso_utc(now - 300),
+    iso_utc(now - (window or 300)),
     "--end-time",
     iso_utc(now),
     "--scan-by",
     "TimestampDescending",
   }
 end
+M._metric_args = metric_args
 
 ---@param conn dbgrid.Connection
 ---@return dbgrid.AwsConfig?, string? err
@@ -1466,6 +1569,33 @@ function M.status(conn, cb)
       cb(rows, { "item", "last", "min", "max" })
     end)
   end, { force = true })
+end
+
+---The newest CloudWatch datapoint of each metric of a connection's cluster or
+---instance, as a one-row result set (what a `-- @metrics` cell runs).
+---@param conn dbgrid.Connection
+---@param names? string[]   metric names (default `M.LIVE_METRICS`)
+---@param cb fun(set?: table, err?: string)
+function M.metrics(conn, names, cb)
+  local a, err = aws_of(conn)
+  if not a then
+    return cb(nil, err)
+  end
+  M.endpoints(a, function(info, derr)
+    if not info then
+      return cb(nil, derr)
+    end
+    if not names or #names == 0 then
+      names = M.LIVE_METRICS[a.cluster and "cluster" or "instance"]
+    end
+    -- ten minutes back: some metrics (VolumeBytesUsed) only arrive every five
+    M.cli(a, metric_args(a, info, names, 600), function(res)
+      if not res.ok then
+        return cb(nil, cli_error(a, "cloudwatch get-metric-data", res))
+      end
+      cb(M.parse_metric_row(res.json or res.stdout))
+    end)
+  end)
 end
 
 ---RDS events of the last 24 hours, newest first.

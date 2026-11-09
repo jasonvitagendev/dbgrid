@@ -387,7 +387,7 @@ local function log_history(state, cell, conn, result, sql)
   })
 end
 
-local execute_done
+local execute_done, run_metrics
 
 ---Execute the prepared statements.
 ---@param state dbgrid.State
@@ -454,6 +454,10 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
     end
   end
   local previous = notebook.result_of(state.nb, fresh.id)
+  if res.ok then
+    -- `-- @rate`: the per-second columns belong to the result everything below sees
+    pcall(require("dbgrid.rate").apply, state, fresh, res)
+  end
   local result = {
     ok = res.ok,
     statements = res.statements,
@@ -494,6 +498,16 @@ function execute_done(state, cell, conn, run_stmts, extra, res, cb)
     notebook.set_result(state.nb, fresh, result)
     log_history(state, fresh, conn, result, extra.sql)
   end
+  local record = require("dbgrid.record")
+  if res.ok and record.wanted(fresh) then
+    local ok, path, created = pcall(record.append, state.nb, fresh, result)
+    if not ok then
+      util.warn("@record: " .. tostring(path))
+    elseif created then
+      util.notify("recording " .. cells.label(fresh, 30) .. " to " .. path)
+    end
+  end
+  pcall(require("dbgrid.alert").check, state, fresh, result)
   state.runtime[fresh.id] = { status = res.ok and "ok" or "error" }
   M.clear_diagnostics(state, fresh)
   if not res.ok and res.error then
@@ -751,6 +765,60 @@ function M.signal_backend(state, pid, action, opts, cb)
   end)
 end
 
+---Run a `-- @metrics` cell: no SQL, the newest CloudWatch datapoints of the
+---cell's connection as a one-row result. It goes through the same end as a
+---query, so `-- @every`, `-- @record`, `-- @alert` and pins work on it.
+---@param state dbgrid.State
+---@param cell dbgrid.Cell
+---@param opts table   as for run_cell
+function run_metrics(state, cell, opts)
+  local directives = cells.directives(cell)
+  local name = type(directives.conn) == "string" and directives.conn or state.nb.meta.connection
+  local conn = name and connections.get(name)
+  if not conn then
+    if not opts.live then
+      util.error("@metrics: " .. (name and ("connection '" .. name .. "' is not configured") or "no connection"))
+    end
+    return
+  end
+  local every = cells.interval_ms(directives.every)
+  if every then
+    -- CloudWatch has one datapoint a minute: asking more often only repeats it
+    every = math.max(every, 60000)
+  end
+  local names = type(directives.metrics) == "string" and vim.split(directives.metrics, "[,%s]+", { trimempty = true })
+    or nil
+  local started = util.now()
+  state.running[cell.id] = { started = started, kind = "run", conn = conn }
+  set_runtime(state, cell, "running")
+  ui_query().start_spinner(state)
+  local what = "cloudwatch " .. (names and table.concat(names, ", ") or "metrics") .. " of " .. conn.name
+  require("dbgrid.aws").metrics(conn, names, function(set, err)
+    if not vim.api.nvim_buf_is_valid(state.buf) then
+      return
+    end
+    state.running[cell.id] = nil
+    local res = {
+      ok = set ~= nil,
+      statements = {
+        { sql = what, kind = "select", class = "read", sets = set and { set } or {}, tags = {} },
+      },
+      notices = {},
+      error = not set and { message = tostring(err or "no metrics") } or nil,
+      elapsed_ms = math.floor((util.now() - started) * 1000),
+    }
+    local extra = { warnings = {}, plans = {}, live = opts.live, sql = "-- " .. what }
+    execute_done(state, cell, conn, {}, extra, res, function(result)
+      if every and result.ok and not opts.live and not state.live[cell.id] then
+        M.start_live(state, cell, every, opts.live_opts)
+      end
+      if opts.cb then
+        opts.cb(result)
+      end
+    end)
+  end)
+end
+
 ---Run one cell: dependencies first (when their result is stale), then the
 ---cell with its references inlined and parameters filled in.
 ---@param state dbgrid.State
@@ -768,6 +836,9 @@ function M.run_cell(state, cell, opts)
       util.warn("cell is already running (cancel with " .. tostring(cfg.keymaps.query.cancel) .. ")")
     end
     return
+  end
+  if cells.directives(cell).metrics ~= nil then
+    return run_metrics(state, cell, opts)
   end
   if #sqlmod.split(cells.sql_text(cell)) == 0 then
     if cells.prompt(cell) then
@@ -896,7 +967,7 @@ function M.run_cell(state, cell, opts)
         local function run_now()
           execute(state, cell, conn, adapter, run_stmts, extra, function(result)
             if every and result.ok and not opts.live and not state.live[cell.id] then
-              M.start_live(state, cell, every)
+              M.start_live(state, cell, every, opts.live_opts)
             end
             if opts.cb then
               opts.cb(result)
@@ -1034,7 +1105,9 @@ end
 ---@param state dbgrid.State
 ---@param cell dbgrid.Cell
 ---@param interval_ms integer
-function M.start_live(state, cell, interval_ms)
+---@param opts? { force?: boolean, quiet?: boolean }  `live all`: past `live.max_cells`, without a message per cell
+function M.start_live(state, cell, interval_ms, opts)
+  opts = opts or {}
   local cfg = config.get().live
   state.live = state.live or {}
   if state.live[cell.id] then
@@ -1044,7 +1117,7 @@ function M.start_live(state, cell, interval_ms)
   for _ in pairs(state.live) do
     n = n + 1
   end
-  if n >= (cfg.max_cells or 4) then
+  if n >= (cfg.max_cells or 4) and not opts.force then
     return util.warn("already " .. n .. " live cells in this notebook (live.max_cells)")
   end
   interval_ms = math.max(interval_ms, cfg.min_interval_ms or 1000)
@@ -1064,16 +1137,70 @@ function M.start_live(state, cell, interval_ms)
       M.live_tick(state, cell.id)
     end)
   end)
-  util.notify(
-    string.format(
-      "live: %s every %s (cancel with %s)",
-      cells.label(cell, 30),
-      util.fmt_ms(interval_ms),
-      tostring(config.get().keymaps.query.cancel)
+  if not opts.quiet then
+    util.notify(
+      string.format(
+        "live: %s every %s (cancel with %s)",
+        cells.label(cell, 30),
+        util.fmt_ms(interval_ms),
+        tostring(config.get().keymaps.query.cancel)
+      )
     )
-  )
+  end
   ui_query().render(state)
   ui_query().refresh_winbar(state)
+end
+
+---Start every `-- @every` cell of the notebook that is not live yet. Asking
+---for all of them is explicit, so `live.max_cells` does not apply.
+---@param state dbgrid.State
+---@param opts? { pin?: boolean, cb?: fun(started: integer, failed: integer) }  pin: also pin each recorded cell
+---@return integer n  cells being started
+function M.live_all(state, opts)
+  opts = opts or {}
+  cells.ensure_ids(state.buf)
+  local todo = {}
+  for _, cell in ipairs(cells.parse(state.buf)) do
+    if cells.interval_ms(cells.directives(cell).every) and not state.live[cell.id] then
+      todo[#todo + 1] = cell
+    end
+  end
+  if #todo == 0 then
+    util.notify("no cell to start: every `-- @every` cell is live already, or there is none")
+    return 0
+  end
+  local left, started, failed = #todo, 0, 0
+  util.notify(
+    string.format("live: starting %d cell%s (stop them with :Dbgrid live stop)", #todo, #todo == 1 and "" or "s")
+  )
+  for _, cell in ipairs(todo) do
+    M.run_cell(state, cell, {
+      silent = true,
+      no_deps = true,
+      live_opts = { force = true, quiet = true },
+      cb = function(result)
+        left = left - 1
+        if result.ok and state.live[cell.id] then
+          started = started + 1
+          if opts.pin and require("dbgrid.record").wanted(cell) and not (state.pins or {})[cell.id] then
+            pcall(require("dbgrid.ui.pins").open, state, cell.id)
+          end
+        else
+          failed = failed + 1
+          util.warn(
+            "live: "
+              .. cells.label(cell, 30)
+              .. " did not start: "
+              .. tostring(result.error and result.error.message or "the run failed")
+          )
+        end
+        if left == 0 and opts.cb then
+          opts.cb(started, failed)
+        end
+      end,
+    })
+  end
+  return #todo
 end
 
 ---@param state dbgrid.State

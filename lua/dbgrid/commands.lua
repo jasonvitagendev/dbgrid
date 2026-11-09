@@ -104,6 +104,9 @@ M.subcommands = {
     if args[1] == "stop" then
       return runner.stop_all_live(s, "cancelled")
     end
+    if args[1] == "all" then
+      return runner.live_all(s, { pin = args[2] == "pin" })
+    end
     local cell = current_cell(s)
     if not cell then
       return
@@ -113,7 +116,7 @@ M.subcommands = {
     end
     local ms = require("dbgrid.cells").interval_ms(args[1] or "5s")
     if not ms then
-      return util.error("usage: :Dbgrid live [interval|stop]")
+      return util.error("usage: :Dbgrid live [interval|stop|all [pin]]")
     end
     runner.run_cell(s, cell, {
       cb = function(r)
@@ -122,6 +125,55 @@ M.subcommands = {
         end
       end,
     })
+  end,
+  mark = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local function save(text)
+      text = text and util.trim(text) or ""
+      if text == "" then
+        return
+      end
+      require("dbgrid.record").mark(s.nb, text)
+      util.notify("marked " .. os.date("%H:%M:%S") .. ": " .. text)
+    end
+    if #args > 0 then
+      return save(table.concat(args, " "))
+    end
+    vim.ui.input({ prompt = "Mark (what just happened): " }, save)
+  end,
+  recordings = function(args)
+    local s = current_or_warn()
+    if not s then
+      return
+    end
+    local record = require("dbgrid.record")
+    if args[1] == "report" then
+      local report = require("dbgrid.report")
+      local text = report.markdown(s.nb)
+      if not text then
+        return util.notify("no recordings yet: add `-- @record` to a cell and run it")
+      end
+      local path = args[2] and vim.fn.expand(args[2]) or (record.dir(s.nb) .. "/report.md")
+      util.write_file(path, text)
+      util.notify("report written to " .. path)
+      vim.cmd("botright split " .. vim.fn.fnameescape(path))
+      return
+    end
+    local rows = {}
+    for _, r in ipairs(record.list(s.nb)) do
+      rows[#rows + 1] = { r.name, tostring(r.lines), util.ago(r.mtime), r.path }
+    end
+    if #rows == 0 then
+      return util.notify("no recordings yet: add `-- @record` to a cell and run it (" .. record.dir(s.nb) .. ")")
+    end
+    require("dbgrid.ui.results").show_rows(
+      s,
+      { columns = { "cell", "lines", "last written", "file" }, rows = rows },
+      { title = "recordings · " .. s.nb.meta.title }
+    )
   end,
   history = function()
     local s = require("dbgrid.state").current()

@@ -274,6 +274,10 @@ function M.winbar(buf)
   if s.live and s.live[cell_id] then
     parts[#parts + 1] = "%#DbgridWinbarLive#" .. esc(icons.live) .. " live "
   end
+  local alert = s.alerts and s.alerts[cell_id]
+  if alert and alert.firing then
+    parts[#parts + 1] = "%#DbgridWinbarError#" .. esc(icons.warn) .. " alert "
+  end
   parts[#parts + 1] = "%#DbgridWinbarDim#│ q unpins "
   return table.concat(parts)
 end

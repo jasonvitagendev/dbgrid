@@ -84,10 +84,18 @@ the cache, so moving between cells never re-runs anything.
   command. Generic ssh / command tunnels work for everything else.
 - **Diagnostics notebooks.** `:Dbgrid new --template diagnostics` gives you
   cells for active queries, blocking, top statements, bloat, unused indexes,
-  replica lag and more; `blue-green` watches an RDS blue/green deployment.
+  replica lag and more; `blue-green` watches an RDS blue/green deployment and
+  `logical-replication` a publication / subscription migration, source and
+  target side by side.
 - **Live cells and diffs.** `-- @every 5s` re-runs a cell and highlights what
   changed; `\d` diffs two runs of a cell (or the same cell on two connections);
   `:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` compare servers.
+- **Monitoring a run.** `-- @record` keeps every tick of a cell in a CSV,
+  `-- @rate` turns counters into per-second columns, `-- @alert lag_bytes >
+  1000000000` warns when a value crosses a line, and a `-- @metrics` cell
+  samples CloudWatch (CPU, IOPS, free storage) next to the SQL ones.
+  `:Dbgrid live all` starts every live cell, `:Dbgrid mark` notes what just
+  happened, and `:Dbgrid recordings report` writes the run up as markdown.
 - **Safety for writes.** The confirmation says how many rows an UPDATE or
   DELETE touches, `-- @dryrun` runs a write with RETURNING * inside a rolled
   back transaction, and DDL that takes heavy locks is called out.
@@ -383,14 +391,17 @@ select count(*) from events;
   wrapper for multi-statement cells; `-- @conn name` runs the cell on another
   connection; `-- @agent name` sends the cell's prompt to another agent;
   `-- @dryrun` runs a write inside a rolled back transaction; `-- @every 5s`
-  makes the cell live; `-- @param name = value` declares a parameter.
+  makes the cell live; `-- @record` appends every run to a CSV, `-- @rate`
+  adds per-second columns, `-- @alert` watches a value and `-- @metrics`
+  samples CloudWatch instead of running SQL (see Monitoring a run);
+  `-- @param name = value` declares a parameter.
 - `{{name}}` inside the SQL inlines the named cell as a subquery; `:name` (or
   `{{name}}` when no cell is called that) is a parameter (see Parameters).
 
 ### Templates
 
 `:Dbgrid new --template diagnostics` copies a bundled notebook into the
-project store; `:Dbgrid templates` picks one. Two ship:
+project store; `:Dbgrid templates` picks one. Three ship:
 
 - **diagnostics**: active queries, blocking tree, idle-in-transaction, long
   transactions, top statements by time / calls / buffers
@@ -410,6 +421,24 @@ project store; `:Dbgrid templates` picks one. Two ship:
 
 Your own templates go in `templates.dir`; a template is a notebook file with
 a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
+- **logical-replication**: for a migration you run yourself with a
+  publication and a subscription (RDS PostgreSQL to Aurora, or any two
+  servers). You are asked which connections are the source and the target.
+  Live cells put both sides next to each other: slot lag and the WAL the
+  source retains, initial sync progress by table state, the copies running,
+  apply and sync workers, subscription errors, sessions and wait events on
+  each side, the commit / row / block counters of each side with their rates
+  per second, and CloudWatch for each side (CPU, memory, IOPS, storage, what
+  the slot costs). The glance, load, throughput, error and CloudWatch cells
+  carry `-- @record`, so the run leaves a CSV per cell behind; a slot about
+  to lose its WAL and a subscription error raise an alert. The rest is for
+  before and after: settings on both sides, publications, tables not
+  published or without a replica identity, the biggest tables, what the
+  slots hold back, decoding spill, row counts and sequence values on both
+  sides, and writes in flight for the cutover. Every cell only reads.
+  `:Dbgrid live all` starts the live cells in one go, `:Dbgrid mark` notes
+  the steps you take, and `:Dbgrid recordings report` sums the run up (see
+  Monitoring a run).
 `-- template-connections:` header.
 
 ### Live cells
@@ -426,6 +455,70 @@ stops.
 ### Pinned results
 
 `\P` in the results pane (or `:Dbgrid pin`) pins the shown result in its own
+`:Dbgrid live all` starts every `-- @every` cell of the notebook that is not
+live yet; asking for all of them is explicit, so `live.max_cells` does not
+apply. `:Dbgrid live all pin` also pins the result of each cell that carries
+`-- @record`. `:Dbgrid live stop` stops them all.
+
+### Monitoring a run
+
+A notebook can watch something that takes hours (a migration, a backfill, a
+load test) and leave a record of it. The pieces work on any cell and combine:
+
+```sql
+-- %% throughput
+-- @every 5s
+-- @record
+-- @rate xact_commit, rows_written
+-- @alert xact_commit_per_s > 2000
+select d.xact_commit,
+       d.tup_inserted + d.tup_updated + d.tup_deleted as rows_written
+from pg_stat_database d
+where d.datname = current_database();
+```
+
+- **`-- @record`** keeps every run of the cell (a live tick or a run by
+  hand): the rows of its first result set are appended to
+  `<store>/recordings/<notebook>/<cell title>.csv`, with the time of the run
+  as the first column `ts`. `-- @record lag` names the file `lag.csv`
+  instead. A run without rows leaves a line with only the time, a failed run
+  leaves nothing, and when the columns change the old file is renamed aside
+  (`<cell>.<date>-<time>.csv`) and a new one starts. `:Dbgrid recordings`
+  lists the files of the notebook.
+- **`-- @rate a, b`** adds an `a_per_s` column next to each named column: the
+  change since the previous run of the cell divided by the seconds between
+  the two. That is what counters that only grow (`pg_stat_database`, LSNs,
+  byte totals) need to be readable. A bare `-- @rate` takes every numeric
+  column. The first run has nothing to compare with and a counter that went
+  down was reset: both give NULL. With several rows, a row is matched to its
+  previous self by the first column that gets no rate.
+- **`-- @alert column > 5, other = text`** raises an alert when any row meets
+  any of the conditions (`>`, `>=`, `<`, `<=`, `=`, `!=`; numbers compare as
+  numbers, NULL never matches). You get a warning when it starts and a note
+  when it clears, the cell shows it while it lasts, and for a recorded cell
+  both moments go into the timeline of the report. Rate columns can be
+  tested like any other.
+- **`-- @metrics`** makes a cell without SQL: it samples CloudWatch for the
+  cell's connection (an AWS connection with `cluster` or `instance`) and
+  shows the newest datapoint of each metric as one row. Byte counts are in
+  MiB and latencies in ms, with the unit in the column name, so the values
+  record, chart and alert like any other. Without names it samples CPU,
+  connections, memory, IOPS, storage and what replication slots cost
+  (`TransactionLogsDiskUsage`, `ReplicationSlotDiskUsage`,
+  `OldestReplicationSlotLag`); `-- @metrics CPUUtilization, DiskQueueDepth`
+  picks others. CloudWatch has one datapoint a minute, a minute or two late
+  (`datapoint_utc` says which one you see), so `-- @every` is at least 60s
+  on such a cell. The role needs `cloudwatch:GetMetricData`.
+- **`:Dbgrid mark subscription created`** notes a moment of the run (without
+  text it asks). Marks go to `recordings/<notebook>/marks.csv`.
+- **`:Dbgrid recordings report [file]`** writes the run up as markdown
+  (`recordings/<notebook>/report.md` unless a file is given) and opens it:
+  a timeline of marks and alerts, then per recording the minimum, average,
+  maximum and last value of every numeric column with a sparkline, how often
+  each state of a text column was seen, and the averages per phase between
+  marks. A recording with several rows per run (one per slot, say) is
+  reported per value of its first column, the eight busiest ones.
+
 small window under the pane, so it stays visible while you move between cells
 and run other queries — the results pane keeps following you. A pin tracks
 its cell: re-running the cell (or a live tick) re-renders it, and the winbar
@@ -532,6 +625,10 @@ one confirmation. Subcommands (with completion):
 | `diff [connection]` | diff against the previous run, or run the cell on another connection and diff |
 | `pin` | pin the shown result in its own window (toggle) |
 | `follow [cell]` / `more` / `edit` | follow the foreign key under the cursor / load the next page / write the UPDATE for the value |
+| `live all [pin]` | start every `-- @every` cell (and pin the recorded ones) |
+| `mark [text]` | note a moment of the run for the recordings report |
+| `recordings` | list the CSV files `-- @record` cells of this notebook wrote |
+| `recordings report [file]` | write the recordings up as markdown and open it |
 | `undo` | write the statements that reverse the cell's last `UPDATE` / `DELETE` as a cell |
 | `backend [cancel\|terminate] [pid]` | signal the backend of the row under the cursor (asks when no action is given) |
 | `columns [hide col \| show col\|all]` | hide or show columns of the shown result |
@@ -1028,6 +1125,11 @@ SSM port forwarding. Nothing else is sent.
   metadata. These are the files meant for committing.
 
 **Read from disk** without asking: `DATABASE_URL` and friends from the
+- `recordings/<notebook>/<cell>.csv`: the rows of every run of a cell that
+  carries `-- @record`, plus `marks.csv` (`:Dbgrid mark`, alerts of recorded
+  cells) and `report.md` (`:Dbgrid recordings report`). Real data; gitignored
+  in a project store. Nothing is written without the directive or the
+  command.
 environment and from `.env`, `.env.local`, `.env.development` and
 `.env.development.local` in the project root (`env_files`, `env_vars`), and
 `config/database.yml` in a Rails project (`rails.enabled`). A URL found this

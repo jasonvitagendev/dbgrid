@@ -396,6 +396,10 @@ local function render_footer(s, result, ctx)
       (live.changed_count or 0) > 0 and (" · " .. live.changed_count .. " changed") or ""
     )
   end
+  local alert = s.alerts and ctx.cell_id and s.alerts[ctx.cell_id]
+  if alert and alert.firing then
+    parts[#parts + 1] = icons.warn .. " alert: " .. tostring(alert.text)
+  end
   if #lines > 0 and lines[#lines] ~= "" then
     add("")
   end

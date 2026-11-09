@@ -69,7 +69,8 @@ Storage: `storage.mode` is "auto" (use `<root>/.dbgrid` when it exists, else
 the data directory), "project" or "data". The `.sql` and `.json` of a
 notebook are made to be committed; the `.cache.json` (the last
 `storage.cache_rows` rows per cell and the parameter values typed in) and
-`history.jsonl` hold data and are gitignored in a project store.
+`history.jsonl` hold data and are gitignored in a project store, as is
+`recordings/` (the CSV files of `-- @record` cells, marks and the report).
 
 See `lua/dbgrid/config.lua` for every default, including all keymaps.
 
@@ -102,6 +103,12 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 `:name`              a parameter.
 
 ==============================================================================
+`-- @record [name]`  append every run to a CSV (|dbgrid-monitor|).
+`-- @rate [a, b]`    add `a_per_s` columns: change per second since the
+                     previous run (|dbgrid-monitor|).
+`-- @alert a > 5`    warn when a row meets a condition (|dbgrid-monitor|).
+`-- @metrics [a, b]` no SQL: sample CloudWatch for the cell's connection
+                     (|dbgrid-monitor|).
 4. COMMANDS                                                  *dbgrid-commands*
 
 :Dbgrid                        pick a notebook (or create one)       *:Dbgrid*
@@ -155,6 +162,12 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
 :Dbgrid pin                    pin the shown result in its own window (toggle)
 :Dbgrid follow [cell]          follow the foreign key of the value under the
                                cursor (|dbgrid-actions|)
+:Dbgrid live all [pin]         start every `-- @every` cell (pin: also pin
+                               the recorded ones)
+:Dbgrid mark [text]            note a moment of the run (|dbgrid-monitor|)
+:Dbgrid recordings             list the CSV files of `-- @record` cells
+:Dbgrid recordings report [file]
+                               write the recordings up as markdown
 :Dbgrid more                   load the next page of the shown result
 :Dbgrid edit                   write the UPDATE for the value as a cell
 :Dbgrid undo                   write the reverse of the cell's last UPDATE /
@@ -406,7 +419,7 @@ gives the agent a read-only `dbgrid-query` shell helper on the connection.
 ==============================================================================
 12. TEMPLATES                                               *dbgrid-templates*
 
-`:Dbgrid new --template diagnostics` and `:Dbgrid new --template blue-green`
+`:Dbgrid new --template diagnostics`, `blue-green` and `logical-replication`
 copy a bundled notebook into the project. Diagnostics: active queries,
 blocking tree, idle in transaction, long transactions, top statements
 (pg_stat_statements), seq scans, dead tuples, unused and redundant indexes,
@@ -415,8 +428,15 @@ replication, settings, extensions, locks on a table, cancel a backend.
 Blue-green: slot lag, sender and subscription state, writes in flight, rows
 written, application sessions, long transactions, tables without replica
 identity, row counts and sequences on both sides, green accepts writes; every
-cell is read-only. Cells with `-- @conn blue|green` are bound to the
-connections you pick. `templates.dir` adds your own (header lines
+cell is read-only. Logical-replication: a publication / subscription
+migration (RDS PostgreSQL to Aurora, or any two servers) seen from both
+sides: slot lag and retained WAL, initial sync progress, copies running,
+workers, subscription errors, sessions, counters with their rates and
+CloudWatch for the source and the target (recorded, see |dbgrid-monitor|),
+settings, publications, tables not published or without replica identity,
+row counts and sequences on both sides, writes in flight; every cell is
+read-only. Cells with `-- @conn blue|green` (`source|target`) are bound to
+the connections you pick. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
 `-- template-connections:`).
 
@@ -438,6 +458,39 @@ by the table's primary key (or an `id` column, or whole rows).
 `:Dbgrid diff {connection}` runs the cell on another connection and diffs.
 `:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` open a scratch
 buffer (`]c` / `[c` jump between tables, `q` closes).
+`:Dbgrid live all` starts every `-- @every` cell that is not live yet,
+past `live.max_cells`; `live all pin` also pins the recorded ones.
+
+MONITORING A RUN                                              *dbgrid-monitor*
+
+`-- @record` appends the first result set of every run of the cell (live
+tick or not) to `<store>/recordings/<notebook>/<cell title>.csv`, the time
+of the run first (`ts`); `-- @record lag` names the file. A run without rows
+leaves a line with only the time, a failed run nothing; when the columns
+change the old file is renamed aside. `:Dbgrid recordings` lists the files.
+
+`-- @rate a, b` adds an `a_per_s` column next to each named column: the
+change since the previous run divided by the seconds between the two (for
+counters that only grow). Bare `-- @rate`: every numeric column. The first
+run and a counter that went down give NULL. Rows are matched by the first
+column that gets no rate.
+
+`-- @alert col > 5, other = text` raises an alert when any row meets any
+condition (`>` `>=` `<` `<=` `=` `!=`; NULL never matches): a warning when
+it starts, a note when it clears, a marker on the cell meanwhile, and for a
+recorded cell a line in the report's timeline.
+
+`-- @metrics [names]` makes a cell without SQL that samples CloudWatch for
+its connection (an AWS connection with `cluster` or `instance`): the newest
+datapoint of each metric as one row, bytes in MiB and latencies in ms. One
+datapoint a minute, so `-- @every` is at least 60s. Needs
+`cloudwatch:GetMetricData`.
+
+`:Dbgrid mark [text]` notes a moment (`recordings/<notebook>/marks.csv`).
+`:Dbgrid recordings report [file]` writes markdown: the timeline of marks
+and alerts, then per recording min / avg / max / last and a sparkline of
+every numeric column, the states of text columns, and averages per phase
+between marks.
 
 Every statement is appended to `<store>/history.jsonl` as it ran, with
 parameter values substituted (`history.enabled`, `history.max_entries`;
