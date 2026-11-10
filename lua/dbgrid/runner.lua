@@ -1542,7 +1542,7 @@ function M.analyze_cell(state, cell, opts)
               if opts.cb then
                 opts.cb(text)
               end
-            end, { connection = conn })
+            end, { agent = ai.agent_name(state, cell), connection = conn })
           end
           if cfg.ai.analyze.include_stats ~= false and #tables > 0 then
             local names = {}
@@ -1622,7 +1622,7 @@ function M.explain_error(state, cell, opts)
         if opts.cb then
           opts.cb(answer)
         end
-      end, { connection = conn })
+      end, { agent = ai.agent_name(state, cell), connection = conn })
     end)
   end)
 end

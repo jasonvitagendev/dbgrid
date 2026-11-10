@@ -376,6 +376,24 @@ H.describe("running features", function()
     results_ui.show(s, "a1", { view = "plan" })
     H.matches(results_text(s), "analysis %(EXPLAIN ANALYZE")
     require("dbgrid.ui.analysis").close(s)
+    -- the cell's `-- @agent` wins over the configured default, as it does for prompts
+    local cfg = require("dbgrid.config").get()
+    cfg.ai.agents.other = { cmd = { "sh", "-c", "echo '## Fix'; echo 'from the other agent'" }, stdin = false }
+    set_cells(s, { "-- %% [a2] slow", "-- @agent other", "select * from users where balance > 5" })
+    text, err = nil, nil
+    runner.analyze_cell(s, cells.parse(s.buf)[1], {
+      silent = true,
+      cb = function(t, e)
+        text, err = t, e
+      end,
+    })
+    H.truthy(H.wait(30000, function()
+      return text ~= nil or err ~= nil
+    end))
+    H.eq(err, nil)
+    H.matches(text, "from the other agent")
+    cfg.ai.agents.other = nil
+    require("dbgrid.ui.analysis").close(s)
   end)
 
   H.it("builds analyze and error prompts with redaction", function()
