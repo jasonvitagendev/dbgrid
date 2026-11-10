@@ -396,7 +396,8 @@ local execute_done, run_metrics
 ---@param adapter dbgrid.Adapter
 ---@param run_stmts dbgrid.RunStatement[]
 ---@param extra { warnings: table[], plans: table[], transaction: boolean, dry_run?: boolean, live?: boolean,
----  sql: string, params?: table, refs?: string[], undo?: dbgrid.UndoEntry[], undo_skipped?: string }
+---  sql: string, params?: table, refs?: string[], undo?: dbgrid.UndoEntry[], undo_skipped?: string,
+---  redact?: string[] }
 local function execute(state, cell, conn, adapter, run_stmts, extra, cb)
   local cfg = config.get()
   local started = util.now()
@@ -441,6 +442,10 @@ end
 function execute_done(state, cell, conn, run_stmts, extra, res, cb)
   local cfg = config.get()
   local fresh = cells.by_id(state.buf, cell.id) or cell
+  if extra.redact and #extra.redact > 0 then
+    -- a `-- @secret` value must not reach the cache, the history or the screen through an error line
+    require("dbgrid.secrets").redact_table(res, extra.redact)
+  end
   local truncated = false
   for i, st in ipairs(res.statements) do
     st.plan = extra.plans[i]
@@ -883,183 +888,227 @@ function M.run_cell(state, cell, opts)
     end
   end
   local directives = cells.directives(cell)
-  expand.prepare(state, cell, { values = opts.values, silent = opts.silent or opts.live }, function(exp, err)
-    if not exp then
-      if not opts.live then
-        util.error("cannot run: " .. tostring(err))
-      end
-      return
+  local secretsmod = require("dbgrid.secrets")
+  local secret_decls = secretsmod.declared(cell)
+  local conn_override = type(directives.conn) == "string" and directives.conn or nil
+  -- `-- @secret` values come from Secrets Manager through the cell's connection, so that
+  -- connection is resolved first; the values only ever live in `exp.text` and the psql stdin
+  local function resolve_secrets(cb)
+    if #secret_decls == 0 then
+      return cb(nil, nil)
     end
-    local text, params = exp.text, exp.params
-    local stmts = sqlmod.split(text)
-    if #stmts == 0 then
-      util.warn("nothing to run in this cell")
-      return
-    end
-    local every = cells.interval_ms(directives.every)
-    if directives.every and not every and not opts.live then
-      util.warn("bad @every value '" .. tostring(directives.every) .. "' (use 5s, 2m, 500ms)")
-    end
-    M.with_connection(state, type(directives.conn) == "string" and directives.conn or nil, function(conn)
-      local adapter = adapter_for(conn)
-      if not adapter then
-        return
-      end
-      local dry_run = opts.dry_run or directives.dryrun ~= nil or cfg.query.dry_run
-      -- prepare statements
-      local run_stmts = {}
-      local has_tx, has_write = false, false
-      for i, st in ipairs(stmts) do
-        local sql, applied = st.sql, false
-        if not directives.nolimit and cfg.query.limit then
-          sql, applied = sqlmod.ensure_limit(st, cfg.query.limit)
-        end
-        if st.class == "tx" then
-          has_tx = true
-        end
-        if st.class == "write" or st.class == "ddl" then
-          has_write = true
-          if dry_run and st.class == "write" and sqlmod.ensure_returning then
-            sql = sqlmod.ensure_returning(st)
+    M.with_connection(state, conn_override, function(conn)
+      secretsmod.resolve(conn, secret_decls, function(literals, raw, serr)
+        if not literals then
+          if not opts.live then
+            util.error("cannot run: " .. tostring(serr))
           end
+          return
         end
-        run_stmts[i] = {
-          sql = sql,
-          kind = st.kind,
-          class = st.class,
-          line = st.line,
-          limit_applied = applied and cfg.query.limit or nil,
-          unlimited = applied and st.sql or nil,
-        }
-      end
-      dry_run = dry_run and has_write
-      if has_write and conn.readonly and not dry_run then
-        util.error("connection '" .. conn.name .. "' is read-only")
-        return
-      end
-      if every and has_write then
-        util.error("@every only applies to read-only cells")
-        return
-      end
-      if opts.live and has_write then
-        return
-      end
-      local function after_confirm()
-        local transaction = (cfg.query.transaction_per_cell and #stmts > 1 and not has_tx and not directives.notx)
-          or (dry_run and not has_tx)
-        local mode = conn.index_check or cfg.index_check.mode or "warn"
-        local explainable = {}
-        for i, st in ipairs(stmts) do
-          if sqlmod.is_explainable(st) then
-            explainable[#explainable + 1] = { i = i, stmt = run_stmts[i] }
+        cb(literals, raw)
+      end)
+    end)
+  end
+  resolve_secrets(function(secret_literals, secret_raw)
+    expand.prepare(
+      state,
+      cell,
+      { values = opts.values, silent = opts.silent or opts.live, secrets = secret_literals },
+      function(exp, err)
+        if not exp then
+          if not opts.live then
+            util.error("cannot run: " .. tostring(err))
           end
+          return
         end
-        local extra = {
-          warnings = {},
-          plans = {},
-          transaction = transaction,
-          dry_run = dry_run,
-          live = opts.live,
-          sql = text,
-          params = next(params or {}) and params or nil,
-          refs = exp.cells,
-        }
-        local function run_now()
-          execute(state, cell, conn, adapter, run_stmts, extra, function(result)
-            if every and result.ok and not opts.live and not state.live[cell.id] then
-              M.start_live(state, cell, every, opts.live_opts)
-            end
-            if opts.cb then
-              opts.cb(result)
-            end
-          end)
+        local text, params = exp.text, exp.params
+        local stmts = sqlmod.split(text)
+        if #stmts == 0 then
+          util.warn("nothing to run in this cell")
+          return
         end
-        local function go()
-          -- keep the rows an UPDATE / DELETE is about to touch, so the undo can be written later
-          if not has_write or dry_run or opts.live or (cfg.query.undo_rows or 0) <= 0 then
-            return run_now()
+        local every = cells.interval_ms(directives.every)
+        if directives.every and not every and not opts.live then
+          util.warn("bad @every value '" .. tostring(directives.every) .. "' (use 5s, 2m, 500ms)")
+        end
+        M.with_connection(state, conn_override, function(conn)
+          local adapter = adapter_for(conn)
+          if not adapter then
+            return
           end
-          local undo = require("dbgrid.undo")
-          schema.get(conn, function(sch)
-            if not vim.api.nvim_buf_is_valid(state.buf) then
-              return
+          local dry_run = opts.dry_run or directives.dryrun ~= nil or cfg.query.dry_run
+          -- prepare statements
+          local run_stmts = {}
+          local has_tx, has_write = false, false
+          for i, st in ipairs(stmts) do
+            local sql, applied = st.sql, false
+            if not directives.nolimit and cfg.query.limit then
+              sql, applied = sqlmod.ensure_limit(st, cfg.query.limit)
             end
-            state.running[cell.id] = { started = util.now(), kind = "undo", conn = conn, adapter = adapter }
-            ui_query().start_spinner(state)
-            local job = undo.capture(conn, adapter, sch, stmts, function(entries, note, cancelled)
-              state.running[cell.id] = nil
-              if cancelled then
-                -- `\x` while the rows were being read: the write does not run either
-                set_runtime(state, cell, "idle")
-                ui_query().render(state)
-                util.notify("cancelled before the write ran")
+            if st.class == "tx" then
+              has_tx = true
+            end
+            if st.class == "write" or st.class == "ddl" then
+              has_write = true
+              if dry_run and st.class == "write" and sqlmod.ensure_returning then
+                sql = sqlmod.ensure_returning(st)
+              end
+            end
+            run_stmts[i] = {
+              sql = sql,
+              kind = st.kind,
+              class = st.class,
+              line = st.line,
+              limit_applied = applied and cfg.query.limit or nil,
+              unlimited = applied and st.sql or nil,
+            }
+          end
+          dry_run = dry_run and has_write
+          if has_write and conn.readonly and not dry_run then
+            util.error("connection '" .. conn.name .. "' is read-only")
+            return
+          end
+          if every and has_write then
+            util.error("@every only applies to read-only cells")
+            return
+          end
+          if opts.live and has_write then
+            return
+          end
+          local function after_confirm()
+            local transaction = (cfg.query.transaction_per_cell and #stmts > 1 and not has_tx and not directives.notx)
+              or (dry_run and not has_tx)
+            -- CREATE SUBSCRIPTION, VACUUM, CREATE INDEX CONCURRENTLY ... refuse a transaction block
+            local blocker
+            for _, st in ipairs(stmts) do
+              blocker = blocker or sqlmod.no_transaction(st)
+            end
+            if transaction and blocker then
+              if dry_run then
+                util.error(blocker .. " cannot run inside a transaction block, so it cannot be dry-run")
                 return
               end
-              extra.undo = entries
-              extra.undo_skipped = note
-              run_now()
-            end)
-            if job and state.running[cell.id] then
-              state.running[cell.id].job = job
-            end
-          end)
-        end
-        if mode == "off" or #explainable == 0 or opts.live then
-          return go()
-        end
-        -- pre-flight EXPLAIN for the index check
-        set_runtime(state, cell, "planning")
-        state.running[cell.id] = { started = util.now(), kind = "explain", conn = conn, adapter = adapter }
-        ui_query().start_spinner(state)
-        local list = vim.tbl_map(function(e)
-          return e.stmt
-        end, explainable)
-        state.running[cell.id].job = adapter.explain(conn, list, function(plans)
-          state.running[cell.id] = nil
-          local sch = schema.loaded(conn)
-          local warnings, by_index = {}, {}
-          for k, e in ipairs(explainable) do
-            local plan = plans[k]
-            if plan then
-              by_index[e.i] = plan
-              local ws = explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows, sql = e.stmt.sql })
-              for _, w in ipairs(ws) do
-                warnings[#warnings + 1] = w
+              transaction = false
+              if not opts.live and not opts.silent then
+                util.notify(blocker .. " cannot run inside a transaction block: the cell runs without one")
               end
             end
-          end
-          if #warnings > 0 and mode == "confirm" and not opts.silent then
-            local lines = vim.tbl_map(function(w)
-              return "• " .. w.message
-            end, warnings)
-            local choice = vim.fn.confirm(
-              "The planner will scan without an index:\n\n" .. table.concat(lines, "\n") .. "\n\nRun anyway?",
-              "&Run\n&Cancel",
-              2,
-              "Warning"
-            )
-            if choice ~= 1 then
-              set_runtime(state, cell, "idle", { warnings = warnings })
-              return
+            local mode = conn.index_check or cfg.index_check.mode or "warn"
+            local explainable = {}
+            for i, st in ipairs(stmts) do
+              if sqlmod.is_explainable(st) then
+                explainable[#explainable + 1] = { i = i, stmt = run_stmts[i] }
+              end
             end
-          elseif #warnings > 0 and not opts.silent then
-            util.warn(warnings[1].message .. (#warnings > 1 and (" (+" .. (#warnings - 1) .. " more)") or ""))
+            local extra = {
+              warnings = {},
+              plans = {},
+              transaction = transaction,
+              dry_run = dry_run,
+              live = opts.live,
+              sql = exp.safe_text or text,
+              params = next(params or {}) and params or nil,
+              refs = exp.cells,
+              redact = secret_raw,
+            }
+            local function run_now()
+              execute(state, cell, conn, adapter, run_stmts, extra, function(result)
+                if every and result.ok and not opts.live and not state.live[cell.id] then
+                  M.start_live(state, cell, every, opts.live_opts)
+                end
+                if opts.cb then
+                  opts.cb(result)
+                end
+              end)
+            end
+            local function go()
+              -- keep the rows an UPDATE / DELETE is about to touch, so the undo can be written later
+              if not has_write or dry_run or opts.live or (cfg.query.undo_rows or 0) <= 0 then
+                return run_now()
+              end
+              local undo = require("dbgrid.undo")
+              schema.get(conn, function(sch)
+                if not vim.api.nvim_buf_is_valid(state.buf) then
+                  return
+                end
+                state.running[cell.id] = { started = util.now(), kind = "undo", conn = conn, adapter = adapter }
+                ui_query().start_spinner(state)
+                local job = undo.capture(conn, adapter, sch, stmts, function(entries, note, cancelled)
+                  state.running[cell.id] = nil
+                  if cancelled then
+                    -- `\x` while the rows were being read: the write does not run either
+                    set_runtime(state, cell, "idle")
+                    ui_query().render(state)
+                    util.notify("cancelled before the write ran")
+                    return
+                  end
+                  extra.undo = entries
+                  extra.undo_skipped = note
+                  run_now()
+                end)
+                if job and state.running[cell.id] then
+                  state.running[cell.id].job = job
+                end
+              end)
+            end
+            if mode == "off" or #explainable == 0 or opts.live then
+              return go()
+            end
+            -- pre-flight EXPLAIN for the index check
+            set_runtime(state, cell, "planning")
+            state.running[cell.id] = { started = util.now(), kind = "explain", conn = conn, adapter = adapter }
+            ui_query().start_spinner(state)
+            local list = vim.tbl_map(function(e)
+              return e.stmt
+            end, explainable)
+            state.running[cell.id].job = adapter.explain(conn, list, function(plans)
+              state.running[cell.id] = nil
+              local sch = schema.loaded(conn)
+              local warnings, by_index = {}, {}
+              for k, e in ipairs(explainable) do
+                local plan = plans[k]
+                if plan then
+                  by_index[e.i] = plan
+                  local ws = explain.warnings(plan, sch, { min_rows = cfg.index_check.min_rows, sql = e.stmt.sql })
+                  for _, w in ipairs(ws) do
+                    warnings[#warnings + 1] = w
+                  end
+                end
+              end
+              if #warnings > 0 and mode == "confirm" and not opts.silent then
+                local lines = vim.tbl_map(function(w)
+                  return "• " .. w.message
+                end, warnings)
+                local choice = vim.fn.confirm(
+                  "The planner will scan without an index:\n\n" .. table.concat(lines, "\n") .. "\n\nRun anyway?",
+                  "&Run\n&Cancel",
+                  2,
+                  "Warning"
+                )
+                if choice ~= 1 then
+                  set_runtime(state, cell, "idle", { warnings = warnings })
+                  return
+                end
+              elseif #warnings > 0 and not opts.silent then
+                util.warn(warnings[1].message .. (#warnings > 1 and (" (+" .. (#warnings - 1) .. " more)") or ""))
+              end
+              extra.warnings = warnings
+              extra.plans = by_index
+              go()
+            end)
           end
-          extra.warnings = warnings
-          extra.plans = by_index
-          go()
-        end)
-      end
-      if has_write and cfg.query.confirm_writes and not opts.silent then
-        confirm_writes(conn, adapter, stmts, { dry_run = dry_run }, function(ok)
-          if ok then
+          if has_write and cfg.query.confirm_writes and not opts.silent then
+            confirm_writes(conn, adapter, stmts, { dry_run = dry_run }, function(ok)
+              if ok then
+                after_confirm()
+              end
+            end)
+          else
             after_confirm()
           end
         end)
-      else
-        after_confirm()
       end
-    end)
+    )
   end)
 end
 

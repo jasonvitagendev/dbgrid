@@ -390,6 +390,44 @@ function M.has_statements(text)
   return #M.tokenize(text) > 0
 end
 
+---Why a statement cannot run inside a transaction block (as psql reports it:
+---CREATE SUBSCRIPTION, VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE,
+---ALTER SYSTEM ...), or nil. The runner leaves such a cell out of the
+---per-cell transaction.
+---@param stmt dbgrid.Statement
+---@return string? what
+function M.no_transaction(stmt)
+  local words = {}
+  for _, t in ipairs(stmt.tokens or {}) do
+    if t.type == "word" then
+      words[#words + 1] = t.lower
+      if #words == 3 then
+        break
+      end
+    end
+  end
+  local a, b = words[1], words[2]
+  if not a then
+    return nil
+  end
+  if a == "vacuum" then
+    return "VACUUM"
+  end
+  if a == "alter" and b == "system" then
+    return "ALTER SYSTEM"
+  end
+  if a == "discard" and b == "all" then
+    return "DISCARD ALL"
+  end
+  if (a == "create" or a == "drop") and (b == "database" or b == "tablespace" or b == "subscription") then
+    return a:upper() .. " " .. b:upper()
+  end
+  if (a == "create" or a == "drop" or a == "reindex") and M.first_top_level_word(stmt, { concurrently = true }) then
+    return a:upper() .. " ... CONCURRENTLY"
+  end
+  return nil
+end
+
 ---@param stmt dbgrid.Statement
 ---@param words table<string,boolean>
 ---@return dbgrid.Token?

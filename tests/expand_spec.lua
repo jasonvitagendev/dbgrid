@@ -102,3 +102,46 @@ H.describe("expand", function()
     H.eq(all[2].value, "42")
   end)
 end)
+
+H.describe("expand.prepare with secrets", function()
+  H.it("substitutes a resolved secret but keeps it out of params and safe_text", function()
+    local s, b = state_with({
+      "-- %% [cc33] subscribe",
+      "-- @secret conn = conninfo:x",
+      "create subscription s connection :conn publication p with (copy_data = :copy)",
+    })
+    local list = cells.parse(b)
+    local exp, err
+    expand.prepare(
+      s,
+      list[1],
+      { values = { copy = "true" }, secrets = { conn = "'host=h password=pw'" } },
+      function(e, er)
+        exp, err = e, er
+      end
+    )
+    H.eq(err, nil)
+    H.eq(
+      exp.text,
+      "-- @secret conn = conninfo:x\ncreate subscription s connection 'host=h password=pw' publication p with (copy_data = true)"
+    )
+    H.eq(
+      exp.safe_text,
+      "-- @secret conn = conninfo:x\ncreate subscription s connection :conn publication p with (copy_data = true)"
+    )
+    H.eq(exp.params, { copy = "true" })
+    H.eq(exp.param_source.conn, "secret")
+    H.eq(notebook.params(s.nb).conn, nil)
+  end)
+  H.it("lists the secret in notebook_params without its value", function()
+    local s, _ = state_with({
+      "-- %% [dd44] subscribe",
+      "-- @secret pw = prod/db",
+      "select :pw",
+    })
+    local list = expand.notebook_params(s)
+    H.eq(list[1].name, "pw")
+    H.eq(list[1].source, "secret")
+    H.eq(list[1].value, "(secret prod/db)")
+  end)
+end)

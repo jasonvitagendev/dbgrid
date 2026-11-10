@@ -13,6 +13,7 @@ local M = {}
 ---@field params table<string,string> parameter values used (name -> SQL literal text)
 ---@field cells string[]              ids of the cells that were inlined
 ---@field param_source table<string,string> where each value came from ("cell", "notebook", "prompt")
+---@field safe_text string            `text` with `-- @secret` values left as their `:name` (for history and display)
 
 ---Inline `{{other cell}}` references into a cell's body, recursively.
 ---@param buf integer
@@ -96,7 +97,9 @@ end
 ---without asking.
 ---@param s dbgrid.State
 ---@param cell dbgrid.Cell
----@param opts? { values?: table<string,string>, silent?: boolean }
+---@param opts? { values?: table<string,string>, silent?: boolean, secrets?: table<string,string> }
+---  `secrets`: `-- @secret` values already resolved (name -> SQL literal); they are substituted but
+---  kept out of `params`, `safe_text` and the notebook
 ---@param cb fun(exp?: dbgrid.Expansion, err?: string)
 function M.prepare(s, cell, opts, cb)
   opts = opts or {}
@@ -106,10 +109,13 @@ function M.prepare(s, cell, opts, cb)
   end
   local names, refs = M.parameter_names(text)
   local values, source, missing = {}, {}, {}
+  local secrets = opts.secrets or {}
   local meta_params = notebook.params(s.nb)
   for _, name in ipairs(names) do
     local v = opts.values and opts.values[name]
-    if v and v ~= "" then
+    if secrets[name] then
+      source[name] = "secret"
+    elseif v and v ~= "" then
       values[name], source[name] = v, "given"
     elseif declared[name] and declared[name] ~= "" then
       values[name], source[name] = declared[name], "cell"
@@ -120,11 +126,18 @@ function M.prepare(s, cell, opts, cb)
     end
   end
   local function finish()
-    local out = sqlmod.substitute(text, refs, function(r)
+    local safe = sqlmod.substitute(text, refs, function(r)
       local v = values[r.name]
       return v and (v:gsub("\n", " ")) or nil
     end)
-    cb({ text = out, params = values, cells = used, param_source = source })
+    local out = safe
+    if next(secrets) then
+      out = sqlmod.substitute(text, refs, function(r)
+        local v = secrets[r.name] or values[r.name]
+        return v and (v:gsub("\n", " ")) or nil
+      end)
+    end
+    cb({ text = out, safe_text = safe, params = values, cells = used, param_source = source })
   end
   if #missing == 0 then
     return finish()
@@ -167,6 +180,7 @@ function M.notebook_params(s)
   local list = cells.parse(s.buf)
   local by_name, order = {}, {}
   local meta_params = notebook.params(s.nb)
+  local secret_names = {}
   for _, cell in ipairs(list) do
     local declared = {}
     for _, p in ipairs(cells.params(cell)) do
@@ -175,6 +189,9 @@ function M.notebook_params(s)
         by_name[p.name] = { name = p.name, cells = {} }
         order[#order + 1] = p.name
       end
+    end
+    for _, d in ipairs(require("dbgrid.secrets").declared(cell)) do
+      secret_names[d.name] = d.spec
     end
     local text = cells.body_text(cell)
     for _, r in ipairs(sqlmod.placeholders(text)) do
@@ -199,7 +216,10 @@ function M.notebook_params(s)
   local out = {}
   for _, name in ipairs(order) do
     local e = by_name[name]
-    if e.value == nil and type(meta_params[name]) == "string" and meta_params[name] ~= "" then
+    if secret_names[name] then
+      e.value = "(secret " .. secret_names[name] .. ")"
+      e.source = "secret"
+    elseif e.value == nil and type(meta_params[name]) == "string" and meta_params[name] ~= "" then
       e.value = meta_params[name]
       e.source = "notebook"
     end

@@ -1122,6 +1122,36 @@ function M.secret(aws_cfg, secret_id, cb)
   end)
 end
 
+---Read a secret as its decoded JSON object (`{ value = ... }` for a plain-text
+---secret), once per session, for `-- @secret` cells. Not validated like M.secret:
+---any keys go.
+---@param aws_cfg dbgrid.AwsConfig
+---@param secret_id string
+---@param cb fun(secret?: table, err?: string)
+function M.secret_json(aws_cfg, secret_id, cb)
+  local key = cache_key(aws_cfg) .. "|secret-json|" .. secret_id
+  if secret_cache[key] then
+    return cb(secret_cache[key])
+  end
+  M.cli(aws_cfg, { "secretsmanager", "get-secret-value", "--secret-id", secret_id }, function(res)
+    if not res.ok then
+      return cb(nil, cli_error(aws_cfg, "reading secret " .. secret_id, res))
+    end
+    local data, err = decode(res.json or res.stdout)
+    if not data then
+      return cb(nil, err)
+    end
+    local text = nz(data.SecretString)
+    if type(text) ~= "string" then
+      return cb(nil, "the secret has no SecretString (binary secrets are not supported)")
+    end
+    local ok, obj = pcall(vim.json.decode, text)
+    local secret = (ok and type(obj) == "table") and obj or { value = text }
+    secret_cache[key] = secret
+    cb(secret)
+  end)
+end
+
 ---Database credentials: the Secrets Manager secret, or an IAM auth token.
 ---Cached in memory until forget_credentials() or the token expires.
 ---@param aws_cfg dbgrid.AwsConfig

@@ -22,6 +22,10 @@ the cache, so moving between cells never re-runs anything.
 - **Parameters.** `:since` or `{{since}}` in a query is filled from a
   `-- @param since = '2026-01-01'` line, from a value the notebook remembers,
   or from a prompt the first time it runs.
+- **Secrets.** `-- @secret conn = conninfo:prod/replication` fills `:conn`
+  from AWS Secrets Manager when the cell runs, for statements that need a
+  password in the SQL (`CREATE SUBSCRIPTION ... CONNECTION :conn`). The value
+  stays out of the notebook, the history and error output.
 - **Cross-cell references.** `{{overdue-invoices}}` inlines another cell as a
   subquery; `-- @depends setup` runs a cell first when its result is stale, and
   `run all` follows the dependency order.
@@ -391,13 +395,15 @@ select count(*) from events;
   is SQL: `'2026-01-01'`, `42`, `now()`); `-- @param name` alone declares it.
 - `-- @depends a, b` runs cells `a` and `b` first when their result is stale.
 - `-- @nolimit` skips the automatic `LIMIT`; `-- @notx` skips the transaction
-  wrapper for multi-statement cells; `-- @conn name` runs the cell on another
+  wrapper for multi-statement cells (skipped on its own for statements that
+  refuse a transaction block, such as CREATE SUBSCRIPTION or VACUUM); `-- @conn name` runs the cell on another
   connection; `-- @agent name` sends the cell's prompt to another agent;
   `-- @dryrun` runs a write inside a rolled back transaction; `-- @every 5s`
   makes the cell live; `-- @record` appends every run to a CSV, `-- @rate`
   adds per-second columns, `-- @alert` watches a value and `-- @metrics`
   samples CloudWatch instead of running SQL (see Monitoring a run);
-  `-- @param name = value` declares a parameter.
+  `-- @param name = value` declares a parameter; `-- @secret name = spec`
+  declares one read from AWS Secrets Manager when the cell runs (see Secrets).
 - `{{name}}` inside the SQL inlines the named cell as a subquery; `:name` (or
   `{{name}}` when no cell is called that) is a parameter (see Parameters).
 

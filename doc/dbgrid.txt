@@ -331,6 +331,30 @@ a parenthesised subquery with comments removed. It must be one read-only
 statement; cycles are reported; its own `-- @param` values are kept. The
 footer lists what was inlined; completion offers cell names after `{{`.
 
+Secrets ~
+                                                              *dbgrid-secrets*
+`-- @secret name = spec` is a parameter read from AWS Secrets Manager when
+the cell runs, through the cell's connection (one with an `aws` block, same
+profile and region). The value is substituted for `:name` as a SQL string
+literal and never remembered: it is not written to the notebook, the result
+cache or `history.jsonl` (which keep `:name`), and it is masked in results
+and error lines. The spec is:
+>sql
+  -- @secret pw = prod/db                 the secret's `password` key
+  -- @secret key = prod/api#api_key       another key of a JSON secret
+  -- @secret conn = conninfo:prod/db      host=... port=... dbname=... user=...
+                                          password=... sslmode=require, from
+                                          an RDS-shaped secret; words after
+                                          the id are added (or override):
+  -- @secret conn = conninfo:prod/db sslmode=verify-full
+<
+The `conninfo` form is what `CREATE SUBSCRIPTION ... CONNECTION :conn` needs.
+Statements that cannot run inside a transaction block (CREATE SUBSCRIPTION,
+VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE, ALTER SYSTEM) are
+detected: a multi-statement cell holding one runs without the per-cell
+transaction, and a dry run of it is refused. The server keeps the
+connection string in `pg_subscription`, readable by superusers.
+
 ==============================================================================
 8. FORMATTING                                              *dbgrid-formatting*
 
