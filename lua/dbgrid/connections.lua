@@ -248,19 +248,19 @@ function M.remove(name)
   local root = project.root()
   local list = saved()
   local out = {}
-  local removed = false
+  local removed
   for _, c in ipairs(list) do
     if c.name == name and (not c.project or c.project == root) then
-      removed = true
+      removed = c
     else
       out[#out + 1] = c
     end
   end
   if removed then
     write_saved(out)
-    M.forget(name)
+    M.refresh(removed)
   end
-  return removed
+  return removed ~= nil
 end
 
 ---The saved entry a connection name refers to, as stored (no `$VAR` expansion,
@@ -375,8 +375,8 @@ function M.edit_interactive(conn, cb)
       end
       write_saved(list)
       M.save(draft, new_scope)
-      M.forget(entry.name)
-      M.forget(draft.name)
+      M.refresh(entry)
+      M.refresh(draft)
       rename_in_notebooks(entry.name, draft.name)
       util.notify("saved connection " .. draft.name)
       cb(M.get(draft.name))
@@ -439,7 +439,7 @@ function M.remove_interactive(conn, cb)
 end
 
 ---Open connections.json in a buffer; saving it drops every cached resolved
----connection so the edits take effect on the next run.
+---connection and the aws caches so the edits take effect on the next run.
 function M.open_file()
   local path = saved_path()
   if not util.exists(path) then
@@ -451,7 +451,7 @@ function M.open_file()
     buffer = buf,
     desc = "dbgrid: forget resolved connections after editing connections.json",
     callback = function()
-      M.forget()
+      M.refresh()
     end,
   })
 end
@@ -588,14 +588,34 @@ local resolved = {} ---@type table<string, dbgrid.Connection>
 local inflight = {} ---@type table<string, fun(conn?: dbgrid.Connection, err?: string)[]>
 
 ---Forget the effective form of a connection (after a failure, or when its
----declaration changed).
+---declaration changed). An aws name covers its roles (name/writer, name/reader).
 ---@param name? string  nil = everything
 function M.forget(name)
   endpoint_memo = {}
-  if name then
-    resolved[name] = nil
-  else
+  if not name then
     resolved = {}
+    return
+  end
+  resolved[name] = nil
+  for key in pairs(resolved) do
+    if key:sub(1, #name + 1) == name .. "/" then
+      resolved[key] = nil
+    end
+  end
+end
+
+---What `:Dbgrid aws refresh` does: forget the resolved form and, for an aws
+---entry, the described endpoints, the looked-up bastion and the credentials.
+---Runs by itself when a saved connection is edited, removed or the JSON saved.
+---@param conn? dbgrid.Connection  a declared or expanded entry; nil = every connection
+function M.refresh(conn)
+  M.forget(conn and (conn.parent or conn.name) or nil)
+  local aws = require("dbgrid.aws")
+  for _, c in ipairs(conn and { conn } or M.all()) do
+    if type(c.aws) == "table" then
+      aws.forget_endpoints(c.aws)
+      aws.forget_credentials(c.aws)
+    end
   end
 end
 

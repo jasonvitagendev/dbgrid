@@ -60,7 +60,9 @@ project, from `config/database.yml` of a Rails project (as
 saved interactively with `:Dbgrid connections`. Saved connections are edited
 (`<C-e>` in the picker, `:Dbgrid connections edit`), removed (`<C-x>`,
 `:Dbgrid connections remove`) or opened as JSON (`:Dbgrid connections file`);
-a renamed connection is followed by the open notebooks that used it.
+a renamed connection is followed by the open notebooks that used it. Every
+edit drops what is cached behind the connection (resolved form, aws
+endpoints, bastion, credentials) like `:Dbgrid aws refresh`.
 
 SQLite urls: `sqlite:path/to.db` (relative to the project root),
 `sqlite:///abs/path.db`, `~/x.db`, or a bare path ending in .sqlite3 / .db.
@@ -123,7 +125,7 @@ See `lua/dbgrid/config.lua` for every default, including all keymaps.
                                removes the saved one under the cursor)
 :Dbgrid connections edit [n]   edit a saved connection, prompts prefilled
 :Dbgrid connections remove [n] remove a saved connection
-:Dbgrid connections file       open connections.json (saving drops the cache)
+:Dbgrid connections file       open connections.json (saving refreshes all)
 :Dbgrid connect [name]         set the connection of the notebook
 :Dbgrid run [all]              run the current cell or all cells
 :Dbgrid explain [analyze]      plan of the current cell (with findings)

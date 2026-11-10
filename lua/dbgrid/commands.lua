@@ -327,12 +327,8 @@ M.subcommands = {
       end)
     elseif sub == "refresh" then
       return with_aws_conn(function(conn)
-        aws.forget_endpoints(conn.aws)
-        if aws.forget_credentials then
-          aws.forget_credentials(conn.aws)
-        end
-        require("dbgrid.connections").forget(conn.name)
-        util.notify("endpoint cache dropped for " .. conn.name)
+        require("dbgrid.connections").refresh(conn)
+        util.notify("endpoint cache dropped for " .. (conn.parent or conn.name))
       end)
     elseif sub == "tunnels" then
       local tunnel = require("dbgrid.tunnel")

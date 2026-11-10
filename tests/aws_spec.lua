@@ -1466,3 +1466,48 @@ H.describe("aws health", function()
 end)
 
 tunnel.kill_all()
+
+H.describe("refresh on edit", function()
+  local connections = require("dbgrid.connections")
+  local path = tmp .. "/data/aws/endpoints.json"
+  local a = { profile = "p", region = "r", cluster = "edited", bastion = "jump-1" }
+  local function prime()
+    util.write_json(path, {
+      ["p|r|edited"] = { fetched_at = os.time(), info = { id = "edited", writer = { host = "h", port = 1 } } },
+      ["bastion|p|r|jump-1"] = { fetched_at = os.time(), id = "i-0jump" },
+      ["p|r|other"] = { fetched_at = os.time(), info = { id = "other", writer = { host = "o", port = 1 } } },
+    })
+  end
+
+  H.it("refresh drops the endpoints and bastion of one aws connection", function()
+    prime()
+    H.truthy(aws.cached_endpoints(a))
+    H.eq(aws.cached_bastion(a), "i-0jump")
+    connections.refresh({ name = "edited", aws = a })
+    H.eq(aws.cached_endpoints(a), nil)
+    H.eq(aws.cached_bastion(a), nil)
+    H.truthy(aws.cached_endpoints({ profile = "p", region = "r", cluster = "other" }), "others are untouched")
+    -- an expanded role entry refreshes its parent
+    prime()
+    connections.refresh({ name = "edited/reader", parent = "edited", aws_role = "reader", aws = a })
+    H.eq(aws.cached_endpoints(a), nil)
+  end)
+
+  H.it("removing a saved aws connection refreshes it", function()
+    connections.save({ name = "edited", aws = a }, "global")
+    prime()
+    H.truthy(connections.remove("edited"))
+    H.eq(aws.cached_endpoints(a), nil)
+    H.eq(aws.cached_bastion(a), nil)
+    H.falsy(connections.remove("edited"), "already gone")
+  end)
+
+  H.it("refresh with no connection covers every aws entry", function()
+    connections.save({ name = "edited", aws = a }, "global")
+    prime()
+    connections.refresh()
+    H.eq(aws.cached_endpoints(a), nil)
+    H.truthy(aws.cached_endpoints({ profile = "p", region = "r", cluster = "other" }), "not a declared connection")
+    connections.remove("edited")
+  end)
+end)

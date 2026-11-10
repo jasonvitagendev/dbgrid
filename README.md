@@ -222,13 +222,16 @@ the same anywhere. Every prompt of the edit is prefilled: name, URL (for an
 AWS entry: bastion and secret), read-only and scope. Renaming a connection
 updates the open notebooks that used it. `:Dbgrid connections file` opens the
 JSON itself for the fields the prompts do not cover (`tunnel`, `env`,
-timeouts); saving it drops the cached resolved connections. Connections from
-`setup()`, the environment or `database.yml` are changed at their source.
+timeouts). Editing, removing or saving the JSON does what `:Dbgrid aws
+refresh` does for the connections touched, so the next run looks everything
+up again. Connections from `setup()`, the environment or `database.yml` are
+changed at their source.
 
 Every run goes through a resolve step: the declared connection becomes an
 effective one (endpoints looked up, tunnel started or re-probed, credentials
 fetched, `password_cmd` run asynchronously). The result is cached per name for
-the session; `:Dbgrid aws refresh` or a failed run drops it.
+the session; `:Dbgrid aws refresh`, an edit of the connection or a failed
+run drops it.
 
 ### AWS RDS and Aurora
 
@@ -301,7 +304,7 @@ online jumpbox in the database's VPC is taken without asking; the database is
 asked for only when the secret names none; when the region has no database
 the other regions are searched and the hits are offered with their region,
 and a listing the role may not make is reported rather than shown as empty), `aws login`,
-`aws refresh` (drop the endpoint cache), `aws tunnels` (list / kill), `aws status` (instance status, engine version, pending
+`aws refresh` (drop the endpoint cache; edits of the connection do it too), `aws tunnels` (list / kill), `aws status` (instance status, engine version, pending
 maintenance, five CloudWatch metrics over the last five minutes), `aws events`
 (last day of RDS events), `aws bluegreen` (blue/green deployments and their
 switchover status). `:checkhealth dbgrid` reports the CLI, the Session
