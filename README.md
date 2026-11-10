@@ -883,6 +883,7 @@ ai = {
                        "--disallowedTools", "Bash,Edit,Write,NotebookEdit,Read,Glob,Grep,Task,WebFetch,WebSearch" }, stdin = true },
     kimi   = { cmd = { "kimi", "--print", "-p", "{prompt}" }, stdin = false },
     codex  = { cmd = { "codex", "exec", "--skip-git-repo-check", "-s", "read-only", "-o", "{output}", "-" }, stdin = true },
+    cursor = { cmd = { "cursor-agent", "-p", "--output-format", "text", "--mode", "ask", "--trust" }, stdin = true },
   },
   instructions = "Use snake_case aliases. Never select *.",
   dialect = "PostgreSQL 18",
@@ -891,12 +892,14 @@ ai = {
 ```
 
 `{prompt}` is replaced by the prompt text, `{output}` by a temp file the agent
-should write its answer to; with `stdin = true` the prompt is piped in. Add
-your own agent the same way. The Claude command above keeps Claude Code from
+should write its answer to; with `stdin = true` the prompt is piped in; `env`
+adds variables to the agent's environment, so one CLI can be two agents (a
+`claude` with `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }` runs with a
+separate account and settings). Add your own agent the same way. The Claude command above keeps Claude Code from
 using tools so answers come back fast; drop `Read,Glob,Grep` from the
 disallowed list if you want it to read your repository (models, migrations)
-for extra context. Check `kimi --help` / `codex exec --help` if your versions
-differ. In a Rails project the agent is also told about Rails conventions
+for extra context. Check `kimi --help` / `codex exec --help` / `cursor-agent --help` if your
+versions differ (`--mode ask` keeps Cursor read-only). In a Rails project the agent is also told about Rails conventions
 (plural tables, `id`, `created_at`, `<singular>_id`), and the Rails
 bookkeeping tables are left out of the schema it sees.
 
@@ -1091,7 +1094,7 @@ groups and can be overridden.
 Nothing is sent anywhere unless you ask for an agent feature, and nothing is
 phoned home. The complete list:
 
-**To the agent CLI** (`claude`, `kimi`, `codex`, or whatever `ai.agents`
+**To the agent CLI** (`claude`, `kimi`, `codex`, `cursor`, or whatever `ai.agents`
 names; it runs locally, but it talks to its own provider), only when you run
 one of these:
 

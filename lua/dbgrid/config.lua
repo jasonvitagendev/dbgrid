@@ -189,9 +189,10 @@ M.defaults = {
 
   ai = {
     -- Which agent generates SQL from `-- ?` prompts.
-    agent = "claude", ---@type "claude"|"kimi"|"codex"|string
+    agent = "claude", ---@type "claude"|"kimi"|"codex"|"cursor"|string
     -- Agent commands. `{prompt}` is replaced with the prompt when stdin is false;
     -- `{output}` with a temp file path the agent should write its answer to.
+    -- `env` adds variables to the agent's environment (CLAUDE_CONFIG_DIR, ANTHROPIC_MODEL, ...).
     agents = {
       claude = {
         cmd = {
@@ -212,6 +213,8 @@ M.defaults = {
         cmd = { "codex", "exec", "--skip-git-repo-check", "-s", "read-only", "-o", "{output}", "-" },
         stdin = true,
       },
+      -- `--mode ask` keeps Cursor read-only (plain `-p` may edit and run shell commands)
+      cursor = { cmd = { "cursor-agent", "-p", "--output-format", "text", "--mode", "ask", "--trust" }, stdin = true },
     },
     -- How many tables of the schema are described to the agent.
     max_tables = 40,

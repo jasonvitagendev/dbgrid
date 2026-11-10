@@ -396,13 +396,15 @@ not run". When the cell already has SQL the prompt is an edit request.
 The agent is chosen per cell (`-- @agent kimi`), per notebook (`\a`,
 `:Dbgrid agent kimi`) or by `ai.agent`. Agents (`ai.agents`) are argv lists;
 `{prompt}` and `{output}` are substituted,
-`stdin = true` pipes the prompt. Defaults exist for `claude`, `kimi` and
-`codex`; add your own the same way. In a Rails project the agent is told
+`stdin = true` pipes the prompt, `env` adds variables to the agent's
+environment (for instance CLAUDE_CONFIG_DIR, to run `claude` with another
+account). Defaults exist for `claude`, `kimi`, `codex` and `cursor`; add your
+own the same way. In a Rails project the agent is told
 about Rails naming conventions.
 
 Asking about a result ~
                                                               *dbgrid-review*
-Needs one of the agent CLIs (`claude`, `kimi`, `codex`, or one you add) on
+Needs one of the agent CLIs (`claude`, `kimi`, `codex`, `cursor-agent`, or one you add) on
 PATH; see |dbgrid-ai| for how agents are configured and picked.
 
 `\a` in the results pane, `\?` on a cell, or `:Dbgrid review [question]`

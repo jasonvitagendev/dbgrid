@@ -186,7 +186,7 @@ function M.clean_output(out)
 end
 
 ---Agent command with placeholders substituted.
----@param agent { cmd: string[], stdin?: boolean }
+---@param agent { cmd: string[], stdin?: boolean, env?: table<string,string> }
 ---@param prompt string
 ---@param output_path string
 ---@return string[] argv, boolean uses_output
@@ -219,8 +219,9 @@ end
 ---The `dbgrid-query` helper the agent may call when `ai.investigate` is on:
 ---a script bound to one connection, read-only, with a statement timeout.
 ---@param conn dbgrid.Connection
+---@param base? table<string,string>  the agent's own environment, extended
 ---@return string dir, table<string,string> env
-local function investigate_helper(conn)
+local function investigate_helper(conn, base)
   local dir = vim.fn.tempname()
   util.mkdirp(dir)
   local script = table.concat({
@@ -231,11 +232,10 @@ local function investigate_helper(conn)
   }, "\n") .. "\n"
   util.write_file(dir .. "/dbgrid-query", script)
   pcall(vim.uv.fs_chmod, dir .. "/dbgrid-query", 493) -- 0755
-  local env = {
-    DBGRID_QUERY_URL = conn.url,
-    PGOPTIONS = "-c default_transaction_read_only=on -c statement_timeout=15000",
-    PATH = dir .. ":" .. (vim.env.PATH or ""),
-  }
+  local env = vim.deepcopy(base or {})
+  env.DBGRID_QUERY_URL = conn.url
+  env.PGOPTIONS = "-c default_transaction_read_only=on -c statement_timeout=15000"
+  env.PATH = dir .. ":" .. (env.PATH or vim.env.PATH or "")
   for k, v in pairs(conn.env or {}) do
     env[k] = v
   end
@@ -286,9 +286,9 @@ function M.run_agent(prompt, cb, opts)
     cb(nil, "'" .. agent.cmd[1] .. "' is not on PATH")
     return nil
   end
-  local env, helper_dir
+  local env, helper_dir = agent.env, nil
   if cfg.investigate and opts.connection and opts.connection.ai ~= false then
-    helper_dir, env = investigate_helper(opts.connection)
+    helper_dir, env = investigate_helper(opts.connection, agent.env)
     agent = investigate_agent(agent)
     prompt = prompt
       .. "\n## Tool\nYou may run read-only SQL against the same database with the shell command"

@@ -653,7 +653,7 @@ H.describe("notebook ui", function()
     local names = vim.tbl_map(function(a)
       return a.name
     end, ai.agents())
-    H.eq(names, { "claude", "codex", "kimi" })
+    H.eq(names, { "claude", "codex", "cursor", "kimi" })
   end)
 
   if os.getenv("DBGRID_TEST_AI") then

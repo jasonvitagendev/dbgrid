@@ -606,6 +606,21 @@ H.describe("ai", function()
       err = e
     end, { agent = "nope" })
     H.matches(err, "unknown agent")
+    -- an agent's env reaches its process
+    require("dbgrid.config").get().ai.agents.env = {
+      cmd = { "sh", "-c", 'printf "%s" "$DBGRID_AGENT_FLAVOUR"' },
+      stdin = false,
+      env = { DBGRID_AGENT_FLAVOUR = "personal" },
+    }
+    answer = nil
+    ai.run_agent("x", function(text)
+      answer = text
+    end, { agent = "env" })
+    H.truthy(H.wait(5000, function()
+      return answer ~= nil
+    end))
+    H.eq(answer, "personal")
+    require("dbgrid.config").get().ai.agents.env = nil
   end)
   H.it("writes sql under the prompt lines", function()
     local cells = require("dbgrid.cells")
