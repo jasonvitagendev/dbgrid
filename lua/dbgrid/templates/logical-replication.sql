@@ -69,6 +69,7 @@ order by pg_total_relation_size(r.srrelid) desc;
 -- %% copies running
 -- @conn target
 -- @every 5s
+-- @record
 -- needs: PostgreSQL 14+ for pg_stat_progress_copy
 -- The table copies in flight right now and how far each one is. Compare copied with the table's size on the source.
 select p.pid,
@@ -191,18 +192,19 @@ where d.datname = current_database();
 -- @conn source
 -- @every 60s
 -- @record
--- @metrics
+-- @metrics CPUUtilization, CPUCreditBalance, NetworkTransmitThroughput, ReadThroughput, ReadIOPS, FreeableMemory, FreeStorageSpace, TransactionLogsDiskUsage, OldestReplicationSlotLag
 -- needs: an AWS connection (cluster or instance in its aws block) allowed to call cloudwatch:GetMetricData
 -- No SQL here: the newest CloudWatch datapoint of each metric, which is what the database cannot say about itself.
 -- CPU and IOPS are the load of the initial copy; FreeStorageSpace against TransactionLogsDiskUsage is the room the
 -- slot's WAL has left. Datapoints are a minute apart and a minute or two late (datapoint_utc says which one this is).
--- Name metrics after @metrics to sample others.
+-- Name metrics after @metrics to sample others. On a burstable source, NetworkTransmitThroughput is the one that
+-- shows the network burst running out (a t3.small settles on about 16 MB/s) and CPUCreditBalance the CPU one.
 
 -- %% cloudwatch on target
 -- @conn target
 -- @every 60s
 -- @record
--- @metrics
+-- @metrics CPUUtilization, NetworkReceiveThroughput, WriteIOPS, CommitLatency, FreeableMemory, DatabaseConnections
 -- needs: an AWS connection (cluster or instance in its aws block) allowed to call cloudwatch:GetMetricData
 -- The same for the target: CPU, memory and write IOPS are what the copy and the apply workers cost it.
 
