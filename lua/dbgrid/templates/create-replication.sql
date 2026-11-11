@@ -40,6 +40,23 @@ select p.pubname,
 from pg_publication p
 order by p.pubname;
 
+-- %% source: set the replication role's password from the secret
+-- @conn source
+-- @param role = replicator
+-- @param replication_user = 'replicator'
+-- @secret pw = scram:prod/db-replication via target
+-- For a role that has no password yet, or after the secret changed; skip it when the role already logs in with the
+-- secret's password. Name the same secret as "create subscription" below: it is read through the target's aws
+-- profile (via target), since that is where the subscription reads it, while the statement runs on the source. :pw
+-- is the SCRAM-SHA-256 verifier of the secret's password, hashed here like psql's \password, so the password itself
+-- never reaches the source (its log, pg_stat_statements). :role is the role as a bare name, which ALTER ROLE wants,
+-- and :replication_user the same name as a string. A write on the source: a read-only connection refuses it, and
+-- the login must be allowed to alter the role. Expect can_login = t and no valid_until.
+alter role :role password :pw;
+select rolname, rolcanlogin as can_login, rolvaliduntil as valid_until
+from pg_roles
+where rolname = :replication_user;
+
 -- %% clear target: what the truncate will empty (review before the next cell)
 -- @conn target
 -- @nolimit

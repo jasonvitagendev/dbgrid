@@ -168,6 +168,19 @@ H.describe("templates", function()
     H.falsy(ltext:find("-- @conn source", 1, true))
     H.falsy(ltext:find("-- @conn target", 1, true))
     H.truthy(ltext:find("-- @conn test-ro\n-- @every 10s\n-- @record", 1, true))
+    local path = vim.fn.tempname() .. ".sql"
+    require("dbgrid.util").write_file(
+      path,
+      "-- %% a\n-- @conn source\n-- @secret pw = scram:x/y via target\n-- @secret k = x/z via elsewhere\nselect 1\n"
+    )
+    local bound = templates.body({ path = path }, { source = "src db", target = "tgt (prod)/writer" })
+    H.truthy(bound:find("-- @conn src db\n-- @secret pw = scram:x/y via tgt (prod)/writer\n", 1, true))
+    H.truthy(bound:find("-- @secret k = x/z via elsewhere\n", 1, true))
+    local cr = templates.instantiate(templates.get("create-replication"), {
+      bindings = { source = "test", target = "test-ro" },
+    })
+    local ctext = require("dbgrid.util").read_file(cr.path)
+    H.truthy(ctext:find("-- @secret pw = scram:prod/db-replication via test-ro\n", 1, true))
     local diag = templates.instantiate(templates.get("diagnostics"), {})
     local b = vim.api.nvim_create_buf(false, true)
     local u = require("dbgrid.util")

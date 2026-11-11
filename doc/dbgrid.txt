@@ -482,7 +482,8 @@ a lag probe, a stream rate test and a rollback (drop, or detach first on a
 restored copy of the target); the subscription and publication names are
 the `:sub` and `:pub` parameters. Its write cells are
 real writes. Cells with `-- @conn blue|green` (`source|target`) are bound to
-the connections you pick. `templates.dir` adds your own (header lines
+the connections you pick, and so is a placeholder after `via` on a
+`-- @secret` line. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
 `-- template-connections:`; `source = prod/writer` offers that connection
 first on creation).

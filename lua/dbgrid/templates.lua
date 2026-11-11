@@ -121,7 +121,8 @@ function M.get(name)
   end
 end
 
----Body of a template with its `-- @conn <placeholder>` lines bound to real connections.
+---Body of a template with its `-- @conn <placeholder>` lines bound to real connections
+---(and the placeholder after `via` on a `-- @secret` line, which names a connection too).
 ---@param tpl dbgrid.Template
 ---@param bindings table<string,string>
 ---@return string
@@ -133,6 +134,11 @@ function M.body(tpl, bindings)
     local prefix, name = l:match("^(%s*%-%-%s*@conn%s+)([%w_%-%./]+)%s*$")
     if prefix and bindings[name] then
       lines[i] = prefix .. bindings[name]
+    else
+      local head, via = l:match("^(%s*%-%-%s*@secret%s.-%s+via%s+)([%w_%-%./]+)%s*$")
+      if head and bindings[via] then
+        lines[i] = head .. bindings[via]
+      end
     end
   end
   return table.concat(lines, "\n")

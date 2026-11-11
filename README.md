@@ -453,7 +453,9 @@ a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
   Monitoring a run).
 - **create-replication**: the steps of that migration, in order, on the
   source and target you pick. Preflight on both sides (target empty, the
-  publication, the replication role); truncate the target (reviewed first);
+  publication, the replication role); set the role's password on the source
+  from the secret, hashed (`-- @secret pw = scram:... via target`); truncate
+  the target (reviewed first);
   drop the secondary indexes the copy would pay for, their definitions saved
   in an `ops` table; `CREATE SUBSCRIPTION` with the connection string built
   from a Secrets Manager secret (`-- @secret conn = conninfo:...`); pause and
