@@ -167,7 +167,7 @@ end
 ---the saved connection under the cursor and the picker reopens; without it,
 ---`:Dbgrid connections edit|remove` do the same.
 ---@param cb fun(conn?: dbgrid.Connection)
----@param opts? { prompt?: string, exclude?: string, saved_only?: boolean, allow_new?: boolean }
+---@param opts? { prompt?: string, exclude?: string, saved_only?: boolean, allow_new?: boolean, default?: string }
 function M.connection(cb, opts)
   opts = opts or {}
   local connections = require("dbgrid.connections")
@@ -176,6 +176,14 @@ function M.connection(cb, opts)
     local saved = c.source == "saved" or c.source == "project"
     if c.name ~= opts.exclude and (saved or not opts.saved_only) then
       items[#items + 1] = { text = connections.describe(c), data = c, preview = { util.redact_url(c.url or "") } }
+    end
+  end
+  -- the default goes first, so <CR> takes it
+  for i, it in ipairs(items) do
+    if opts.default and it.data.name == opts.default then
+      it.text = it.text .. "  (default)"
+      table.insert(items, 1, table.remove(items, i))
+      break
     end
   end
   if opts.saved_only and #items == 0 then

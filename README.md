@@ -463,7 +463,8 @@ a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
   and drop the slots on the source by hand). The subscription and publication names are the
   `:sub` and `:pub` parameters, asked for once. Cells that write say so in
   their title; read the review cells before the ones they precede.
-`-- template-connections:` header.
+`-- template-connections:` header. `source = prod/writer` there offers that
+connection first when the notebook is created.
 
 ### Live cells
 

@@ -5,6 +5,7 @@
 --   -- template-tags: diagnostics
 --   -- template-description: what is slow, who blocks whom, ...
 --   -- template-connections: blue, green      <- `-- @conn blue` placeholders bound on creation
+--   -- template-connections: source = prod/writer, target   <- `name = connection` offers that one first
 local util = require("dbgrid.util")
 local config = require("dbgrid.config")
 
@@ -16,6 +17,7 @@ local M = {}
 ---@field tags string[]
 ---@field description string
 ---@field connections string[] placeholder connection names
+---@field defaults table<string,string> connection offered first per placeholder
 ---@field path string
 ---@field builtin boolean
 
@@ -30,7 +32,7 @@ end
 ---@param text string
 ---@return table meta, string body
 function M.parse(text)
-  local meta = { tags = {}, connections = {} }
+  local meta = { tags = {}, connections = {}, defaults = {} }
   local lines = util.lines(text)
   local i = 1
   while lines[i] do
@@ -38,7 +40,18 @@ function M.parse(text)
     if not k then
       break
     end
-    if k == "tags" or k == "connections" then
+    if k == "connections" then
+      -- comma-separated; `name = connection` names the default, and a connection name may hold spaces
+      for _, item in ipairs(vim.split(v, ",", { trimempty = true })) do
+        local name, default = item:match("^%s*(%S+)%s*=%s*(.-)%s*$")
+        if name then
+          meta.connections[#meta.connections + 1] = name
+          meta.defaults[name] = default
+        else
+          vim.list_extend(meta.connections, vim.split(item, "%s+", { trimempty = true }))
+        end
+      end
+    elseif k == "tags" then
       meta[k] = vim.split(v, "[,%s]+", { trimempty = true })
     else
       meta[k] = v
@@ -67,6 +80,7 @@ local function load(path, builtin)
     tags = meta.tags or {},
     description = meta.description or "",
     connections = meta.connections or {},
+    defaults = meta.defaults or {},
     path = path,
     builtin = builtin,
   }
@@ -170,7 +184,7 @@ function M.create_interactive(name_or_tpl, opts, cb)
       end
       bindings[ph] = conn.name
       next_binding()
-    end, { prompt = "Connection for '" .. ph .. "'" })
+    end, { prompt = "Connection for '" .. ph .. "'", default = tpl.defaults[ph] })
   end
   next_binding()
 end

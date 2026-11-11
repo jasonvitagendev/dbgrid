@@ -475,7 +475,8 @@ the `:sub` and `:pub` parameters. Its write cells are
 real writes. Cells with `-- @conn blue|green` (`source|target`) are bound to
 the connections you pick. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
-`-- template-connections:`).
+`-- template-connections:`; `source = prod/writer` offers that connection
+first on creation).
 
 ==============================================================================
 13. LIVE CELLS                                                  *dbgrid-live*
