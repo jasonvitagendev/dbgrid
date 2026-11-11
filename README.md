@@ -88,9 +88,9 @@ the cache, so moving between cells never re-runs anything.
   command. Generic ssh / command tunnels work for everything else.
 - **Diagnostics notebooks.** `:Dbgrid new --template diagnostics` gives you
   cells for active queries, blocking, top statements, bloat, unused indexes,
-  replica lag and more; `blue-green` watches an RDS blue/green deployment and
+  replica lag and more; `blue-green` watches an RDS blue/green deployment,
   `logical-replication` a publication / subscription migration, source and
-  target side by side.
+  target side by side, and `create-replication` does the steps of one.
 - **Live cells and diffs.** `-- @every 5s` re-runs a cell and highlights what
   changed; `\d` diffs two runs of a cell (or the same cell on two connections);
   `:Dbgrid schema diff a b` and `:Dbgrid settings diff a b` compare servers.
@@ -439,7 +439,8 @@ a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
   each side, the commit / row / block counters of each side with their rates
   per second, and CloudWatch for each side (CPU, memory, IOPS, storage, what
   the slot costs). The glance, load, throughput, error and CloudWatch cells
-  carry `-- @record`, so the run leaves a CSV per cell behind; a slot about
+  and the copies running carry `-- @record`, so the run leaves a CSV per
+  cell behind; a slot about
   to lose its WAL and a subscription error raise an alert. The rest is for
   before and after: settings on both sides, publications, tables not
   published or without a replica identity, the biggest tables, what the
@@ -448,6 +449,19 @@ a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
   `:Dbgrid live all` starts the live cells in one go, `:Dbgrid mark` notes
   the steps you take, and `:Dbgrid recordings report` sums the run up (see
   Monitoring a run).
+- **create-replication**: the steps of that migration, in order, on the
+  source and target you pick. Preflight on both sides (target empty, the
+  publication, the replication role); truncate the target (reviewed first);
+  drop the secondary indexes the copy would pay for, their definitions saved
+  in an `ops` table; `CREATE SUBSCRIPTION` with the connection string built
+  from a Secrets Manager secret (`-- @secret conn = conninfo:...`); pause and
+  resume; then, once every table is ready, rebuild the indexes (with a
+  progress cell), check them against what was saved and against the source
+  (`:Dbgrid diff` on the source connection), analyze, reset the sequences and
+  check them; a lag probe, a stream rate test over dblink, and a rollback that
+  drops the subscription. The subscription and publication names are the
+  `:sub` and `:pub` parameters, asked for once. Cells that write say so in
+  their title; read the review cells before the ones they precede.
 `-- template-connections:` header.
 
 ### Live cells

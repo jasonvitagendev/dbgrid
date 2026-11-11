@@ -218,6 +218,26 @@ H.describe("bundled templates", function()
       H.eq(st.class, "read", st.kind)
     end
   end)
+  H.it("create-replication writes on purpose, and its placeholders are outside strings", function()
+    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+    local text = require("dbgrid.util").read_file(root .. "/lua/dbgrid/templates/create-replication.sql")
+    local stmts = sql.split(text)
+    H.truthy(#stmts > 20)
+    local classes = {}
+    for _, st in ipairs(stmts) do
+      classes[st.class] = true
+    end
+    H.truthy(classes.read)
+    H.truthy(classes.ddl or classes.write)
+    -- every :name the template mentions in a comment is a placeholder the scanner sees somewhere
+    local names = {}
+    for _, ref in ipairs(sql.placeholders(text)) do
+      names[ref.name] = true
+    end
+    for _, n in ipairs({ "sub", "pub", "conn", "keep", "table", "replication_user" }) do
+      H.truthy(names[n], n)
+    end
+  end)
 end)
 
 H.describe("sql.no_transaction", function()

@@ -447,8 +447,8 @@ gives the agent a read-only `dbgrid-query` shell helper on the connection.
 ==============================================================================
 12. TEMPLATES                                               *dbgrid-templates*
 
-`:Dbgrid new --template diagnostics`, `blue-green` and `logical-replication`
-copy a bundled notebook into the project. Diagnostics: active queries,
+`:Dbgrid new --template diagnostics`, `blue-green`, `logical-replication`
+and `create-replication` copy a bundled notebook into the project. Diagnostics: active queries,
 blocking tree, idle in transaction, long transactions, top statements
 (pg_stat_statements), seq scans, dead tuples, unused and redundant indexes,
 cache hit ratio, sizes, connections, wraparound, temp files, replica lag,
@@ -463,7 +463,15 @@ workers, subscription errors, sessions, counters with their rates and
 CloudWatch for the source and the target (recorded, see |dbgrid-monitor|),
 settings, publications, tables not published or without replica identity,
 row counts and sequences on both sides, writes in flight; every cell is
-read-only. Cells with `-- @conn blue|green` (`source|target`) are bound to
+read-only. Create-replication: the steps of that migration in order:
+preflight on both sides, truncate the target, drop the secondary indexes for
+the copy (definitions saved in an `ops` table), CREATE SUBSCRIPTION with the
+connection string from a secret (|dbgrid-secrets|), pause and resume, then
+rebuild and check the indexes (against the saved definitions and, with
+`:Dbgrid diff`, against the source), analyze, reset and check the sequences,
+a lag probe, a stream rate test and a rollback; the subscription and
+publication names are the `:sub` and `:pub` parameters. Its write cells are
+real writes. Cells with `-- @conn blue|green` (`source|target`) are bound to
 the connections you pick. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
 `-- template-connections:`).
