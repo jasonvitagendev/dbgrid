@@ -347,8 +347,17 @@ and error lines. The spec is:
                                           an RDS-shaped secret; words after
                                           the id are added (or override):
   -- @secret conn = conninfo:prod/db sslmode=verify-full
+  -- @secret pw = scram:prod/db           the SCRAM-SHA-256 verifier of the
+                                          password, hashed here
+  -- @secret pw = prod/db via other conn  read through another connection
 <
 The `conninfo` form is what `CREATE SUBSCRIPTION ... CONNECTION :conn` needs.
+The `scram:` form is for `ALTER ROLE ... PASSWORD :pw`: the server stores the
+verifier as it is, like psql's `\password`, so the password itself is never in
+the statement (server log, pg_stat_statements). It takes a printable ASCII
+password. `via <connection>` (the rest of the line, names may have spaces)
+reads the secret with that connection's profile and region, for a secret that
+lives in another account or region than the database the cell runs on.
 Statements that cannot run inside a transaction block (CREATE SUBSCRIPTION,
 VACUUM, CREATE INDEX CONCURRENTLY, CREATE DATABASE, ALTER SYSTEM) are
 detected: a multi-statement cell holding one runs without the per-cell

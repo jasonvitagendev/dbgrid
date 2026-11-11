@@ -26,6 +26,19 @@ H.describe("secrets.parse", function()
     H.eq(s.id, "prod/db")
     H.eq(s.extras, { { k = "sslmode", v = "verify-full" }, { k = "application_name", v = "migration" } })
   end)
+  H.it("reads scram: and via, a connection name keeping its spaces", function()
+    local s = secrets.parse("scram:prod/db#pw via app-db (prod)")
+    H.eq(s.id, "prod/db")
+    H.eq(s.key, "pw")
+    H.eq(s.scram, true)
+    H.eq(s.via, "app-db (prod)")
+    local c = secrets.parse("conninfo:prod/db sslmode=verify-full via other")
+    H.eq(c.conninfo, true)
+    H.eq(c.extras, { { k = "sslmode", v = "verify-full" } })
+    H.eq(c.via, "other")
+    H.eq(secrets.parse("prod/db").via, nil)
+    H.eq(secrets.parse("scram:conninfo:prod/db"), nil)
+  end)
   H.it("rejects empty and malformed specs", function()
     H.eq(secrets.parse(""), nil)
     H.eq(secrets.parse("conninfo:prod/db notakeyvalue"), nil)
@@ -85,6 +98,42 @@ H.describe("secrets.value", function()
   end)
 end)
 
+H.describe("scram", function()
+  local scram = require("dbgrid.scram")
+  local function hex(x)
+    return (x:gsub(".", function(c)
+      return ("%02x"):format(c:byte())
+    end))
+  end
+  -- salt of the RFC 7677 example, base64 W22ZaJ0SNY7soEsUEjb6gQ==
+  local salt = "\91\109\153\104\157\18\53\142\236\160\75\20\18\54\250\129"
+  H.it("hashes like the reference implementations", function()
+    H.eq(hex(scram.sha256("abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    H.eq(hex(scram.sha256(("a"):rep(119))), "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb")
+    H.eq(hex(scram.hmac(("k"):rep(100), "msg")), "bd56a1782c2830e8abc6ed866a57a1230661e650b84c62f7ee3accc5fa5af491")
+  end)
+  H.it("builds the verifier PostgreSQL stores", function()
+    H.eq(
+      scram.verifier("pencil", { salt = salt }),
+      "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU="
+    )
+  end)
+  H.it("salts each verifier and refuses what it cannot hash faithfully", function()
+    local a, b = scram.verifier("pw"), scram.verifier("pw")
+    H.matches(a, "^SCRAM%-SHA%-256%$4096:")
+    H.eq(a ~= b, true)
+    H.eq(scram.verifier(""), nil)
+    local v, err = scram.verifier("p\195\164ss")
+    H.eq(v, nil)
+    H.matches(err, "printable ASCII")
+  end)
+  H.it("is what a scram: secret resolves to, never the password", function()
+    local v = secrets.value(secrets.parse("scram:x"), { password = "pencil" })
+    H.matches(v, "^SCRAM%-SHA%-256%$4096:")
+    H.eq(v:find("pencil", 1, true), nil)
+  end)
+end)
+
 H.describe("secrets.redact", function()
   H.it("masks raw values in strings and nested tables", function()
     local raw = { "p'w d", "s3cr(et)" }
@@ -128,5 +177,40 @@ H.describe("secrets.resolve", function()
     H.eq(got[1].conn, "'host=h port=1 dbname=d user=u password=pw sslmode=require'")
     H.eq(got[1].key, "'k'")
     H.eq(got[2], { "host=h port=1 dbname=d user=u password=pw sslmode=require", "k" })
+  end)
+  H.it("reads a via secret through the named connection's aws block", function()
+    local aws = require("dbgrid.aws")
+    local connections = require("dbgrid.connections")
+    local orig, orig_get = aws.secret_json, connections.get
+    local used = {}
+    aws.secret_json = function(cfg, id, cb)
+      used[#used + 1] = cfg.profile .. ":" .. id
+      cb({ password = "pw" })
+    end
+    connections.get = function(name)
+      if name == "other acct" then
+        return { name = name, aws = { profile = "q" } }
+      elseif name == "plain" then
+        return { name = name }
+      end
+    end
+    local function run(conn, spec)
+      local got
+      secrets.resolve(conn, { { name = "pw", spec = spec } }, function(lit, raw, err)
+        got = { lit, raw, err }
+      end)
+      return got
+    end
+    local ok = run({ name = "c", aws = { profile = "p" } }, "a via other acct")
+    -- the cell's own connection needs no aws block when its secrets name another
+    local local_conn = run({ name = "local" }, "a via other acct")
+    local missing = run({ name = "c", aws = { profile = "p" } }, "a via nope")
+    local no_aws = run({ name = "c", aws = { profile = "p" } }, "a via plain")
+    aws.secret_json, connections.get = orig, orig_get
+    H.eq(ok[1].pw, "'pw'")
+    H.eq(local_conn[1].pw, "'pw'")
+    H.eq(used, { "q:a", "q:a" })
+    H.matches(missing[3], "no connection named 'nope'")
+    H.matches(no_aws[3], "plain has none")
   end)
 end)

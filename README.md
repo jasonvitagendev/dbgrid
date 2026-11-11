@@ -26,6 +26,8 @@ the cache, so moving between cells never re-runs anything.
   from AWS Secrets Manager when the cell runs, for statements that need a
   password in the SQL (`CREATE SUBSCRIPTION ... CONNECTION :conn`). The value
   stays out of the notebook, the history and error output.
+  `scram:prod/db` gives the password hashed for `ALTER ROLE ... PASSWORD :pw`,
+  and `via <connection>` reads a secret kept in another account or region.
 - **Cross-cell references.** `{{overdue-invoices}}` inlines another cell as a
   subquery; `-- @depends setup` runs a cell first when its result is stale, and
   `run all` follows the dependency order.

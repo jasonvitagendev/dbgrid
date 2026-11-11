@@ -9,6 +9,10 @@
 --                                            secret's host, port, dbname, username and
 --                                            password (sslmode=require unless given):
 --   -- @secret conn = conninfo:prod/db sslmode=verify-full application_name=migration
+--   -- @secret pw = scram:prod/db            the SCRAM-SHA-256 verifier of the password,
+--                                            for ALTER ROLE ... PASSWORD :pw
+--   -- @secret pw = prod/db via other conn   read through another connection's aws block
+--                                            (a secret in a different account or region)
 local cells = require("dbgrid.cells")
 local util = require("dbgrid.util")
 
@@ -18,6 +22,8 @@ local M = {}
 ---@field id string                secret id or ARN
 ---@field key string               JSON key to read (default "password")
 ---@field conninfo boolean         build a libpq connection string instead of one key
+---@field scram boolean            hash the key's value into a SCRAM-SHA-256 verifier
+---@field via? string              connection whose aws block reads the secret (default: the cell's)
 ---@field extras { k: string, v: string }[]  extra conninfo keywords, in order
 
 ---Parse the text after `-- @secret name =`.
@@ -28,8 +34,21 @@ function M.parse(spec)
   if spec == "" then
     return nil, "no secret id"
   end
-  local out = { conninfo = false, extras = {}, key = "password" }
+  local out = { conninfo = false, scram = false, extras = {}, key = "password" }
+  -- connection names have spaces, so `via` takes the rest of the line
+  local body, via = spec:match("^(.-)%s+via%s+(.+)$")
+  if body then
+    spec, out.via = body, via
+  end
+  local hashed = spec:match("^scram:%s*(.+)$")
+  if hashed then
+    out.scram = true
+    spec = hashed
+  end
   local rest = spec:match("^conninfo:%s*(.+)$")
+  if rest and out.scram then
+    return nil, "scram: hashes one key, not a conninfo string"
+  end
   if rest then
     out.conninfo = true
     local words = vim.split(rest, "%s+", { trimempty = true })
@@ -143,10 +162,14 @@ function M.value(spec, secret)
   if v == nil or v == vim.NIL then
     return nil, "the secret has no '" .. spec.key .. "' key"
   end
+  if spec.scram then
+    return require("dbgrid.scram").verifier(tostring(v))
+  end
   return tostring(v)
 end
 
----Resolve every declaration of a cell through the connection's aws block.
+---Resolve every declaration of a cell through the connection's aws block
+---(or, with `via <connection>`, through that connection's).
 ---@param conn dbgrid.Connection
 ---@param declared { name: string, spec: string }[]
 ---@param cb fun(literals?: table<string,string>, raw?: string[], err?: string)
@@ -154,16 +177,27 @@ function M.resolve(conn, declared, cb)
   if #declared == 0 then
     return cb({}, {})
   end
-  if type(conn.aws) ~= "table" then
-    return cb(nil, nil, "-- @secret needs an AWS connection (one with an aws block); " .. conn.name .. " has none")
-  end
   local specs = {}
   for _, d in ipairs(declared) do
     local spec, err = M.parse(d.spec)
     if not spec then
       return cb(nil, nil, "-- @secret " .. d.name .. ": " .. err)
     end
-    specs[#specs + 1] = { name = d.name, spec = spec }
+    local reader = conn
+    if spec.via then
+      reader = require("dbgrid.connections").get(spec.via)
+      if not reader then
+        return cb(nil, nil, "-- @secret " .. d.name .. ": no connection named '" .. spec.via .. "'")
+      end
+    end
+    if type(reader.aws) ~= "table" then
+      return cb(
+        nil,
+        nil,
+        "-- @secret needs an AWS connection (one with an aws block); " .. tostring(reader.name) .. " has none"
+      )
+    end
+    specs[#specs + 1] = { name = d.name, spec = spec, aws = reader.aws }
   end
   local aws = require("dbgrid.aws")
   local literals, raw = {}, {}
@@ -174,7 +208,7 @@ function M.resolve(conn, declared, cb)
     if not s then
       return cb(literals, raw)
     end
-    aws.secret_json(conn.aws, s.spec.id, function(secret, err)
+    aws.secret_json(s.aws, s.spec.id, function(secret, err)
       if not secret then
         return cb(nil, nil, "-- @secret " .. s.name .. ": " .. tostring(err))
       end
