@@ -458,8 +458,9 @@ a `-- template-name:` / `-- template-tags:` / `-- template-description:` /
   resume; then, once every table is ready, rebuild the indexes (with a
   progress cell), check them against what was saved and against the source
   (`:Dbgrid diff` on the source connection), analyze, reset the sequences and
-  check them; a lag probe, a stream rate test over dblink, and a rollback that
-  drops the subscription. The subscription and publication names are the
+  check them; a lag probe, a stream rate test over dblink, and a rollback
+  (drop the subscription, or detach it first on a restored copy of the target
+  and drop the slots on the source by hand). The subscription and publication names are the
   `:sub` and `:pub` parameters, asked for once. Cells that write say so in
   their title; read the review cells before the ones they precede.
 `-- template-connections:` header.

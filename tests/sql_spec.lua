@@ -234,7 +234,17 @@ H.describe("bundled templates", function()
     for _, ref in ipairs(sql.placeholders(text)) do
       names[ref.name] = true
     end
-    for _, n in ipairs({ "sub", "pub", "conn", "keep", "table", "replication_user" }) do
+    for _, n in ipairs({
+      "sub",
+      "pub",
+      "conn",
+      "keep",
+      "keep_schemas",
+      "table",
+      "replication_user",
+      "slot",
+      "subscription_oid",
+    }) do
       H.truthy(names[n], n)
     end
   end)

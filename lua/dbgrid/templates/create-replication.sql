@@ -6,29 +6,36 @@
 -- %% preflight: target empty, no subscription yet
 -- @conn target
 -- @param keep = 'schema_migrations,ar_internal_metadata'
+-- @param keep_schemas = 'ops,datadog'
 -- Run before CREATE SUBSCRIPTION. Expect nonempty_tables = 0 and subscriptions = 0. :keep names the tables the
--- publication leaves out (here the two Rails keeps); ops holds the index definitions this notebook saves. The
--- subscription and publication names are the :sub and :pub parameters, asked for once and remembered (\p lists them).
--- The Logical replication template is the live view of the copy once it runs; this one does the steps.
+-- publication leaves out (here the two Rails keeps) and :keep_schemas the schemas that are the target's own: ops holds
+-- the index definitions this notebook saves, datadog is the monitoring agent's. The subscription and publication
+-- names are the :sub and :pub parameters, asked for once and remembered (\p lists them). The Logical replication
+-- template is the live view of the copy once it runs; this one does the steps.
 select (select count(*) from pg_stat_user_tables
-         where n_live_tup > 0 and schemaname <> 'ops' and relname <> all (string_to_array(:keep, ','))) as nonempty_tables,
+         where n_live_tup > 0
+           and schemaname <> all (string_to_array(:keep_schemas, ','))
+           and relname <> all (string_to_array(:keep, ','))) as nonempty_tables,
        (select count(*) from pg_subscription) as subscriptions,
-       (select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema', 'ops')) as tables;
+       (select count(*) from pg_tables
+         where schemaname not in ('pg_catalog', 'information_schema')
+           and schemaname <> all (string_to_array(:keep_schemas, ','))) as tables;
 
 -- %% preflight: source publication and role
 -- @conn source
 -- @param replication_user = 'replicator'
 -- One row per publication: its table count and publish_via_partition_root (partitions then arrive as their parent,
 -- which a target with plain tables needs). The role in the connection secret must be allowed to replicate:
--- rds_replication on RDS and Aurora, the REPLICATION attribute elsewhere. logical_slots should be 0 before the
--- subscription exists, and tables should match the target's count.
+-- rds_replication on RDS and Aurora, the REPLICATION attribute elsewhere. logical_slots names what is there already;
+-- other consumers (a Debezium connector, say) are normal, a slot already named after :sub is not. tables should
+-- match the target's count.
 select p.pubname,
        (select count(*) from pg_publication_tables t where t.pubname = p.pubname) as published_tables,
        p.pubviaroot as via_root,
        case when exists (select 1 from pg_roles where rolname = 'rds_replication')
             then pg_has_role(:replication_user, 'rds_replication', 'member')
             else (select rolreplication from pg_roles where rolname = :replication_user) end as role_can_replicate,
-       (select count(*) from pg_replication_slots where slot_type = 'logical') as logical_slots,
+       (select string_agg(slot_name, ', ' order by slot_name) from pg_replication_slots where slot_type = 'logical') as logical_slots,
        (select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema')) as tables
 from pg_publication p
 order by p.pubname;
@@ -37,30 +44,34 @@ order by p.pubname;
 -- @conn target
 -- @nolimit
 -- @param keep = 'schema_migrations,ar_internal_metadata'
+-- @param keep_schemas = 'ops,datadog'
 -- A new subscription with copy_data copies every published table again, so rows left from an earlier copy collide
--- (duplicate keys on tables with a unique index, silently doubled rows on the ones without). Every schema except ops
--- (index definitions) and the :keep tables; an already empty table is harmless. Check nothing odd is here.
+-- (duplicate keys on tables with a unique index, silently doubled rows on the ones without). Every schema except
+-- :keep_schemas and every table except :keep; an already empty table is harmless. Check nothing odd is here.
 select schemaname || '.' || relname as table_name,
        n_live_tup as rows_estimate,
        pg_size_pretty(pg_total_relation_size(format('%I.%I', schemaname, relname)::regclass)) as size_here
 from pg_stat_user_tables
-where schemaname <> 'ops' and relname <> all (string_to_array(:keep, ','))
+where schemaname <> all (string_to_array(:keep_schemas, ','))
+  and relname <> all (string_to_array(:keep, ','))
 order by n_live_tup desc, relname;
 
 -- %% clear target: truncate everything the copy will refill
 -- @conn target
 -- @param keep = 'schema_migrations,ar_internal_metadata'
+-- @param keep_schemas = 'ops,datadog'
 -- Same list as above, one statement, so it is all or nothing. cascade also empties any table reached through a
--- foreign key, which is in the list anyway. :keep goes in through a session setting because placeholders inside the
--- dollar-quoted body are left alone. Run "preflight: target empty" after this; nonempty_tables must be 0.
-select set_config('dbgrid.keep', :keep, false);
+-- foreign key, which is in the list anyway. The two lists go in through session settings because placeholders inside
+-- the dollar-quoted body are left alone. Run "preflight: target empty" after this; nonempty_tables must be 0.
+select set_config('dbgrid.keep', :keep, false), set_config('dbgrid.keep_schemas', :keep_schemas, false);
 do $$
 declare stmt text;
 begin
   select 'truncate ' || string_agg(format('%I.%I', schemaname, tablename), ', ') || ' cascade'
     into stmt
   from pg_tables
-  where schemaname not in ('pg_catalog', 'information_schema', 'ops')
+  where schemaname not in ('pg_catalog', 'information_schema')
+    and schemaname <> all (string_to_array(current_setting('dbgrid.keep_schemas'), ','))
     and tablename <> all (string_to_array(current_setting('dbgrid.keep'), ','));
   execute stmt;
 end $$;
@@ -68,20 +79,22 @@ end $$;
 -- %% before copy: secondary indexes the next cell drops (review)
 -- @conn target
 -- @nolimit
+-- @param keep_schemas = 'ops,datadog'
 -- COPY into an indexed table pays for every index on every row; a first run with them in place had the subscriber's
 -- CPU and log writes at the limit. The copy goes faster into bare tables, with the indexes built once afterwards.
 -- Kept: primary keys, anything backing a constraint (unique, exclusion), the replica identity index, indexes attached
 -- to a partitioned parent (the parent's index covers them), and every index on a table that has replica identity
 -- FULL and no primary key: the apply worker needs an index to find the rows it updates. With a primary key it uses
 -- that one, so FULL tables that have a key lose their secondary indexes like the rest. A run that kept them copied
--- such a table at 13k rows/s against 100k rows/s for a bare one.
+-- such a table at 13k rows/s against 100k rows/s for a bare one. The :keep_schemas schemas are not touched.
 select i.indrelid::regclass as table_name,
        i.indexrelid::regclass as index_name,
        pg_get_indexdef(i.indexrelid) as definition
 from pg_index i
 join pg_class t on t.oid = i.indrelid
 join pg_namespace n on n.oid = t.relnamespace
-where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast', 'ops')
+where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+  and n.nspname <> all (string_to_array(:keep_schemas, ','))
   and t.relkind in ('r', 'p')
   and (t.relreplident <> 'f'
        or exists (select 1 from pg_index p where p.indrelid = t.oid and p.indisprimary))
@@ -93,9 +106,11 @@ order by 1, 2;
 
 -- %% before copy: drop them, definitions saved in ops.indexes_dropped_for_copy
 -- @conn target
+-- @param keep_schemas = 'ops,datadog'
 -- Same selection as above. Each CREATE INDEX statement is saved before its index is dropped, in one transaction, so
 -- "after copy: recreate the dropped indexes" can put them back. Running it twice is harmless: an index already gone
 -- is not selected again.
+select set_config('dbgrid.keep_schemas', :keep_schemas, false);
 create schema if not exists ops;
 create table if not exists ops.indexes_dropped_for_copy (
   index_name   text primary key,
@@ -114,7 +129,8 @@ begin
     from pg_index i
     join pg_class t on t.oid = i.indrelid
     join pg_namespace n on n.oid = t.relnamespace
-    where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast', 'ops')
+    where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+      and n.nspname <> all (string_to_array(current_setting('dbgrid.keep_schemas'), ','))
       and t.relkind in ('r', 'p')
       and (t.relreplident <> 'f'
            or exists (select 1 from pg_index p where p.indrelid = t.oid and p.indisprimary))
@@ -394,6 +410,35 @@ drop extension if exists dblink;
 -- %% rollback: drop the subscription
 -- @conn target
 -- @notx
--- Also drops the slot on the source when it can reach it; if the source is gone, ALTER SUBSCRIPTION ... SET (slot_name
--- = NONE) first. Everything copied stays on the target.
+-- Only on the database that really subscribes: this also drops the slot on the source, which is what a rollback
+-- wants. On a cluster restored from a snapshot of the target, or when the source cannot be reached, use the detach
+-- cell below instead. Everything copied stays on the target.
 drop subscription :sub;
+
+-- %% rollback: detach (a restored copy of the target, or the source unreachable)
+-- @conn target
+-- @notx
+-- A cluster restored from a snapshot of the target still carries the subscription, with the source's connection
+-- string and password in it. A plain DROP SUBSCRIPTION there reaches the source and drops the SOURCE's slot, which
+-- stops the real replication. Detaching first leaves the slot alone: note the oid the first statement prints, the
+-- tablesync slots of any table still copying are named after it on the source (next cell).
+select oid as subscription_oid, subname from pg_subscription;
+alter subscription :sub disable;
+alter subscription :sub set (slot_name = none);
+drop subscription :sub;
+
+-- %% rollback: drop the slots a detach left on the source
+-- @conn source
+-- @param slot =
+-- @param subscription_oid =
+-- Run on the source after a detach, never after a plain drop (nothing is left then). Both values are asked for:
+-- the slot is the subscription name as a SQL string ('my_sub'), the oid the number the detach cell printed. The
+-- first statement is the review; the second drops the main slot and the pg_<oid>_sync_% tablesync slots.
+select slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as retained_wal
+from pg_replication_slots
+where slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%'
+order by slot_name;
+select slot_name, pg_drop_replication_slot(slot_name)
+from pg_replication_slots
+where slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%';

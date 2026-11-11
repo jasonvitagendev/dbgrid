@@ -469,8 +469,9 @@ the copy (definitions saved in an `ops` table), CREATE SUBSCRIPTION with the
 connection string from a secret (|dbgrid-secrets|), pause and resume, then
 rebuild and check the indexes (against the saved definitions and, with
 `:Dbgrid diff`, against the source), analyze, reset and check the sequences,
-a lag probe, a stream rate test and a rollback; the subscription and
-publication names are the `:sub` and `:pub` parameters. Its write cells are
+a lag probe, a stream rate test and a rollback (drop, or detach first on a
+restored copy of the target); the subscription and publication names are
+the `:sub` and `:pub` parameters. Its write cells are
 real writes. Cells with `-- @conn blue|green` (`source|target`) are bound to
 the connections you pick. `templates.dir` adds your own (header lines
 `-- template-name:`, `-- template-tags:`, `-- template-description:`,
