@@ -433,12 +433,16 @@ drop subscription :sub;
 -- @param subscription_oid =
 -- Run on the source after a detach, never after a plain drop (nothing is left then). Both values are asked for:
 -- the slot is the subscription name as a SQL string ('my_sub'), the oid the number the detach cell printed. The
--- first statement is the review; the second drops the main slot and the pg_<oid>_sync_% tablesync slots.
+-- first statement is the review; the second drops the main slot and the pg_<oid>_sync_% tablesync slots. Only
+-- inactive logical slots of this database are considered, so a slot another consumer is connected to (the real
+-- subscriber, a Debezium connector) is never dropped, whatever is typed.
 select slot_name, active, wal_status,
        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as retained_wal
 from pg_replication_slots
-where slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%'
+where slot_type = 'logical' and database = current_database()
+  and (slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%')
 order by slot_name;
 select slot_name, pg_drop_replication_slot(slot_name)
 from pg_replication_slots
-where slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%';
+where slot_type = 'logical' and database = current_database() and not active
+  and (slot_name = :slot or slot_name like 'pg_' || :subscription_oid || '_sync_%');
